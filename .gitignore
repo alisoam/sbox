@@ -1,0 +1,4 @@
+# Python bytecode caches (created by the `import sbox` verification runs)
+__pycache__/
+*.py[cod]
+.pytest_cache/
