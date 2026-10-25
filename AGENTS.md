@@ -75,10 +75,13 @@ Allowlist/denial semantics:
 Lifecycle and path handling:
 - `check_bind_paths` validates *realpaths* and `build_bwrap` mounts those same
   resolved paths — validation and mount must never diverge (symlink swaps).
-  Binds covering protected paths are refused, and so are known host control
-  sockets (`CONTROL_SOCKETS`: docker/containerd/D-Bus/systemd/libvirt/X11/
-  gpg-agent/pipewire — each a trivial full escape; they are only *children*
-  of protected paths, which the covers() check deliberately allows).
+  Binds covering protected paths are refused, and so are control sockets:
+  known ones via `CONTROL_SOCKETS` with the **same ancestor test** (`covers`,
+  so `-b /run/docker` and `-b ~/.gnupg` are caught too), plus a shape rule —
+  any socket file (`S_ISSOCK`) and anything under `/run`, `/var/run` or
+  `$XDG_RUNTIME_DIR`. `--bind-socket PATH` is the explicit per-path opt-in
+  for the shape rule ONLY (known sockets/protected paths stay refused), and
+  it takes a value — keep it in `OPTS_WITH_VALUE`.
 - bwrap argv order matters: the automatic cwd bind is emitted **before** user
   binds (a later bind shadows an earlier one at the same target), so explicit
   `-r "$PWD"` wins over the default read-write cwd.
@@ -108,8 +111,16 @@ Seccomp specifics:
 - **`--as-pid-1` in the bwrap argv is load-bearing** — never remove it:
   bwrap otherwise keeps its own *unfiltered* zombie-reaper init as pid 1
   (the command's parent); on Yama ptrace_scope=0 systems that init can be
-  `/proc/1/mem`-injected, which no syscall ban covers. Trade-off: orphaned
-  grandchildren are not reaped while pid 1 lives.
+  `/proc/1/mem`-injected, which no syscall ban covers. Trade-offs: orphaned
+  grandchildren are not reaped while pid 1 lives (long-running commands
+  that abandon children accumulate zombies), and signals sent to pid 1
+  from inside are ignored unless handled (pid-namespace init semantics).
+  External teardown is unaffected.
+- The BPF rule blocks must each **reload the syscall number** before their
+  fall-through label (`clone` and `ioctl` both do; A holds an argument
+  otherwise, and the next number-match rule misfires). The interpreter test
+  (`test_bpf_interpreter_golden_cases`) walks the compiled program and
+  catches stale-register fall-throughs — extend its cases when adding rules.
 - `ptrace` and `process_vm_readv/writev` are denied as defense in depth
   (debuggers — gdb/strace — inside the sandbox need `--no-seccomp`).
 - cBPF argument quirks: the kernel truncates `ioctl`'s cmd to 32 bits, so

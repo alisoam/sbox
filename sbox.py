@@ -89,12 +89,20 @@ bwrap only.
 
 Known limits (design trade-offs, not bugs):
   - -b/--ro-bind paths are refused when they cover a protected path
-    (system dirs, $HOME, /run/user/<uid>) or ARE a known host control
-    socket (CONTROL_SOCKETS: docker/containerd, D-Bus, systemd, libvirt,
-    X11, gpg-agent/pipewire sockets) — but the list is a denylist of
-    well-known names, not a guarantee; anything else you bind — the
-    launcher's /tmp/sbox.* work dir, which holds proxy.json and any
-    upstream credentials, included — is handed over as requested.
+    (system dirs, $HOME, /run/user/<uid>) or are socket-shaped: a known
+    host control socket (CONTROL_SOCKETS: docker/containerd, D-Bus,
+    systemd, libvirt, X11, keyring, gpg-agent, ...) or, by rule, any
+    socket file and anything under /run, /var/run or $XDG_RUNTIME_DIR
+    (--bind-socket PATH opts back in per path — the list of names would
+    always lag reality, the shape rule fail-closes it). Anything else you
+    bind — the launcher's /tmp/sbox.* work dir, which holds proxy.json and
+    any upstream credentials, included — is handed over as requested.
+  - --as-pid-1 makes the command pid 1 of the sandbox: long-lived commands
+    that spawn and abandon children accumulate zombies (nothing reaps
+    them; a shell as pid 1 reaps via waitpid(-1)), and signals sent to
+    pid 1 from inside the sandbox are ignored unless the command handles
+    them (pid-namespace init semantics). External teardown (SIGTERM to
+    sbox.py, --die-with-parent) works exactly as before.
   - No resource limits (CPU/memory/PID/fds) inside the sandbox; the
     boundary is bwrap's namespaces plus the seccomp deny-list above. That
     deny-list is best-effort hardening: unsupported architectures or a
@@ -272,10 +280,11 @@ def load_allows(opt_allows: list[str], opt_files: list[str]) -> list[dict]:
             die(f"cannot read allow file: {path}")
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for lineno, line in enumerate(fh, 1):
-                if not line.strip():
+                raw = line.split("#", 1)[0].strip()  # '#' comments, blank lines
+                if not raw:
                     continue
                 try:
-                    entries.append(parse_allow_entry(line))
+                    entries.append(parse_allow_entry(raw))
                 except ValueError as e:
                     die(f"{path}:{lineno}: {e}")
     for raw in opt_allows:
@@ -1006,6 +1015,7 @@ def build_seccomp_bpf(machine: str = "") -> bytes | None:
     emit(_BPF_LD_W_ABS, 24)                      # args[1] low word (cmd is u32)
     emit(_BPF_JEQ_K, TIOCSTI, "eperm", None)
     emit(_BPF_JEQ_K, TIOCLINUX, "eperm", None)
+    emit(_BPF_LD_W_ABS, 0)                       # reload nr: A holds the cmd
     marks["after_ioctl"] = len(insns)
     # socket(): allow only the usual families (SOCKET_FAMILIES; Flatpak's
     # set). AF_VSOCK notably reaches the host hypervisor in VM guests,
@@ -1181,12 +1191,17 @@ def protected_paths(home: str) -> set[str]:
 
 
 # Well-known host control sockets: binding any of these hands the sandbox
-# full control of the host (docker/containerd/CRI-O = root via the container
-# daemon; D-Bus/systemd = arbitrary privileged services; libvirt = VMs;
-# ~/.config X11 = input injection; the session bus or gpg-agent = your
-# identity) — a trivial escape, so they are refused exactly like protected
-# paths even though they are only *children* of them. realpath() collapses
-# the /var/run -> /run symlink, so listing both spellings is belt and braces.
+# full control of the host (docker/containerd/CRI-O/podman/incus/LXD =
+# root via the container daemon; D-Bus/systemd = arbitrary privileged
+# services; libvirt = VMs; gnome-keyring/gpg-agent/1Password = your
+# identity and ssh keys; snapd/tailscaled = service control; X11 = input
+# injection) — a trivial escape, so they are refused exactly like protected
+# paths even though they are only *children* of them. Matching uses the
+# covers() ancestor test, so the parent dirs (e.g. -b /run/docker, -b
+# ~/.gnupg) are refused too. realpath() collapses the /var/run -> /run
+# symlink, so listing both spellings is belt and braces. This list will
+# always lag reality — the shape rule below (anything under /run or any
+# socket file) is what actually fail-closes it.
 CONTROL_SOCKETS = {
     "/run/docker.sock", "/var/run/docker.sock",
     "/run/podman/podman.sock", "/var/run/podman/podman.sock",
@@ -1196,11 +1211,26 @@ CONTROL_SOCKETS = {
     "/run/systemd/private", "/run/systemd/journal/socket",
     "/run/libvirt/libvirt-sock", "/var/run/libvirt/libvirt-sock",
     "/run/libvirt/libvirt-sock-ro", "/var/run/libvirt/libvirt-sock-ro",
+    "/run/snapd.socket", "/run/snapd-snap.socket",
+    "/run/tailscale/tailscaled.sock",
+    "/run/incus/unix.socket", "/var/snap/lxd/common/lxd/unix.socket",
     "/tmp/.X11-unix",
     f"/run/user/{os.getuid()}/bus",
     f"/run/user/{os.getuid()}/gnupg/S.gpg-agent",
     f"/run/user/{os.getuid()}/pipewire-0",
+    f"/run/user/{os.getuid()}/docker.sock",
+    f"/run/user/{os.getuid()}/podman/podman.sock",
+    f"/run/user/{os.getuid()}/systemd/private",
+    f"/run/user/{os.getuid()}/keyring",      # gnome-keyring: secrets + ssh agent
+    os.path.expanduser("~/.1password/agent.sock"),
 }
+
+
+def _is_socket(path: str) -> bool:
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
 
 
 def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
@@ -1212,15 +1242,25 @@ def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
     Whatever these paths really point at is handed to the sandbox, so refuse
     anything that covers a protected path (an ancestor of — or equal to —
     $HOME, a system dir, or the user runtime dir with its agent/pipewire/
-    D-Bus sockets) or IS a known host control socket (CONTROL_SOCKETS —
-    docker.sock, D-Bus, systemd, ...). Children are fine (e.g. -b ~/proj). -b $HOME itself is
+    D-Bus sockets), covers a known host control socket (CONTROL_SOCKETS),
+    or is socket-shaped by rule: any socket file, and anything under /run,
+    /var/run or $XDG_RUNTIME_DIR — control-socket territory where a
+    name list will always lag reality. --bind-socket PATH is the explicit
+    per-path opt-in for the socket-shaped rule. Children of protected
+    paths are fine otherwise (e.g. -b ~/proj). -b $HOME itself is
     only acceptable together with --home (which binds it anyway); anything
     that merely covers $HOME, like /home, is still refused.
     """
     real_home = os.path.realpath(home)
     protected = sorted(protected_paths(home))
+    explicit = {os.path.realpath(p) for p in getattr(opts, "bind_socket", [])}
+    runtime_roots = {"/run", "/var/run"}
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        runtime_roots.add(os.path.realpath(xdg))
     binds: list[tuple[str, str]] = []
-    for flag, paths in (("--bind", opts.bind), ("--ro-bind", opts.ro_bind)):
+    for flag, paths in (("--bind", opts.bind), ("--ro-bind", opts.ro_bind),
+                        ("--bind", opts.bind_socket)):
         for p in paths:
             rp = os.path.realpath(p)
             exempt = flag == "--bind" and opts.home and rp == real_home
@@ -1229,10 +1269,19 @@ def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
                 die(f"{flag} {p} covers protected path(s): {', '.join(hits)}"
                     + ("; use --home to bind $HOME itself"
                        if flag == "--bind" and rp == real_home else ""))
-            if rp in CONTROL_SOCKETS or rp.startswith("/tmp/.X11-unix/"):
-                die(f"{flag} {p} binds the host control socket {rp} — that "
-                    "hands the sandbox full control of the host (container "
-                    "runtime, D-Bus/systemd, X11, ...); refusing")
+            sock_hits = sorted(s for s in CONTROL_SOCKETS if covers(rp, s))
+            if sock_hits or rp.startswith("/tmp/.X11-unix/"):
+                die(f"{flag} {p} covers host control socket(s): "
+                    f"{', '.join(sock_hits) or rp} — that hands the sandbox "
+                    "full control of the host (container runtime, D-Bus/"
+                    "systemd, keyring, X11, ...); refusing")
+            if rp not in explicit and (
+                    any(covers(root, rp) for root in runtime_roots)
+                    or _is_socket(rp)):
+                die(f"{flag} {p}: {rp} is a socket or lives under a runtime "
+                    "dir — control-socket territory (a full host escape "
+                    "waiting for a name we forgot); pass "
+                    "--bind-socket to bind it anyway")
             binds.append((flag, rp))
     return binds
 
@@ -1587,7 +1636,7 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
 
 OPTS_WITH_VALUE = {
     "-a", "--allow", "-A", "--allow-file", "-b", "--bind", "-r", "--ro-bind",
-    "--upstream", "--_proxy",
+    "--bind-socket", "--upstream", "--_proxy",
 }
 
 
@@ -1632,9 +1681,16 @@ Notes:
     escape: any client can log keystrokes, capture the screen and inject
     input (XTEST/SendEvent — e.g. type into your terminal = host command
     execution). Treat X11 passthrough as unsandboxed.
-  - -b/-r of known host control sockets (docker.sock, containerd, D-Bus,
-    systemd, libvirt, X11, gpg-agent, pipewire) is refused: each is a
-    trivial full escape.
+  - -b/-r of host control sockets (docker.sock, containerd, D-Bus, systemd,
+    libvirt, X11, keyring, gpg-agent, ...) is refused, and so is anything
+    socket-shaped by rule: any socket file, and anything under /run,
+    /var/run or $XDG_RUNTIME_DIR — each is a trivial full escape.
+    --bind-socket PATH is the explicit opt-in when you really mean it.
+  - With --as-pid-1 your command IS pid 1 of the sandbox: long-lived
+    commands that spawn and abandon children will see zombies (nothing
+    reaps orphans), and signals sent to pid 1 from inside (kill -TERM 1)
+    are ignored unless handled — pid-namespace init semantics. External
+    teardown is unaffected.
   - --ssh-agent forwards $SSH_AUTH_SOCK to /run/ssh-agent.sock (read-only,
     $SSH_AUTH_SOCK preset). Combined with the injected ssh config, ssh can
     then authenticate with your keys through the allowlisted proxy. Note
@@ -1691,6 +1747,11 @@ Examples:
                         help="Bind PATH read-write at the same location. Repeatable.")
     parser.add_argument("-r", "--ro-bind", action="append", default=[], metavar="PATH",
                         help="Bind PATH read-only at the same location. Repeatable.")
+    parser.add_argument("--bind-socket", action="append", default=[], metavar="PATH",
+                        help="Bind PATH even though it is a socket or lives under /run, /var/run or "
+                             "$XDG_RUNTIME_DIR (refused by default: control sockets there are full "
+                             "host escapes). Explicit per-path opt-in; repeatable. Known control "
+                             "sockets and protected paths are still refused.")
     parser.add_argument("--ro-cwd", action="store_true", help="Mount the current directory read-only (default: rw).")
     parser.add_argument("--home", action="store_true", help="Bind the real $HOME (default: private tmpfs home).")
     parser.add_argument("--gui", action="store_true",

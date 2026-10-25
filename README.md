@@ -46,6 +46,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `-A, --allow-file FILE` | File with allow entries, one per line, `#` comments. Repeatable. |
 | `-b, --bind PATH` | Bind `PATH` read-write into the sandbox. Repeatable. |
 | `-r, --ro-bind PATH` | Bind `PATH` read-only. Repeatable. |
+| `--bind-socket PATH` | Explicit opt-in to bind a socket / runtime-dir path that `-b`/`-r` refuse by default. Repeatable; known control sockets and protected paths stay refused. |
 | `--ro-cwd` | Mount the current directory read-only (default: read-write). |
 | `--home` | Bind the real `$HOME` (default: private tmpfs home). |
 | `--gui` | Pass through Wayland (preferred) and X11 sockets. |
@@ -87,6 +88,8 @@ Everything after the first positional (or `--`) is the sandboxed command.
   and the command — which also runs as pid 1 (`--as-pid-1`), so no unfiltered
   bwrap reaper init remains inside (on Yama `ptrace_scope=0` systems that
   parent could otherwise be `/proc/1/mem`-injected, bypassing the filter).
+  Note pid-1 semantics: long-lived commands that abandon children see
+  zombies, and `kill 1` from inside is ignored unless handled.
   `socket()` is limited to `AF_UNIX`/`AF_INET`/`AF_INET6`/`AF_NETLINK`
   (AF_VSOCK bypasses netns isolation in VM guests on older kernels). ENOSYS
   where runtimes have fallbacks, EPERM elsewhere; foreign-ABI binaries are
@@ -146,11 +149,15 @@ Everything after the first positional (or `--`) is the sandboxed command.
   any client can log keystrokes, capture the screen *and inject input*
   (XTEST/SendEvent — e.g. type into your terminal, which is host command
   execution). Treat X11 passthrough as unsandboxed; prefer Wayland.
-- Binding host control sockets (`docker.sock`, `containerd`, `podman`,
-  `crio`, D-Bus, `systemd`, `libvirt`, X11, `gpg-agent`, `pipewire`) via
-  `-b`/`-r` is refused outright: each is a trivial full escape (the container
-  daemon means root). Any other bind is still handed over as requested —
-  the denylist covers well-known names, not every socket on your host.
+- Binding host control sockets via `-b`/`-r` is refused outright — by name
+  (`docker.sock`, `containerd`, `podman`, `crio`, D-Bus, `systemd`,
+  `libvirt`, `snapd`, `tailscaled`, `incus`/LXD, X11, `gnome-keyring`,
+  `gpg-agent`, pipewire, 1Password — parent dirs included), and by **shape**:
+  any socket file, and anything under `/run`, `/var/run` or
+  `$XDG_RUNTIME_DIR` (rootless daemons, agents, anything we forgot to name).
+  Each is a trivial full escape. `--bind-socket PATH` is the explicit
+  per-path opt-in for the shape rule; known control sockets and protected
+  paths stay refused.
 - `--net` shares the host network namespace: the allowlist is **not** enforced,
   and host loopback services and abstract Unix sockets (D-Bus, X11, ...) become
   reachable. Only use it for trusted work.

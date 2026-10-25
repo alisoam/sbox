@@ -511,6 +511,90 @@ def test_require_seccomp_conflicts_with_no_seccomp():
         f"rc={r.returncode}, stderr={r.stderr!r}")
 
 
+# ------------------------------------------------------- bpf interpreter ---
+
+def _run_bpf(bpf, audit_arch, nr, args=()):
+    """Tiny cBPF interpreter for the four opcodes build_seccomp_bpf emits
+    (LD_W_ABS, JEQ_K, JSET_K, RET_K). Header cross-checks validate the
+    syscall numbers; only this validates the control flow — stale-register
+    fall-throughs, wrong jump targets, forgotten rule blocks."""
+    data = (struct.pack("<II", nr & 0xFFFFFFFF, audit_arch)
+            + struct.pack("<Q", 0)  # instruction_pointer
+            + b"".join(struct.pack("<Q", a & 0xFFFFFFFFFFFFFFFF) for a in args))
+    prog = [struct.unpack("<HBBI", bpf[i:i + 8])
+            for i in range(0, len(bpf), 8)]
+    pc, A = 0, 0
+    for _ in range(4096):  # any real run terminates in a few steps
+        assert 0 <= pc < len(prog), "interpreter: pc out of range"
+        code, jt, jf, k = prog[pc]
+        if code == sbox._BPF_LD_W_ABS:
+            A = struct.unpack_from("<I", data, k)[0]
+            pc += 1
+        elif code == sbox._BPF_JEQ_K:
+            pc += (jt if A == k else jf) + 1
+        elif code == sbox._BPF_JSET_K:
+            pc += (jt if A & k else jf) + 1
+        elif code == sbox._BPF_RET_K:
+            return k
+        else:
+            raise AssertionError(f"interpreter: unhandled opcode {code:#x}")
+    raise AssertionError("interpreter: program did not terminate")
+
+
+_ALLOW = sbox._SECCOMP_RET_ALLOW
+_EPERM = sbox._SECCOMP_RET_ERRNO | _errno.EPERM
+_ENOSYS = sbox._SECCOMP_RET_ERRNO | _errno.ENOSYS
+_KILL = sbox._SECCOMP_RET_KILL_PROCESS
+
+
+def test_bpf_interpreter_golden_cases():
+    for arch in ("x86_64", "aarch64"):
+        bpf = sbox.build_seccomp_bpf(machine=arch)
+        nr = sbox.SECCOMP_SYSCALLS[arch]
+        aa = sbox.SECCOMP_AUDIT_ARCH[arch]
+        cases = [
+            ("ioctl", [3, 0x5412], _EPERM),               # TIOCSTI
+            ("ioctl", [3, 0x541C], _EPERM),               # TIOCLINUX
+            ("ioctl", [3, 0x100000000 | 0x5412], _EPERM),  # high word ignored
+            # The regression that shipped in the socket-gate revision: the
+            # ioctl block used to fall through with the cmd still in A, so
+            # an ioctl whose cmd equals the socket() syscall number entered
+            # the family gate and got EPERM for any fd.
+            ("ioctl", [3, nr["socket"]], _ALLOW),
+            ("ioctl", [3, 0], _ALLOW),                    # ordinary ioctl
+            ("clone", [0x10000000], _EPERM),              # CLONE_NEWUSER
+            ("clone", [0x00010000], _ALLOW),              # CLONE_THREAD
+            ("clone", [0], _ALLOW),                       # plain fork
+            ("clone", [0x10000000 | 0x10000], _EPERM),    # NEWUSER | THREAD
+            ("socket", [40], _EPERM),                     # AF_VSOCK
+            ("socket", [17], _EPERM),                     # AF_PACKET
+            ("socket", [1], _ALLOW),                      # AF_UNIX
+            ("socket", [2], _ALLOW),                      # AF_INET
+            ("socket", [10], _ALLOW),                     # AF_INET6
+            ("socket", [16], _ALLOW),                     # AF_NETLINK
+            ("clone3", [], _ENOSYS),
+            ("io_uring_setup", [0], _ENOSYS),
+            ("unshare", [0], _EPERM),
+            ("bpf", [0], _EPERM),
+            ("mount", [0], _EPERM),
+            ("personality", [0], _EPERM),
+            ("open_tree", [0], _EPERM),
+            ("mount_setattr", [0], _EPERM),
+        ]
+        # An unlisted syscall (read: x86_64=0, generic=63) must stay allowed.
+        unlisted = 0 if arch == "x86_64" else 63
+        cases.append((unlisted, [0, 0, 0], _ALLOW))
+        for name, args, want in cases:
+            syscall_nr = nr[name] if isinstance(name, str) else name
+            got = _run_bpf(bpf, aa, syscall_nr, args)
+            assert got == want, f"{arch} {name!r}{args}: got {got:#010x}, want {want:#010x}"
+        # x32 (nr bit 30 set) is killed — x86_64 only, only it has an x32
+        # ABI. Foreign-arch calls are killed on every arch.
+        if arch == "x86_64":
+            assert _run_bpf(bpf, aa, 0x40000000 | unlisted, []) == _KILL
+        assert _run_bpf(bpf, aa ^ 1, unlisted, []) == _KILL
+
+
 # ----------------------------------------------------------------- runner ---
 
 
