@@ -80,15 +80,25 @@ Everything after the first positional (or `--`) is the sandboxed command.
   fail-closed guarantee is checked, not assumed.
 - **Seccomp hardening:** a deny-list filter (io_uring, bpf, perf_event_open,
   userfaultfd, kernel keyring, nested user namespaces, mount/kexec/module
-  syscalls, process-injection APIs — ptrace, process_vm_readv/writev — and
+  syscalls plus the new mount API, process-injection APIs — ptrace,
+  process_vm_readv/writev, kcmp, pidfd_getfd, personality — and
   `ioctl(TIOCSTI/TIOCLINUX)`) is installed by the *first* process inside the
   sandbox and inherited by everything below it: the shell, the socat bridge
-  and the command, so a filtered command cannot inject syscalls into an
-  unfiltered sibling (ptrace/`/proc/<pid>/mem`, Yama scope 1). ENOSYS where
-  runtimes have fallbacks, EPERM elsewhere; foreign-ABI binaries are killed.
-  Needs `python3` inside the sandbox, otherwise skipped with a warning
-  (fatal with `--require-seccomp`); debuggers (gdb/strace) need
-  `--no-seccomp`.
+  and the command — which also runs as pid 1 (`--as-pid-1`), so no unfiltered
+  bwrap reaper init remains inside (on Yama `ptrace_scope=0` systems that
+  parent could otherwise be `/proc/1/mem`-injected, bypassing the filter).
+  `socket()` is limited to `AF_UNIX`/`AF_INET`/`AF_INET6`/`AF_NETLINK`
+  (AF_VSOCK bypasses netns isolation in VM guests on older kernels). ENOSYS
+  where runtimes have fallbacks, EPERM elsewhere; foreign-ABI binaries are
+  killed, thread group included. Without a usable python3 inside the sandbox
+  the filter is **skipped with a warning (fail-open)** — fatal with
+  `--require-seccomp`, the recommended default for untrusted work:
+
+  ```sh
+  alias sbox='sbox.py --require-seccomp'
+  ```
+
+  Debuggers (gdb/strace) and `setarch` need `--no-seccomp`.
 - **Lifecycle:** if any component dies, everything dies (supervisor loop,
   `--die-with-parent`, `PR_SET_PDEATHSIG` on the proxy) — even a SIGKILLed
   launcher takes the proxy with it.
@@ -107,6 +117,12 @@ Everything after the first positional (or `--`) is the sandboxed command.
   CIDRs) and CIDRs with host bits set (`203.0.113.7/24`) are rejected loudly
   instead of being widened or silently allowed.
 - **Ports** are unrestricted unless an entry carries `:port`.
+- **The allowlist is also an exfiltration channel.** Suffix matching means
+  `-a github.com` allows *pushing* to (and gisting from) any repo of yours,
+  not just cloning; multi-tenant domains (`amazonaws.com`, `github.io`,
+  `cloudfront.net`, `pages.dev`, ...) allow attacker-controlled hosts under
+  the same suffix. With `--home`, everything in `$HOME` can leave through
+  any allowed host. Keep allowlists minimal and scoped (`:port` helps).
 
 ### Trust decisions — read before using
 
@@ -126,8 +142,15 @@ Everything after the first positional (or `--`) is the sandboxed command.
   (`--new-session`), host-key prompting fails closed — pass
   `-r ~/.ssh/known_hosts` (or pin hosts in your own `~/.ssh/config`, which
   wins per-option).
-- `--gui` passes through Wayland and X11. X11 allows any client to log
-  keystrokes and capture the screen.
+- `--gui` passes through Wayland and X11. **X11 is effectively an escape**:
+  any client can log keystrokes, capture the screen *and inject input*
+  (XTEST/SendEvent — e.g. type into your terminal, which is host command
+  execution). Treat X11 passthrough as unsandboxed; prefer Wayland.
+- Binding host control sockets (`docker.sock`, `containerd`, `podman`,
+  `crio`, D-Bus, `systemd`, `libvirt`, X11, `gpg-agent`, `pipewire`) via
+  `-b`/`-r` is refused outright: each is a trivial full escape (the container
+  daemon means root). Any other bind is still handed over as requested —
+  the denylist covers well-known names, not every socket on your host.
 - `--net` shares the host network namespace: the allowlist is **not** enforced,
   and host loopback services and abstract Unix sockets (D-Bus, X11, ...) become
   reachable. Only use it for trusted work.

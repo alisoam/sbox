@@ -75,6 +75,10 @@ Allowlist/denial semantics:
 Lifecycle and path handling:
 - `check_bind_paths` validates *realpaths* and `build_bwrap` mounts those same
   resolved paths — validation and mount must never diverge (symlink swaps).
+  Binds covering protected paths are refused, and so are known host control
+  sockets (`CONTROL_SOCKETS`: docker/containerd/D-Bus/systemd/libvirt/X11/
+  gpg-agent/pipewire — each a trivial full escape; they are only *children*
+  of protected paths, which the covers() check deliberately allows).
 - bwrap argv order matters: the automatic cwd bind is emitted **before** user
   binds (a later bind shadows an earlier one at the same target), so explicit
   `-r "$PWD"` wins over the default read-write cwd.
@@ -91,10 +95,21 @@ Seccomp specifics:
   process_vm_readv on x86_64). Three layers pin it down: `tests/
   test_seccomp.py` checks every entry against kernel headers /
   `scmp_sys_resolver` / `ausyscall`, its runtime probe calls `unshare(0)` /
-  `ioctl(TIOCSTI)` / `ptrace(ATTACH)` through the **C library wrappers**
-  (name→number ground truth, so the table cannot fool its own probe), and
-  the sandbox helper self-probes fail-closed at startup before exec'ing the
-  command. Extend the table only together with the test.
+  `ioctl(TIOCSTI)` / `ptrace(ATTACH)` / `personality(0)` through the
+  **C library wrappers** (name→number ground truth, so the table cannot
+  fool its own probe), and the sandbox helper self-probes fail-closed at
+  startup before exec'ing the command. Extend the table only together with
+  the test.
+- `socket()` is family-gated to `SOCKET_FAMILIES` (AF_UNIX/INET/INET6/
+  NETLINK, the Flatpak set) — AF_VSOCK bypasses netns isolation in VM
+  guests on older kernels. Kill actions use `SECCOMP_RET_KILL_PROCESS`
+  (whole thread group), and x32 (same audit arch, nr bit `0x40000000`) is
+  killed explicitly on x86_64.
+- **`--as-pid-1` in the bwrap argv is load-bearing** — never remove it:
+  bwrap otherwise keeps its own *unfiltered* zombie-reaper init as pid 1
+  (the command's parent); on Yama ptrace_scope=0 systems that init can be
+  `/proc/1/mem`-injected, which no syscall ban covers. Trade-off: orphaned
+  grandchildren are not reaped while pid 1 lives.
 - `ptrace` and `process_vm_readv/writev` are denied as defense in depth
   (debuggers — gdb/strace — inside the sandbox need `--no-seccomp`).
 - cBPF argument quirks: the kernel truncates `ioctl`'s cmd to 32 bits, so

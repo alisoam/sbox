@@ -51,16 +51,23 @@ Security model of the proxy (default-deny):
     installed at sandbox startup — the helper is the first process inside
     (after bwrap is done, so the filter cannot break bwrap's own namespace
     setup), and the shell, the socat bridge, the command and all descendants
-    inherit it; nothing unfiltered is left for a filtered process to
-    ptrace or /proc/<pid>/mem-write into. It blocks kernel surface
-    namespaces cannot hide — io_uring_*, bpf, perf_event_open, userfaultfd,
-    the (non-namespaced) kernel keyring, nested user namespaces
-    (unshare/setns/clone3/clone-with-CLONE_NEWUSER), admin ops (mount,
-    umount2, pivot_root, kexec, module loading, open_by_handle_at),
-    process-injection APIs (ptrace, process_vm_readv/writev) and ioctl
-    TIOCSTI/TIOCLINUX. Denied calls return ENOSYS where runtimes have
+    inherit it. The payload also runs as pid 1 (--as-pid-1), so there is no
+    unfiltered bwrap reaper init inside the sandbox: on Yama
+    ptrace_scope=0 systems that parent could otherwise be /proc/1/mem-
+    injected, which the ptrace-syscall ban cannot stop. The filter blocks
+    kernel surface namespaces cannot hide — io_uring_*, bpf,
+    perf_event_open, userfaultfd, the (non-namespaced) kernel keyring,
+    nested user namespaces (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
+    admin ops (mount, umount2, pivot_root, chroot, kexec, module loading,
+    open_by_handle_at and the new mount API: fsopen/fsconfig/fsmount/
+    move_mount/open_tree/mount_setattr), process-injection APIs (ptrace,
+    process_vm_readv/writev, kcmp, pidfd_getfd, personality) and ioctl
+    TIOCSTI/TIOCLINUX; socket() is limited to AF_UNIX/AF_INET/AF_INET6/
+    AF_NETLINK (AF_VSOCK bypasses netns isolation in VM guests on older
+    kernels). Denied calls return ENOSYS where runtimes have
     fallbacks (io_uring users, glibc clone3) and EPERM otherwise;
-    foreign-ABI binaries (e.g. 32-bit compat, x32) are killed.
+    foreign-ABI binaries (e.g. 32-bit compat, x32) are killed, whole
+    thread group included.
     After installing the filter, a fail-closed self-probe requires
     unshare(0) to be denied (EPERM): a wrong number in the hand-typed
     syscall tables would otherwise block the wrong syscall silently. The
@@ -81,17 +88,27 @@ Dependencies: bwrap, socat and python3 >= 3.8 (stdlib only). --net mode needs
 bwrap only.
 
 Known limits (design trade-offs, not bugs):
-  - -b/--ro-bind paths are only refused when they cover a protected path
-    (system dirs, $HOME, /run/user/<uid>); anything else you bind — the
-    launcher's /tmp/sbox.* work dir, which holds proxy.json and any upstream
-    credentials, included — is handed over as requested.
+  - -b/--ro-bind paths are refused when they cover a protected path
+    (system dirs, $HOME, /run/user/<uid>) or ARE a known host control
+    socket (CONTROL_SOCKETS: docker/containerd, D-Bus, systemd, libvirt,
+    X11, gpg-agent/pipewire sockets) — but the list is a denylist of
+    well-known names, not a guarantee; anything else you bind — the
+    launcher's /tmp/sbox.* work dir, which holds proxy.json and any
+    upstream credentials, included — is handed over as requested.
   - No resource limits (CPU/memory/PID/fds) inside the sandbox; the
     boundary is bwrap's namespaces plus the seccomp deny-list above. That
     deny-list is best-effort hardening: unsupported architectures or a
-    sandbox without python3 disable it (with a warning), and --no-seccomp
-    opts out entirely.
-  - Ports are unrestricted unless an entry carries :port, and there is no
-    domain-fronting protection (an allowed CDN host may serve many origins).
+    sandbox without python3 disable it (with a warning — fail-open;
+    --require-seccomp makes it fatal, consider it in your alias), and
+    --no-seccomp opts out entirely.
+  - The allowlist is also an exfiltration channel. Suffix matching means
+    -a github.com allows pushing to (and gisting from) any repo of yours,
+    not just cloning; multi-tenant domains (amazonaws.com, github.io,
+    cloudfront.net, pages.dev, ...) allow attacker-controlled hosts under
+    the same suffix. With --home, everything in $HOME can leave through
+    any allowed host. Ports are unrestricted unless an entry carries
+    :port, and there is no domain-fronting protection (an allowed CDN
+    host may serve many origins).
   - With --upstream, the destination reaches the upstream as a literal IP:
     it sees CONNECT 1.2.3.4:443, never the hostname. Hostname-based policy
     or logging on that proxy cannot work, and some proxies reject IP
@@ -835,6 +852,15 @@ def self_test(sock_path: str, allows: list[dict]) -> None:
 #                             sandbox shares the filter, but deny the
 #                             injection APIs outright (gdb/strace need
 #                             --no-seccomp)
+#   kcmp, pidfd_getfd,        more process-inspection/fd-stealing surface
+#   personality, chroot       legacy attack surface (setarch -R needs
+#                             --no-seccomp)
+#   fsopen, fsmount, fsconfig, the new mount API: same powers as mount(),
+#   move_mount, open_tree,    which the caps normally already gate — pure
+#   mount_setattr             defense in depth
+#   socket(AF_VSOCK/AF_       AF_VSOCK reaches the hypervisor in VM guests,
+#   PACKET/...)               bypassing the netns on older kernels; only
+#                             AF_UNIX/INET/INET6/NETLINK pass (Flatpak's set)
 #   ioctl TIOCSTI /           injecting keystrokes into the controlling tty
 #   TIOCLINUX                 / raw console ioctls (--new-session already
 #                             blunts TIOCSTI; this is belt and braces)
@@ -844,35 +870,41 @@ def self_test(sock_path: str, allows: list[dict]) -> None:
 # code has fallbacks (io_uring users fall back to plain threads; glibc falls
 # back from clone3 to clone — EPERM there would break threading) and EPERM
 # elsewhere. Foreign-ABI binaries (e.g. i386 compat under an x86_64 kernel)
-# are killed: syscall numbers differ per ABI, so number-based filtering
-# would be meaningless for them. x32 is the exception the arch check cannot
-# catch (same AUDIT_ARCH_X86_64, bit 0x40000000 in the number) — it is
-# killed explicitly on x86_64.
+# are killed — the whole thread group (SECCOMP_RET_KILL_PROCESS): syscall
+# numbers differ per ABI, so number-based filtering would be meaningless
+# for them. x32 is the exception the arch check cannot catch (same
+# AUDIT_ARCH_X86_64, bit 0x40000000 in the number) — it is killed
+# explicitly on x86_64.
 
 # Native syscall numbers; aarch64 and riscv64 share the asm-generic table.
 # Hand-typed: tests/test_seccomp.py cross-checks every entry against kernel
 # headers / scmp_sys_resolver / ausyscall — extend it when editing this.
 SECCOMP_SYSCALLS = {
     "x86_64": {
-        "ioctl": 16, "clone": 56, "ptrace": 101, "pivot_root": 155,
-        "mount": 165, "umount2": 166, "init_module": 175, "delete_module": 176,
+        "ioctl": 16, "clone": 56, "socket": 41, "ptrace": 101,
+        "personality": 135, "pivot_root": 155, "mount": 165, "chroot": 161,
+        "umount2": 166, "init_module": 175, "delete_module": 176,
         "kexec_load": 246, "add_key": 248, "request_key": 249, "keyctl": 250,
         "perf_event_open": 298, "open_by_handle_at": 304, "setns": 308,
-        "process_vm_readv": 310, "process_vm_writev": 311,
+        "process_vm_readv": 310, "process_vm_writev": 311, "kcmp": 312,
         "unshare": 272, "finit_module": 313, "kexec_file_load": 320,
         "bpf": 321, "userfaultfd": 323, "io_uring_setup": 425,
-        "io_uring_enter": 426, "io_uring_register": 427, "clone3": 435,
+        "io_uring_enter": 426, "io_uring_register": 427, "open_tree": 428,
+        "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432,
+        "clone3": 435, "pidfd_getfd": 438, "mount_setattr": 442,
     },
     "aarch64": {
         "umount2": 39, "mount": 40, "pivot_root": 41, "ptrace": 117,
-        "unshare": 97, "kexec_load": 104, "init_module": 105,
-        "delete_module": 106, "clone": 220, "add_key": 217, "request_key": 218,
-        "keyctl": 219, "ioctl": 29, "perf_event_open": 241,
-        "open_by_handle_at": 265, "process_vm_readv": 270,
-        "process_vm_writev": 271, "setns": 268, "kexec_file_load": 294,
-        "bpf": 280, "finit_module": 273, "userfaultfd": 282,
-        "io_uring_setup": 425, "io_uring_enter": 426,
-        "io_uring_register": 427, "clone3": 435,
+        "chroot": 51, "personality": 92, "unshare": 97, "kexec_load": 104,
+        "init_module": 105, "delete_module": 106, "socket": 198,
+        "clone": 220, "add_key": 217, "request_key": 218, "keyctl": 219,
+        "ioctl": 29, "perf_event_open": 241, "open_by_handle_at": 265,
+        "process_vm_readv": 270, "process_vm_writev": 271, "kcmp": 272,
+        "finit_module": 273, "setns": 268, "kexec_file_load": 294,
+        "bpf": 280, "userfaultfd": 282, "io_uring_setup": 425,
+        "io_uring_enter": 426, "io_uring_register": 427, "open_tree": 428,
+        "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432,
+        "clone3": 435, "pidfd_getfd": 438, "mount_setattr": 442,
     },
 }
 SECCOMP_SYSCALLS["riscv64"] = SECCOMP_SYSCALLS["aarch64"]
@@ -889,13 +921,22 @@ SECCOMP_EPERM = (
     "bpf", "perf_event_open", "userfaultfd",
     "keyctl", "add_key", "request_key",
     "unshare", "setns", "ptrace", "process_vm_readv", "process_vm_writev",
+    "kcmp", "pidfd_getfd", "personality", "chroot",
     "mount", "umount2", "pivot_root", "kexec_load", "kexec_file_load",
     "init_module", "finit_module", "delete_module", "open_by_handle_at",
+    "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount",
+    "mount_setattr",
 )
 
 CLONE_NEWUSER = 0x10000000
 TIOCSTI = 0x5412
 TIOCLINUX = 0x541C
+
+# Socket families the filter allows (identical values on every arch we
+# support): AF_UNIX, AF_INET, AF_INET6, AF_NETLINK — the Flatpak set.
+# Everything else (AF_VSOCK, AF_PACKET, ...) is refused: AF_VSOCK can bypass
+# network-namespace isolation in VM guests on older kernels.
+SOCKET_FAMILIES = (1, 2, 10, 16)
 
 # cBPF machine constants (linux/filter.h) + seccomp return actions.
 _BPF_LD_W_ABS = 0x20   # A = u32 at seccomp_data offset k
@@ -905,6 +946,9 @@ _BPF_RET_K = 0x06
 _SECCOMP_RET_ALLOW = 0x7FFF0000
 _SECCOMP_RET_ERRNO = 0x00050000
 _SECCOMP_RET_KILL_THREAD = 0x00000000
+# Kills the whole thread group, not just the calling thread (kernel >= 4.14;
+# bwrap sandboxes require user namespaces anyway, so old kernels are moot).
+_SECCOMP_RET_KILL_PROCESS = 0x80000000
 
 
 def seccomp_machine(machine: str = "") -> str:
@@ -962,15 +1006,26 @@ def build_seccomp_bpf(machine: str = "") -> bytes | None:
     emit(_BPF_LD_W_ABS, 24)                      # args[1] low word (cmd is u32)
     emit(_BPF_JEQ_K, TIOCSTI, "eperm", None)
     emit(_BPF_JEQ_K, TIOCLINUX, "eperm", None)
+    marks["after_ioctl"] = len(insns)
+    # socket(): allow only the usual families (SOCKET_FAMILIES; Flatpak's
+    # set). AF_VSOCK notably reaches the host hypervisor in VM guests,
+    # bypassing the network namespace on older kernels. socketpair() is not
+    # restricted: a socket pair never connects anywhere.
+    emit(_BPF_JEQ_K, table["socket"], None, "after_socket")
+    emit(_BPF_LD_W_ABS, 16)                      # args[0] low word (domain)
+    for fam in SOCKET_FAMILIES:
+        emit(_BPF_JEQ_K, fam, "allow", None)
+    emit(_BPF_RET_K, _SECCOMP_RET_ERRNO | errno.EPERM)
     # The default ALLOW comes directly after the last rule (fall-through
     # and skip targets must reach it, not the RET blocks below).
-    marks["after_ioctl"] = len(insns)
+    marks["after_socket"] = len(insns)
+    marks["allow"] = len(insns)
     emit(_BPF_RET_K, _SECCOMP_RET_ALLOW)
     # Action blocks for the deny rules and the arch-mismatch kill.
     for label, action in (
         ("enosys", _SECCOMP_RET_ERRNO | errno.ENOSYS),
         ("eperm", _SECCOMP_RET_ERRNO | errno.EPERM),
-        ("kill", _SECCOMP_RET_KILL_THREAD),
+        ("kill", _SECCOMP_RET_KILL_PROCESS),
     ):
         marks[label] = len(insns)
         emit(_BPF_RET_K, action)
@@ -1125,6 +1180,29 @@ def protected_paths(home: str) -> set[str]:
     return set(SYSTEM_DIRS) | {os.path.realpath(home), "/run/user", f"/run/user/{os.getuid()}"}
 
 
+# Well-known host control sockets: binding any of these hands the sandbox
+# full control of the host (docker/containerd/CRI-O = root via the container
+# daemon; D-Bus/systemd = arbitrary privileged services; libvirt = VMs;
+# ~/.config X11 = input injection; the session bus or gpg-agent = your
+# identity) — a trivial escape, so they are refused exactly like protected
+# paths even though they are only *children* of them. realpath() collapses
+# the /var/run -> /run symlink, so listing both spellings is belt and braces.
+CONTROL_SOCKETS = {
+    "/run/docker.sock", "/var/run/docker.sock",
+    "/run/podman/podman.sock", "/var/run/podman/podman.sock",
+    "/run/containerd/containerd.sock", "/var/run/containerd/containerd.sock",
+    "/run/crio/crio.sock",
+    "/run/dbus/system_bus_socket", "/var/run/dbus/system_bus_socket",
+    "/run/systemd/private", "/run/systemd/journal/socket",
+    "/run/libvirt/libvirt-sock", "/var/run/libvirt/libvirt-sock",
+    "/run/libvirt/libvirt-sock-ro", "/var/run/libvirt/libvirt-sock-ro",
+    "/tmp/.X11-unix",
+    f"/run/user/{os.getuid()}/bus",
+    f"/run/user/{os.getuid()}/gnupg/S.gpg-agent",
+    f"/run/user/{os.getuid()}/pipewire-0",
+}
+
+
 def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
     """Validate -b/--ro-bind before anything is started; return the resolved
     (flag, realpath) pairs that build_bwrap mounts — validation and mount
@@ -1134,7 +1212,8 @@ def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
     Whatever these paths really point at is handed to the sandbox, so refuse
     anything that covers a protected path (an ancestor of — or equal to —
     $HOME, a system dir, or the user runtime dir with its agent/pipewire/
-    D-Bus sockets). Children are fine (e.g. -b ~/proj). -b $HOME itself is
+    D-Bus sockets) or IS a known host control socket (CONTROL_SOCKETS —
+    docker.sock, D-Bus, systemd, ...). Children are fine (e.g. -b ~/proj). -b $HOME itself is
     only acceptable together with --home (which binds it anyway); anything
     that merely covers $HOME, like /home, is still refused.
     """
@@ -1150,6 +1229,10 @@ def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
                 die(f"{flag} {p} covers protected path(s): {', '.join(hits)}"
                     + ("; use --home to bind $HOME itself"
                        if flag == "--bind" and rp == real_home else ""))
+            if rp in CONTROL_SOCKETS or rp.startswith("/tmp/.X11-unix/"):
+                die(f"{flag} {p} binds the host control socket {rp} — that "
+                    "hands the sandbox full control of the host (container "
+                    "runtime, D-Bus/systemd, X11, ...); refusing")
             binds.append((flag, rp))
     return binds
 
@@ -1180,6 +1263,13 @@ def build_bwrap(opts, sand: str, sock: str, home: str, user_binds: list[tuple[st
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
+        # Run the payload as pid 1 instead of bwrap's own zombie-reaper
+        # init: that init is NOT covered by our seccomp filter and is the
+        # command's PARENT, so on Yama ptrace_scope=0 systems a filtered
+        # process could write to /proc/1/mem and inject syscalls into it
+        # (the ptrace-syscall ban does not cover /proc/<pid>/mem). Trade-
+        # off: orphaned grandchildren are not reaped while pid 1 lives.
+        "--as-pid-1",
         "--clearenv",
         "--setenv", "HOME", home,
         "--setenv", "USER", user,
@@ -1241,8 +1331,10 @@ def build_bwrap(opts, sand: str, sock: str, home: str, user_binds: list[tuple[st
         bw += ["--perms", "0700", "--tmpfs", home]
 
     if opts.gui:
-        # X11 allows any client to log keys / capture the screen; Wayland is
-        # the preferred path. Keep the sockets themselves read-only.
+        # X11 allows any client to log keys, capture the screen AND inject
+        # input (XTEST/SendEvent) — i.e. type into your terminal: treat X11
+        # passthrough as unsandboxed. Wayland is the preferred path. Keep
+        # the sockets themselves read-only.
         xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
         bw += ["--setenv", "XDG_RUNTIME_DIR", xdg, "--perms", "0700", "--dir", xdg]
         wl = os.environ.get("WAYLAND_DISPLAY")
@@ -1536,8 +1628,13 @@ guard; effectively catch-all networks such as 0.0.0.0/1 are refused).
 Notes:
   - --net also exposes host loopback services and abstract Unix sockets
     (D-Bus, X11, ...) to the sandbox; only use it for trusted work.
-  - --gui passes through Wayland (preferred) and X11. X11 lets any client
-    log keystrokes and capture the screen.
+  - --gui passes through Wayland (preferred) and X11. X11 is effectively an
+    escape: any client can log keystrokes, capture the screen and inject
+    input (XTEST/SendEvent — e.g. type into your terminal = host command
+    execution). Treat X11 passthrough as unsandboxed.
+  - -b/-r of known host control sockets (docker.sock, containerd, D-Bus,
+    systemd, libvirt, X11, gpg-agent, pipewire) is refused: each is a
+    trivial full escape.
   - --ssh-agent forwards $SSH_AUTH_SOCK to /run/ssh-agent.sock (read-only,
     $SSH_AUTH_SOCK preset). Combined with the injected ssh config, ssh can
     then authenticate with your keys through the allowlisted proxy. Note
@@ -1562,17 +1659,21 @@ Notes:
     sbox.py, which then tears the whole sandbox down.
   - Seccomp deny-list: io_uring_*, bpf, perf_event_open, userfaultfd,
     keyring, namespace (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
-    admin (mount/pivot_root/kexec/module loading/open_by_handle_at) and
-    process-injection (ptrace, process_vm_readv/writev) syscalls plus
-    ioctl(TIOCSTI/TIOCLINUX) are refused inside the sandbox — ENOSYS where
+    admin (mount/pivot_root/chroot/kexec/module loading/open_by_handle_at
+    and the new mount API fsopen/fsmount/move_mount/...), process-
+    inspection/injection (ptrace, process_vm_*/kcmp/pidfd_getfd/personality)
+    syscalls plus ioctl(TIOCSTI/TIOCLINUX) are refused inside the sandbox;
+    socket() is limited to AF_UNIX/AF_INET/AF_INET6/AF_NETLINK (AF_VSOCK
+    bypasses netns isolation in VM guests on older kernels) — ENOSYS where
     runtimes have fallbacks, EPERM otherwise; foreign-ABI binaries (e.g.
-    32-bit compat, x32) are killed. The filter covers everything inside the
-    sandbox from the first process (the socat bridge included). Needs
-    python3 inside the sandbox; perf, io_uring runtimes, unshare-based
-    builders, keyring-using kerberos, debuggers (gdb/strace) or nested
-    containers need --no-seccomp. --require-seccomp aborts instead of
-    warning when the filter cannot be installed (no python3 in the
-    sandbox, unsupported architecture).
+    32-bit compat, x32) are killed. The filter covers everything inside
+    the sandbox from the first process (the socat bridge included; the
+    payload runs as pid 1, so no unfiltered bwrap reaper init remains).
+    Needs python3 inside the sandbox; perf, io_uring runtimes, unshare-
+    based builders, keyring-using kerberos, debuggers (gdb/strace), setarch
+    or nested containers need --no-seccomp. Without it the launcher
+    FAILS OPEN with a warning — --require-seccomp makes that fatal and is
+    the recommended default for untrusted work (put it in your alias).
 
 Examples:
   sbox.py -a pypi.org -a files.pythonhosted.org -- pip install requests
@@ -1592,7 +1693,9 @@ Examples:
                         help="Bind PATH read-only at the same location. Repeatable.")
     parser.add_argument("--ro-cwd", action="store_true", help="Mount the current directory read-only (default: rw).")
     parser.add_argument("--home", action="store_true", help="Bind the real $HOME (default: private tmpfs home).")
-    parser.add_argument("--gui", action="store_true", help="Pass through Wayland/X11 sockets (X11: see notes).")
+    parser.add_argument("--gui", action="store_true",
+                        help="Pass through Wayland/X11 sockets. X11 is effectively an escape: clients can "
+                             "log keys, capture the screen and inject input (XTEST) — treat it as unsandboxed.")
     parser.add_argument("--ssh-agent", action="store_true",
                         help="Forward the host SSH agent socket ($SSH_AUTH_SOCK) into the sandbox, read-only, "
                              "at /run/ssh-agent.sock. Anything in the sandbox can then sign with every key "

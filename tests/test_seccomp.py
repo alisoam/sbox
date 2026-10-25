@@ -229,6 +229,24 @@ def test_filter_runtime_probe():
                                  nr["ioctl"], rfd,
                                  ctypes.c_ulong(0x100000000 | sbox.TIOCSTI),
                                  0, expect_errno=EPERM))
+            # socket() family gate: AF_VSOCK (netns bypass in VM guests)
+            # and AF_PACKET must be refused; AF_UNIX/AF_INET still work.
+            # glibc socket() wrapper = name->number ground truth.
+            results.append(probe_fn("socket(AF_VSOCK) denied EPERM",
+                                    lambda: libc.socket(40, 1, 0), EPERM))
+            results.append(probe_fn("socket(AF_PACKET) denied EPERM",
+                                    lambda: libc.socket(17, 1, 0), EPERM))
+            vsock_fd = libc.socket(2, 1, 0)  # AF_INET must still work
+            results.append({"label": "control socket(AF_INET) allowed",
+                            "rc": vsock_fd, "errno": ctypes.get_errno(),
+                            "ok": vsock_fd >= 0})
+            if vsock_fd >= 0:
+                os.close(vsock_fd)
+            # personality(0) is PER_LINUX, a harmless no-op that returns 0
+            # unfiltered — EPERM here proves the new deny entry fires
+            # (glibc wrapper => ground truth for the number).
+            results.append(probe_fn("personality(0) denied EPERM",
+                                    lambda: libc.personality(0), EPERM))
             if kver >= (5, 3):
                 # Unfiltered clone3(NULL, 0) is EINVAL; filtered ENOSYS.
                 results.append(probe("clone3(NULL,0) ENOSYS", nr["clone3"],
@@ -308,7 +326,8 @@ def test_tables_structurally_consistent():
     assert len(keysets) == 1, f"arch tables disagree on entries: {keysets}"
     names = set(keysets.pop())
     # Every name the BPF builder references must exist in every table...
-    for req in sbox.SECCOMP_FAKE_MISSING + sbox.SECCOMP_EPERM + ("clone", "ioctl"):
+    for req in sbox.SECCOMP_FAKE_MISSING + sbox.SECCOMP_EPERM + (
+            "clone", "ioctl", "socket"):
         assert req in names, f"{req!r} missing from SECCOMP_SYSCALLS"
     # ...and the BPF must actually build for every supported arch.
     for arch in archs:
@@ -323,10 +342,22 @@ def test_tables_structurally_consistent():
             assert x32, "x86_64: missing x32 kill rule (JSET 0x40000000)"
             target = insns[x32[0] + 1 + insns[x32[0]][1]]
             assert (target[0] == sbox._BPF_RET_K
-                    and target[3] == sbox._SECCOMP_RET_KILL_THREAD), (
-                f"x32 rule must jump to RET KILL_THREAD, got {target}")
+                    and target[3] == sbox._SECCOMP_RET_KILL_PROCESS), (
+                f"x32 rule must jump to RET KILL_PROCESS, got {target}")
         else:
             assert not x32, f"{arch}: unexpected x32 kill rule"
+        # The socket-family gate must exist: JEQ socket_nr followed by a
+        # load of args[0] and one allow-jump per family in SOCKET_FAMILIES.
+        nr = sbox.SECCOMP_SYSCALLS[arch]
+        gate = [i for i, (c, _jt, _jf, k) in enumerate(insns)
+                if c == sbox._BPF_JEQ_K and k == nr["socket"]]
+        assert gate, f"{arch}: missing socket() rule"
+        i = gate[0]
+        assert insns[i + 1] == (sbox._BPF_LD_W_ABS, 0, 0, 16), (
+            f"{arch}: socket rule must load args[0] (domain) next")
+        fams = [insns[j][3] for j in range(i + 2, i + 2 + len(sbox.SOCKET_FAMILIES))]
+        assert sorted(fams) == sorted(sbox.SOCKET_FAMILIES), (
+            f"{arch}: socket families {fams} != {sbox.SOCKET_FAMILIES}")
 
 
 def test_seccomp_helper_execs():
