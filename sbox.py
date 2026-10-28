@@ -47,33 +47,71 @@ Security model of the proxy (default-deny):
     non-allowed destination is refused on both protocols before the sandbox
     starts, so the fail-closed guarantee is checked, not assumed.
 
-  - Seccomp hardening on top of the namespaces: a deny-list filter is
-    installed at sandbox startup — the helper is the first process inside
-    (after bwrap is done, so the filter cannot break bwrap's own namespace
-    setup), and the shell, the socat bridge, the command and all descendants
-    inherit it. The payload also runs as pid 1 (--as-pid-1), so there is no
-    unfiltered bwrap reaper init inside the sandbox: on Yama
+  - Seccomp hardening on top of the namespaces: a deny-list cBPF filter is
+    installed by bwrap itself, as the very last step before exec'ing the
+    payload (--add-seccomp-fd; --seccomp on older bwrap) — after bwrap's own
+    namespace setup, but before the payload's first instruction, so the
+    shell, the socat bridge, the command and all descendants inherit it and
+    nothing inside the sandbox ever runs unfiltered. (An in-sandbox helper
+    used to install it; that had a pre-filter window — python3's site.py
+    processes user .pth files and usercustomize, so code planted by a
+    previous sandbox run under --home could fork an unfiltered child — and
+    a fail-open default, because it needed python3 inside the sandbox.
+    bwrap needs neither.) The payload also runs as pid 1 (--as-pid-1), so
+    there is no unfiltered bwrap reaper init inside the sandbox: on Yama
     ptrace_scope=0 systems that parent could otherwise be /proc/1/mem-
-    injected, which the ptrace-syscall ban cannot stop. The filter blocks
+    injected, which the ptrace-syscall ban cannot stop. On bwrap >= 0.8 the
+    launcher also passes --disable-userns --assert-userns-disabled: nested
+    user namespaces are then blocked at the kernel level
+    (max_user_namespaces in a nested user namespace; bwrap verifies it),
+    not only by the hand-typed syscall numbers below. The filter blocks
     kernel surface namespaces cannot hide — io_uring_*, bpf,
     perf_event_open, userfaultfd, the (non-namespaced) kernel keyring,
     nested user namespaces (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
     admin ops (mount, umount2, pivot_root, chroot, kexec, module loading,
-    open_by_handle_at and the new mount API: fsopen/fsconfig/fsmount/
-    move_mount/open_tree/mount_setattr), process-injection APIs (ptrace,
-    process_vm_readv/writev, kcmp, pidfd_getfd, personality) and ioctl
-    TIOCSTI/TIOCLINUX; socket() is limited to AF_UNIX/AF_INET/AF_INET6/
-    AF_NETLINK (AF_VSOCK bypasses netns isolation in VM guests on older
-    kernels). Denied calls return ENOSYS where runtimes have
-    fallbacks (io_uring users, glibc clone3) and EPERM otherwise;
-    foreign-ABI binaries (e.g. 32-bit compat, x32) are killed, whole
-    thread group included.
-    After installing the filter, a fail-closed self-probe requires
-    unshare(0) to be denied (EPERM): a wrong number in the hand-typed
-    syscall tables would otherwise block the wrong syscall silently. The
-    tables are cross-checked against kernel headers by tests/test_seccomp.py.
-    --no-seccomp opts out; without python3 inside the sandbox the filter is
-    skipped with a loud warning, which --require-seccomp turns fatal.
+    open_by_handle_at, name_to_handle_at, quotactl, syslog and the new
+    mount API: fsopen/fsconfig/fsmount/move_mount/open_tree/
+    mount_setattr), process-injection APIs (ptrace, process_vm_readv/
+    writev, kcmp, pidfd_getfd, personality, vmsplice) and ioctl
+    TIOCSTI/TIOCLINUX; fanotify_init is denied too; socket() is limited to
+    AF_UNIX/AF_INET/AF_INET6/AF_NETLINK (AF_VSOCK bypasses netns isolation
+    in VM guests on older kernels). Denied calls return ENOSYS where
+    runtimes have fallbacks (io_uring users, glibc clone3) and EPERM
+    otherwise; foreign-ABI binaries (e.g. 32-bit compat, x32) are killed,
+    whole thread group included. Fail-closed, not fail-open: if the filter
+    cannot be installed (unsupported architecture, or a bwrap without
+    seccomp support) the launcher refuses to run; --no-seccomp is the
+    explicit opt-out. The hand-typed syscall tables are cross-checked
+    against kernel headers / scmp_sys_resolver / ausyscall and a live
+    filter probe by tests/test_seccomp.py (a wrong number once shipped
+    here).
+
+  - --filter-output (terminal output filtering): the sandbox shares the
+    host terminal, and output is input to the terminal EMULATOR — OSC 52
+    rewrites the clipboard, device queries elicit answerback replies,
+    cursor/erase sequences can forge already-reviewed output, SGR 8
+    (conceal) hides text from the reader, bidi/zero-width characters
+    deceive. --new-session blocks TIOCSTI INPUT injection; this is the
+    output counterpart. bwrap's stdin/stdout/stderr become a host-side
+    pty SLAVE (the real host terminal fd never enters the sandbox —
+    close_fds guarantees bwrap gets nothing else), and everything read
+    from the master passes an allowlist filter before reaching the host
+    terminal: printable text, \n/\r/\t and SGR color/style sequences
+    (parameter string [0-9;]{0,64}, mode-8 conceal stripped) pass;
+    OSC/DCS/APC/PM/SOS strings, non-SGR CSI, 2-byte and intermediate ESC
+    sequences, remaining C0/C1 controls (incl. U+009B) and bidi/zero-
+    width characters are dropped silently. A bare \r is allowed by
+    default (progress bars depend on it), which also lets payload output
+    VISUALLY overwrite the current line ("curl evil | sh\r" then "ok");
+    --strict-crlf (implies --filter-output) drops \r unless it is
+    immediately followed by \n. Trailing incomplete sequences
+    are held across read() chunk boundaries and dropped past 4096 bytes;
+    decoding is stateful UTF-8 with errors="replace". Host stdin is
+    forwarded byte-wise into the pty — the host tty runs in raw mode for
+    the duration (SIGWINCH forwarded via TIOCGWINSZ/TIOCSWINSZ, termios
+    restored in a finally); piped stdin is forwarded too (EOF delivered
+    as the pty's VEOF, ^D). Needs no new dependencies
+    (pty/tty/termios/select).
 
   - --net skips all of the above: bwrap then shares the host network
     namespace (--unshare-all --share-net), /etc/resolv.conf is mounted, and
@@ -84,8 +122,12 @@ Security model of the proxy (default-deny):
     --die-with-parent on bwrap, PR_SET_PDEATHSIG on the proxy; a SIGKILLed
     launcher therefore still takes the proxy with it).
 
-Dependencies: bwrap, socat and python3 >= 3.8 (stdlib only). --net mode needs
-bwrap only.
+Dependencies: bwrap, socat and python3 >= 3.8 on the host (stdlib only;
+the seccomp filter is installed by bwrap itself — no python3 is needed
+INSIDE the sandbox). The deny-list needs bwrap >= 0.4.1 (--seccomp) or any
+newer bwrap (--add-seccomp-fd); --disable-userns needs >= 0.8 and
+fd-pinned binds (below) need >= 0.10 — older bwrap degrades with a loud
+note. --net mode needs bwrap only.
 
 Known limits (design trade-offs, not bugs):
   - -b/--ro-bind paths are refused when they cover a protected path
@@ -98,6 +140,17 @@ Known limits (design trade-offs, not bugs):
     rules fail-close it). Anything else you
     bind — the launcher's /tmp/sbox.* work dir, which holds proxy.json and
     any upstream credentials, included — is handed over as requested.
+    Validation and mount cannot diverge: the resolved source paths are
+    opened O_PATH|O_NOFOLLOW (component-by-component openat walk, inode
+    re-checked) and passed to bwrap >= 0.10 as --bind-fd/--ro-bind-fd, so
+    a concurrent sandbox sharing a writable directory cannot swap a
+    component for a symlink between check and mount (older bwrap: path
+    binds, with a note).
+  - Read-write binds of $HOME children are host code execution at next
+    login/session (shell rc files, ~/.ssh/authorized_keys, systemd user
+    units, XDG autostart, ~/.local/bin): a warning names the covered
+    PERSISTENCE_PATHS — refusal would just lag reality. The rw cwd mount
+    is the same deal by design (.git/hooks et al.); see the epilog.
   - --as-pid-1 makes the command pid 1 of the sandbox: long-lived commands
     that spawn and abandon children accumulate zombies (nothing reaps
     them; a shell as pid 1 reaps via waitpid(-1)), and signals sent to
@@ -106,10 +159,12 @@ Known limits (design trade-offs, not bugs):
     sbox.py, --die-with-parent) works exactly as before.
   - No resource limits (CPU/memory/PID/fds) inside the sandbox; the
     boundary is bwrap's namespaces plus the seccomp deny-list above. That
-    deny-list is best-effort hardening: unsupported architectures or a
-    sandbox without python3 disable it (with a warning — fail-open;
-    --require-seccomp makes it fatal, consider it in your alias), and
-    --no-seccomp opts out entirely.
+    deny-list is best-effort hardening against kernel attack surface; it
+    is deny-list, so anything unlisted stays allowed, and any kernel bug
+    reachable through an allowed syscall is still a full escape. It is
+    fail-closed though: an unsupported architecture or a bwrap without
+    seccomp support is a hard error, not a silent skip (--no-seccomp opts
+    out explicitly).
   - The allowlist is also an exfiltration channel. Suffix matching means
     -a github.com allows pushing to (and gisting from) any repo of yours,
     not just cloning; multi-tenant domains (amazonaws.com, github.io,
@@ -135,6 +190,28 @@ Known limits (design trade-offs, not bugs):
   - The proxy has no connection caps, idle timeouts or header-count limits,
     tunnels have no TCP half-close, and only the first resolved address is
     tried when chaining through an upstream.
+  - --filter-output: the pty slave is an inherited fd and cannot become
+    the sandbox's controlling terminal (bwrap --new-session already
+    started a fresh session), so job control inside is limited (shells
+    report "no job control"). With the host tty raw, Ctrl-C is delivered
+    to the sandbox as a byte: a command that never reads stdin cannot be
+    interrupted from the keyboard — kill sbox.py from another shell. The
+    filter is an allowlist: unusual-but-harmless characters beyond the
+    deny ranges (NBSP, soft hyphen, other Unicode format characters) are
+    dropped too, an unterminated OSC/DCS swallows following bytes until
+    its terminator or the 4096-byte cap (fail-safe: less is displayed,
+    never more), and SGR sequences containing conceal are dropped
+    wholesale rather than rewritten. Hidden text is NOT prevented beyond
+    SGR 8: matching foreground/background colors (black-on-black
+    \x1b[30;40m, truecolor fg==bg) hide text just as well, and dropping
+    all background colors would break legitimate output — review with
+    colors off if it matters. A bare \r passes by default (progress
+    bars); --strict-crlf drops it unless followed by \n. If the host
+    terminal is not in UTF-8 mode while the sanitizer emits UTF-8,
+    continuation bytes 0x80-0x9F of multibyte characters can be read as
+    raw C1 controls by the terminal (niche misconfiguration — put the
+    host terminal in UTF-8). A SIGKILL of the launcher leaves
+    the host tty raw (as with any killed terminal program — run `reset`).
 
 Installed to ~/.local/bin via config/sync.py (Directory("bin", ..., "~/.local/bin")).
 """
@@ -144,13 +221,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import codecs
 import ctypes
 import errno
+import fcntl
 import ipaddress
 import json
 import os
 import platform
+import pty
 import re
+import select
 import shutil
 import signal
 import socket
@@ -160,8 +241,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import traceback
+import tty
 import urllib.parse
 
 PROG = "sbox.py"
@@ -191,8 +274,16 @@ def covers(a: str, b: str) -> bool:
     return b == a or b.startswith(a + "/")
 
 
+# True while --filter-output holds the host tty in raw mode: the sbox.py
+# diagnostics below must CR their own newlines then (OPOST is off).
+_raw_term = False
+
+
 def err(msg: str) -> None:
-    print(f"{PROG}: {msg}", file=sys.stderr, flush=True)
+    line = f"{PROG}: {msg}"
+    if _raw_term:
+        line = line.replace("\n", "\r\n") + "\r"
+    print(line, file=sys.stderr, flush=True)
 
 
 def die(msg: str) -> None:
@@ -837,11 +928,376 @@ def self_test(sock_path: str, allows: list[dict]) -> None:
         die(f"self-test: cannot talk to the proxy ({e!r}) — failing closed")
 
 
+# --------------------------------------------------------- output filter ---
+# --filter-output: the sandbox shares the host terminal, and output is
+# INPUT to the terminal emulator: OSC 52 rewrites the clipboard, device
+# status queries elicit answerback replies, cursor/erase sequences can
+# forge already-reviewed output, SGR 8 (conceal) hides text from the
+# human reading it, bidi overrides and zero-width characters deceive.
+# --new-session (always on) blocks TIOCSTI input injection; this is the
+# output-side counterpart: a host-side pty whose slave is the sandbox's
+# ONLY stdio (the real host terminal fd never enters the sandbox), and
+# everything read from the master passes an allowlist filter before it
+# reaches the host terminal.
+
+ESCAPE = "\x1b"
+BEL = "\x07"
+CAN = "\x18"    # VT parser abort codes for a pending escape sequence
+SUB = "\x1a"
+
+# The ONLY escapes the filter lets through: SGR color/style whose
+# parameter string is digits and semicolons, at most 64 chars. The regex
+# is the whole validity check — every other CSI body (private markers
+# like '?', intermediates, ':' subparameters) fails it and is dropped.
+SGR_PARAMS_RE = re.compile(r"[0-9;]{0,64}")
+
+# An unterminated escape sequence is dropped wholesale past this many
+# bytes, so a malformed stream cannot grow host memory without bound.
+# The buffer holds decoded characters but the cap counts bytes (each
+# add accounts for the UTF-8 encoding of the character).
+MAX_PENDING_SEQ = 4096
+
+# Backlog cap for stdin bytes the sandbox is not reading: the pty buffer
+# is small, the pump never blocks, so slow consumers must not make the
+# host-side buffer unbounded. Beyond it, newly read input is dropped.
+MAX_PENDING_INPUT = 262144
+
+# Filter states: plain text, after ESC, ESC + intermediates, inside CSI,
+# inside a string (OSC/DCS/APC/PM/SOS), and the ESC seen inside one.
+_F_PLAIN, _F_ESC, _F_ESC_INT, _F_CSI, _F_STR, _F_STR_ESC = range(6)
+
+# ESC ] OSC, ESC P DCS, ESC _ APC, ESC ^ PM, ESC X SOS — all dropped
+# wholesale (clipboard writes, titles, hyperlinks, queries, ...).
+_STRING_OPENERS = "]P_^X"
+
+
+def _char_allowed(ch: str) -> bool:
+    """Allowlist for a plain (non-escape) character: printable text only.
+
+    \\n \\r \\t are handled by the caller; everything refused here is
+    dropped — remaining C0 controls, DEL, C1 controls (U+0080..U+009F,
+    including the single-character CSI U+009B and OSC U+009D), bidi
+    overrides, zero-width/invisible characters, and anything else
+    non-printable (NBSP, soft hyphen, ...). C1 bytes are NOT interpreted
+    as sequence initiators — they never start a valid UTF-8 escape.
+    """
+    o = ord(ch)
+    if o < 0x20 or 0x7F <= o <= 0x9F:
+        return False
+    if 0x200B <= o <= 0x200F:      # ZWSP ZWNJ ZWJ LRM RLM
+        return False
+    if 0x202A <= o <= 0x202E:      # bidi overrides LRE RLE PDF LRO RLO
+        return False
+    if o in (0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF):
+        return False               # word joiner, LRI RLI FSI PDI, BOM
+    return ch.isprintable()        # the general printable-text allowlist
+
+
+def _sgr_conceals(params: str) -> bool:
+    """True if an SGR parameter string sets mode 8 (conceal/invisible).
+
+    38/48 (extended fg/bg color) take subparameters — '38;5;8' selects
+    color index 8, not conceal — so their arguments are skipped, walking
+    the string exactly like a terminal does. Unknown extended forms
+    degrade to scanning every remaining parameter (fail-safe: the whole
+    sequence is dropped). Leading zeros count ('08' is 8).
+    """
+    parts = params.split(";")
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        if p.lstrip("0") == "8":
+            return True
+        if p in ("38", "48") and i + 1 < len(parts) and parts[i + 1] in ("5", "2"):
+            i += 3 if parts[i + 1] == "5" else 5   # 38;5;N / 38;2;R;G;B
+            continue
+        i += 1
+    return False
+
+
+class OutputSanitizer:
+    """Stateful allowlist filter for sandbox terminal output.
+
+    feed() takes raw bytes read from the pty master and returns the text
+    that is safe to show on the host terminal. Decoding is stateful
+    (incremental UTF-8, errors replaced), so multibyte characters split
+    across read() boundaries survive; a trailing incomplete escape
+    sequence is held back until its final byte arrives in a later chunk
+    (or the byte cap drops it).
+
+    Allowed: printable text, \\n, \\r, \\t, and SGR color/style sequences
+    whose parameter string is [0-9;]{0,64} and sets no mode 8. Everything
+    else — OSC/DCS/APC/PM/SOS strings, non-SGR CSI (cursor movement,
+    screen clears, device queries), 2-byte and intermediate ESC
+    sequences, remaining C0/C1 controls, bidi overrides and zero-width
+    characters — is dropped silently.
+
+    strict_cr=True additionally drops every \\r that is not immediately
+    followed by \\n: a bare \\r moves the cursor to column 0, so payload
+    output can visually overwrite the current line after you read it
+    ("curl evil | sh\\r" + "ok"). The decision needs one character of
+    lookahead, so a trailing \\r is held across feed() boundaries and
+    dropped at flush() — chunked delivery filters identically either way.
+    This breaks progress bars and any \\r-relying redraw, hence the opt-in.
+    """
+
+    def __init__(self, strict_cr: bool = False) -> None:
+        self.strict_cr = strict_cr
+        self._cr_pending = False  # strict mode: a \r awaiting its next byte
+        self._dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._state = _F_PLAIN
+        self._seq: list[str] = []
+        self._seq_len = 0  # bytes (not codepoints) held in _seq
+
+    # -- pending-sequence buffer ------------------------------------------
+
+    def _seq_start(self, ch: str, state: int) -> None:
+        self._seq = [ch]
+        self._seq_len = len(ch.encode("utf-8"))
+        self._state = state
+
+    def _seq_add(self, ch: str) -> None:
+        self._seq.append(ch)
+        self._seq_len += len(ch.encode("utf-8"))
+        if self._seq_len > MAX_PENDING_SEQ:
+            self._seq_drop()  # malformed stream: drop, never grow unbounded
+
+    def _seq_drop(self) -> None:
+        self._seq = []
+        self._seq_len = 0
+        self._state = _F_PLAIN
+
+    # -- filtering ------------------------------------------------------------
+
+    def feed(self, data: bytes) -> str:
+        """Filter one read() chunk; stateful UTF-8 decoding with
+        errors='replace' keeps split multibyte characters intact."""
+        return self._filter(self._dec.decode(data))
+
+    def flush(self) -> str:
+        """End of stream: decode leftovers (as U+FFFD); a sequence that
+        never terminated is dropped — it is malformed by definition."""
+        text = self._filter(self._dec.decode(b"", final=True))
+        self._seq_drop()
+        if self._cr_pending:  # a trailing bare \r never finds its \n
+            self._cr_pending = False
+        return text
+
+    def _finish_csi(self, final: str, out: list[str]) -> None:
+        seq = "".join(self._seq)
+        params = seq[2:-1]  # between "\x1b[" and the final byte
+        self._seq_drop()    # consumed either way
+        if final == "m" and SGR_PARAMS_RE.fullmatch(params) \
+                and not _sgr_conceals(params):
+            out.append(seq)
+        # else: non-SGR CSI (cursor, clears, device queries, private
+        # markers) or a malformed/concealing SGR — dropped
+
+    def _filter(self, text: str) -> str:
+        out: list[str] = []
+        for ch in text:
+            if self._cr_pending:
+                # strict mode: the previous \r is only emitted when THIS
+                # character is \n; anything else means it was a bare \r.
+                self._cr_pending = False
+                if ch == "\n":
+                    out.append("\r")  # then \n flows through the sm below
+            st = self._state
+            if st == _F_PLAIN:
+                if ch == ESCAPE:
+                    self._seq_start(ESCAPE, _F_ESC)
+                elif ch == "\r" and self.strict_cr:
+                    self._cr_pending = True  # decide on the next character
+                elif ch in "\n\r\t" or _char_allowed(ch):
+                    out.append(ch)
+                # else dropped: C0/C1 controls, DEL, bidi overrides,
+                # zero-width and other non-printable characters
+            elif st == _F_ESC:
+                o = ord(ch)
+                if ch == "[":
+                    self._seq_add(ch)
+                    self._state = _F_CSI
+                elif ch in _STRING_OPENERS:
+                    self._seq_add(ch)
+                    self._state = _F_STR
+                elif ch == ESCAPE:
+                    self._seq_start(ESCAPE, _F_ESC)  # restart on a new ESC
+                elif ch in (CAN, SUB):
+                    self._seq_drop()
+                elif 0x20 <= o <= 0x2F:  # intermediates, e.g. ESC ( B
+                    self._seq_add(ch)
+                    self._state = _F_ESC_INT
+                elif 0x30 <= o <= 0x7E:  # 2-byte escape: never allowed
+                    self._seq_drop()
+                # anything else (stray C0/C1/DEL): swallowed, keep waiting
+                # for the sequence to complete (or the cap to drop it)
+            elif st == _F_ESC_INT:
+                o = ord(ch)
+                if ch == ESCAPE:
+                    self._seq_start(ESCAPE, _F_ESC)
+                elif ch in (CAN, SUB):
+                    self._seq_drop()
+                elif 0x20 <= o <= 0x2F:
+                    self._seq_add(ch)  # further intermediates
+                elif 0x30 <= o <= 0x7E:  # final byte: charset etc. — dropped
+                    self._seq_drop()
+                # else swallowed
+            elif st == _F_CSI:
+                o = ord(ch)
+                if 0x40 <= o <= 0x7E:  # final byte terminates the sequence
+                    self._seq_add(ch)
+                    self._finish_csi(ch, out)
+                elif ch == ESCAPE:
+                    self._seq_start(ESCAPE, _F_ESC)  # abort, restart
+                elif ch in (CAN, SUB):
+                    self._seq_drop()
+                elif 0x20 <= o <= 0x3F:  # parameter bytes + intermediates
+                    self._seq_add(ch)
+                # else swallowed (stray controls/DEL/non-ASCII in the body)
+            elif st == _F_STR:
+                if ch == BEL:  # OSC-BEL terminator
+                    self._seq_drop()
+                elif ch == ESCAPE:
+                    self._seq_add(ch)
+                    self._state = _F_STR_ESC
+                elif ch in (CAN, SUB):
+                    self._seq_drop()
+                else:  # string content: collected only to be dropped
+                    self._seq_add(ch)
+            else:  # _F_STR_ESC: ESC inside a string, maybe a ST (ESC \)
+                if ch == "\\":
+                    self._seq_drop()  # ST: properly terminated — dropped
+                elif ch in (CAN, SUB):
+                    self._seq_drop()
+                elif ch == ESCAPE:
+                    pass  # another ESC: still not a terminator
+                else:  # not a terminator after all: back to content
+                    self._seq_add(ch)
+                    self._state = _F_STR
+        return "".join(out)
+
+
+def _emit_filtered(text: str) -> None:
+    """Write filtered sandbox output to the host terminal (stdout)."""
+    if not text:
+        return
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # Non-UTF-8 host locale: show replacement bytes instead of dying.
+        buf = sys.stdout.buffer
+        buf.write(text.encode("utf-8", "replace"))
+        buf.flush()
+    except (OSError, ValueError):
+        pass  # stdout closed: filtering is moot, keep supervising
+
+
+def _copy_winsize(src_fd: int, dst_fd: int) -> None:
+    """Forward a terminal resize: TIOCGWINSZ on the host tty, TIOCSWINSZ
+    on the pty master (which also SIGWINCHes the pty's foreground pgrp)."""
+    try:
+        packed = fcntl.ioctl(src_fd, termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, packed)
+    except OSError:
+        pass
+
+
+def _read_maybe(fd: int, n: int = 65536) -> bytes | None:
+    """Read from a select-readable fd: data, b"" on EOF (pty master EIO
+    included), or None when nothing was readable after all (EAGAIN)."""
+    try:
+        return os.read(fd, n)
+    except BlockingIOError:
+        return None
+    except OSError:
+        return b""  # EIO (pty EOF) or a dead fd: treat as end of stream
+
+
+def _drain_master(master: int, sanitizer: OutputSanitizer) -> None:
+    """After bwrap exited: read the pty master until EOF or a short
+    deadline — the payload may still be dying (--die-with-parent runs a
+    beat later) with final output in flight, but a daemonized child can
+    hold the slave open forever, so the drain is bounded."""
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        try:
+            ready, _, _ = select.select([master], [], [], 0.05)
+        except OSError:
+            break
+        if not ready:
+            continue
+        try:
+            data = os.read(master, 65536)
+        except BlockingIOError:
+            continue
+        except OSError:
+            break  # EIO: every slave fd is closed — real EOF
+        if not data:
+            break
+        _emit_filtered(sanitizer.feed(data))
+    _emit_filtered(sanitizer.flush())
+
+
+def _host_tty_fd() -> int | None:
+    """A host terminal fd for TIOCGWINSZ: stdin, else stdout."""
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            if stream is not None and stream.isatty():
+                return stream.fileno()
+        except (OSError, ValueError, AttributeError):
+            pass
+    return None
+
+
+def _forwardable_stdin_fd() -> int | None:
+    """An fd to forward host stdin from when there is no raw tty: a
+    real stdin keeps `... | sbox.py --filter-output -- cmd` pipelines
+    working exactly like the non-filtered mode (bwrap inherits stdin)."""
+    try:
+        if sys.stdin is not None:
+            return sys.stdin.fileno()
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _enter_raw_mode() -> tuple[int | None, list | None]:
+    """Put the host stdin tty into raw mode; returns (fd, saved termios)
+    for restoring, or (None, None) when stdin is not a usable tty. Raw
+    mode is what makes byte-wise stdin forwarding possible (no line
+    buffering, no host-side signal/echo processing)."""
+    global _raw_term
+    try:
+        if not sys.stdin.isatty():
+            return None, None
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        tty.setraw(fd)
+    except (OSError, ValueError, termios.error):
+        return None, None
+    _raw_term = True
+    return fd, saved
+
+
+def _restore_termios(fd: int, saved) -> None:
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    except (OSError, termios.error):
+        pass
+
+
 # ---------------------------------------------------------------- seccomp ---
-# A deny-list cBPF program installed INSIDE the sandbox (by SECCOMP_HELPER
-# below) right before the command runs — after bwrap is done, so the filter
-# never interferes with bwrap's own namespace setup. Kernel attack surface
-# that namespaces alone cannot hide; the same list Flatpak/Chrome disable
+# A deny-list cBPF program bwrap installs itself, as the very last step
+# before exec'ing the payload (--add-seccomp-fd / --seccomp, see run_sandbox)
+# — after bwrap's own namespace setup, but before the payload's first
+# instruction, so the shell, the socat bridge, the command and all
+# descendants inherit it and nothing inside runs unfiltered. (Installing it
+# from a python3 helper inside the sandbox — the previous design — had a
+# pre-filter window: site.py runs user .pth files/usercustomize before the
+# helper's first statement, and it failed open when the sandbox had no
+# python3.) Kernel attack surface that namespaces alone cannot hide; the
+# same list Flatpak/Chrome disable
 # for untrusted code:
 #   io_uring_*                large, bug-prone surface (Google disabled it)
 #   bpf, perf_event_open,     classic LPE primitives, almost never
@@ -856,7 +1312,13 @@ def self_test(sock_path: str, allows: list[dict]) -> None:
 #   kexec_file_load,
 #   init_module, finit_module,
 #   delete_module,
-#   open_by_handle_at
+#   open_by_handle_at,         file handles bypass directory permissions
+#   name_to_handle_at,         (and DAC); quotactl/syslog/fanotify_init are
+#   quotactl, syslog,          admin/surface calls normal tools never need
+#   fanotify_init              (syslog = kernel log, KASLR leaks where
+#                             dmesg_restrict=0 — Docker denies it too)
+#   vmsplice                   historical LPE primitive, plain pipes cover
+#                             ordinary tools
 #   ptrace, process_vm_       injecting syscalls into other processes —
 #   readv, process_vm_writev  defense in depth: everything inside the
 #                             sandbox shares the filter, but deny the
@@ -891,11 +1353,12 @@ def self_test(sock_path: str, allows: list[dict]) -> None:
 # headers / scmp_sys_resolver / ausyscall — extend it when editing this.
 SECCOMP_SYSCALLS = {
     "x86_64": {
-        "ioctl": 16, "clone": 56, "socket": 41, "ptrace": 101,
+        "ioctl": 16, "clone": 56, "socket": 41, "syslog": 103, "ptrace": 101,
         "personality": 135, "pivot_root": 155, "mount": 165, "chroot": 161,
-        "umount2": 166, "init_module": 175, "delete_module": 176,
+        "umount2": 166, "quotactl": 179, "init_module": 175, "delete_module": 176,
         "kexec_load": 246, "add_key": 248, "request_key": 249, "keyctl": 250,
-        "perf_event_open": 298, "open_by_handle_at": 304, "setns": 308,
+        "perf_event_open": 298, "fanotify_init": 300, "open_by_handle_at": 304,
+        "name_to_handle_at": 303, "setns": 308, "vmsplice": 278,
         "process_vm_readv": 310, "process_vm_writev": 311, "kcmp": 312,
         "unshare": 272, "finit_module": 313, "kexec_file_load": 320,
         "bpf": 321, "userfaultfd": 323, "io_uring_setup": 425,
@@ -908,7 +1371,9 @@ SECCOMP_SYSCALLS = {
         "chroot": 51, "personality": 92, "unshare": 97, "kexec_load": 104,
         "init_module": 105, "delete_module": 106, "socket": 198,
         "clone": 220, "add_key": 217, "request_key": 218, "keyctl": 219,
-        "ioctl": 29, "perf_event_open": 241, "open_by_handle_at": 265,
+        "ioctl": 29, "quotactl": 60, "vmsplice": 75, "syslog": 116,
+        "perf_event_open": 241, "fanotify_init": 262, "name_to_handle_at": 264,
+        "open_by_handle_at": 265,
         "process_vm_readv": 270, "process_vm_writev": 271, "kcmp": 272,
         "finit_module": 273, "setns": 268, "kexec_file_load": 294,
         "bpf": 280, "userfaultfd": 282, "io_uring_setup": 425,
@@ -931,9 +1396,10 @@ SECCOMP_EPERM = (
     "bpf", "perf_event_open", "userfaultfd",
     "keyctl", "add_key", "request_key",
     "unshare", "setns", "ptrace", "process_vm_readv", "process_vm_writev",
-    "kcmp", "pidfd_getfd", "personality", "chroot",
+    "kcmp", "pidfd_getfd", "personality", "chroot", "vmsplice",
     "mount", "umount2", "pivot_root", "kexec_load", "kexec_file_load",
     "init_module", "finit_module", "delete_module", "open_by_handle_at",
+    "name_to_handle_at", "quotactl", "syslog", "fanotify_init",
     "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount",
     "mount_setattr",
 )
@@ -1054,110 +1520,82 @@ def build_seccomp_bpf(machine: str = "") -> bytes | None:
     return bytes(out)
 
 
-# Runs INSIDE the sandbox as /tmp/.sbox-seccomp.py, as the FIRST sandboxed
-# process (bwrap execs it directly): install the compiled filter, self-probe
-# it, then exec the command line (sh, the socat bridge, the command and all
-# descendants inherit the filter — nothing unfiltered is left below it).
-# Self-contained stdlib-only Python so nothing but python3 is needed in the
-# sandbox. Fails loudly instead of running unfiltered.
-SECCOMP_HELPER = """\
-import ctypes, os, sys
-bpf = bytes.fromhex("@BPF@")
+# bwrap itself installs the compiled filter (raw cBPF: the fd must contain
+# nothing but sock_filter instructions, a multiple of 8 bytes — no length
+# prefix; bwrap reads it at option-parse time and applies it as the very
+# last step before exec'ing the payload, after PR_SET_NO_NEW_PRIVS, so
+# unprivileged installation works and nothing inside the sandbox — not even
+# its first instruction — runs unfiltered). --add-seccomp-fd is the
+# current spelling (repeatable), --seccomp the old one (bwrap >= 0.4.1);
+# both take the same wire format. There is deliberately NO in-sandbox
+# fallback anymore: an in-sandbox helper ran after python3's site.py (user
+# .pth files, usercustomize — a seccomp bypass via --home) and failed open
+# when the sandbox had no python3. If bwrap cannot install the filter, the
+# launcher dies (--no-seccomp is the explicit opt-out).
+def parse_bwrap_caps(text: str) -> dict:
+    """Parse `bwrap --help` output into the options this launcher relies on.
+    Capability probing (not version parsing) so distro backports like
+    bwrap 0.6.3 (--bind-fd backported from 0.10) are detected correctly."""
+    def has(opt: str) -> bool:
+        return re.search(rf"(?<![\w-]){re.escape(opt)}(?![\w-])", text) is not None
 
-class SockFilter(ctypes.Structure):
-    _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
-                ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint)]
-
-class SockFprog(ctypes.Structure):
-    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(SockFilter))]
-
-prog = SockFprog(len(bpf) // 8, (SockFilter * (len(bpf) // 8)).from_buffer_copy(bpf))
-libc = ctypes.CDLL(None, use_errno=True)
-libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
-libc.prctl.restype = ctypes.c_int
-libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS (bwrap sets it too; idempotent)
-if libc.prctl(22, 2, ctypes.byref(prog), 0, 0) != 0:  # PR_SET_SECCOMP, SECCOMP_MODE_FILTER
-    print("sbox.py: cannot install the seccomp filter:",
-          os.strerror(ctypes.get_errno()), file=sys.stderr)
-    sys.exit(1)
-# Fail-closed self-probe (the seccomp analogue of the proxy self-test): a
-# wrong number in the hand-typed syscall table would silently deny the wrong
-# syscall and load fine. unshare(0) is a harmless no-op that succeeds
-# unfiltered; under this filter it must return -1 with EPERM. Probe through
-# the C library's unshare() wrapper — it maps the name to the kernel's real
-# number, so the table cannot fool its own probe. The return value is
-# checked first: a successful call does not update errno.
-if hasattr(libc, "unshare"):
-    ctypes.set_errno(0)
-    rc = libc.unshare(0)
-else:  # libc without the wrapper: fall back to our own table number
-    libc.syscall.restype = ctypes.c_long
-    ctypes.set_errno(0)
-    rc = libc.syscall(@UNSHARE@, 0)
-if rc != -1 or ctypes.get_errno() != 1:  # EPERM
-    print(f"sbox.py: seccomp self-probe failed: unshare(0) not denied "
-          f"(rc={rc}, errno={ctypes.get_errno()}) — refusing to run unfiltered",
-          file=sys.stderr)
-    sys.exit(1)
-os.execvp(sys.argv[1], sys.argv[1:])
-"""
+    return {
+        # option to hand the filter to bwrap with, None = unsupported
+        "seccomp": "--add-seccomp-fd" if has("--add-seccomp-fd") else
+                   ("--seccomp" if has("--seccomp") else None),
+        # >= 0.8: nested user namespaces die at the kernel level
+        # (max_user_namespaces in a nested userns; --assert-... makes bwrap
+        # verify it and die otherwise)
+        "disable_userns": has("--disable-userns") and has("--assert-userns-disabled"),
+        # >= 0.10 (or 0.6.3): TOCTOU-free binds via pinned O_PATH fds
+        "bind_fd": has("--bind-fd") and has("--ro-bind-fd"),
+    }
 
 
-def sandbox_python3() -> str | None:
-    """A python3 that exists inside the sandbox: the RESOLVED interpreter
-    (only /usr, /bin, ... are mounted there — $HOME/.pyenv/bin/python or an
-    activated venv's ~/venv/bin/python is a tmpfs path inside, even when it
-    symlinks to /usr/bin/python3.x)."""
-    for cand in (sys.executable, "/usr/bin/python3", "/bin/python3", "/usr/bin/python"):
-        if not cand:
-            continue
-        try:
-            real = os.path.realpath(cand)
-        except OSError:
-            continue
-        # The interpreter must live under a mounted tree post-symlink, and
-        # the path we return must be that resolved one: cand itself may
-        # exist only via a symlink outside the mounted trees (venv,
-        # linuxbrew, ...), which is a tmpfs path inside the sandbox.
-        if os.path.isfile(real) and real.startswith(("/usr/", "/bin/")):
-            return real
-    return None
+_BWRAP_CAPS: dict | None = None  # cache; main() sets opts._bwrap_caps
 
 
-def seccomp_exec(sand: str, verbose: bool, required: bool = False) -> list[str] | None:
-    """Write the helper into the sandbox's /tmp (bound from $WORK) and
-    return the argv prefix ([python3, helper]) that bwrap execs as the
-    FIRST sandbox process — everything below it (sh, the socat bridge, the
-    command) inherits the installed filter — or None (with a warning — or
-    a hard error under `required`, i.e. --require-seccomp) when the
-    hardening cannot be provided."""
+def bwrap_caps(binpath: str = "bwrap") -> dict:
+    """Probe the real bwrap once; {} when the probe fails (callers then
+    degrade loudly, and seccomp — which cannot degrade — fails closed)."""
+    global _BWRAP_CAPS
+    if _BWRAP_CAPS is not None:
+        return _BWRAP_CAPS
+    try:
+        r = subprocess.run([binpath, "--help"], capture_output=True, text=True, timeout=10)
+        _BWRAP_CAPS = parse_bwrap_caps(r.stdout + r.stderr) if r.returncode == 0 else {}
+    except (OSError, subprocess.SubprocessError):
+        _BWRAP_CAPS = {}
+    return _BWRAP_CAPS
 
-    def unavailable(msg: str) -> None:
-        if required:
-            die(f"--require-seccomp: {msg}")
-        err(f"warning: {msg}")
 
+def seccomp_fd_args(caps: dict, verbose: bool) -> tuple[str, int]:
+    """Compile the deny-list and hand it to bwrap through a pipe.
+
+    Returns (bwrap_option, read_fd); the caller puts both into the bwrap
+    argv, passes the fd to Popen and closes it after the spawn. DIES (never
+    warns) when the filter cannot be installed — fail-closed by design;
+    --no-seccomp is the explicit opt-out and never reaches here.
+    """
     bpf = build_seccomp_bpf()
     if bpf is None:
-        unavailable(f"no seccomp syscall table for this machine ({platform.machine()}) — "
-                    "seccomp hardening disabled")
-        return None
-    py = sandbox_python3()
-    if py is None:
-        unavailable("no python3 available inside the sandbox (bwrap only mounts /usr, /bin, ...) — "
-                    "seccomp hardening disabled")
-        return None
-    path = os.path.join(sand, ".sbox-seccomp.py")
-    with open(path, "w", encoding="utf-8") as fh:
-        # @UNSHARE@ is only the fallback probe number (the primary probe
-        # uses the C library's unshare() wrapper, which cannot be fooled by
-        # our own table).
-        unshare_nr = SECCOMP_SYSCALLS[seccomp_machine()]["unshare"]
-        fh.write(SECCOMP_HELPER.replace("@BPF@", bpf.hex()).replace("@UNSHARE@", str(unshare_nr)))
-    os.chmod(path, 0o500)
+        die(f"no seccomp syscall table for this machine ({platform.machine()}) — "
+            "refusing to run without the filter (pass --no-seccomp to override)")
+    opt = caps.get("seccomp")
+    if opt is None:
+        die("this bwrap supports neither --add-seccomp-fd nor --seccomp — cannot "
+            "install the seccomp deny-list (upgrade bwrap >= 0.4.1, or pass "
+            "--no-seccomp)")
+    r, w = os.pipe()  # empty pipe, blocking fd: completes for << 64K; the
+    try:              # loop is belt and braces for a much bigger filter
+        view = memoryview(bpf)
+        while view:
+            view = view[os.write(w, view):]
+    finally:
+        os.close(w)
     if verbose:
-        err(f"seccomp: deny-list installed via /tmp/.sbox-seccomp.py ({len(bpf) // 8} filter instructions)")
-    return [py, "/tmp/.sbox-seccomp.py"]
+        err(f"seccomp: deny-list handed to bwrap via {opt} ({len(bpf) // 8} filter instructions)")
+    return opt, r
 
 
 # ------------------------------------------------------------------ sandbox ---
@@ -1245,6 +1683,182 @@ def _is_socket(path: str) -> bool:
         return False
 
 
+# Well-known $HOME persistence paths: a read-write bind covering any of
+# these is host code execution at the next login/session — shell rc files
+# run at shell startup, ~/.ssh/authorized_keys at the next sshd login,
+# systemd user units and XDG autostart at session start, ~/.local/bin is
+# on default PATHs, ~/.gitconfig aliases execute shell commands. Like
+# CONTROL_SOCKETS this list will always lag reality, but unlike control
+# sockets these binds are legitimate far more often, so they are WARNED
+# about (naming the paths), never refused. Read-only binds are fine.
+def persistence_paths(home: str) -> set[str]:
+    h = os.path.realpath(home)
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(h, ".config")
+    data = os.environ.get("XDG_DATA_HOME") or os.path.join(h, ".local", "share")
+    # XDG spec: relative values are ignored, i.e. resolved under $HOME.
+    if not os.path.isabs(cfg):
+        cfg = os.path.join(h, cfg)
+    if not os.path.isabs(data):
+        data = os.path.join(h, data)
+    return {
+        os.path.join(h, ".bashrc"), os.path.join(h, ".bash_profile"),
+        os.path.join(h, ".bash_login"), os.path.join(h, ".profile"),
+        os.path.join(h, ".zprofile"), os.path.join(h, ".zshrc"),
+        os.path.join(h, ".zshenv"), os.path.join(h, ".zlogin"),
+        os.path.join(h, ".kshrc"),
+        os.path.join(h, ".emacs"), os.path.join(h, ".vimrc"),
+        os.path.join(h, ".gitconfig"), os.path.join(cfg, "git", "config"),
+        os.path.join(h, ".ssh", "authorized_keys"),
+        os.path.join(h, ".local", "bin"),
+        os.path.join(cfg, "fish", "config.fish"),
+        os.path.join(cfg, "systemd", "user"),
+        os.path.join(cfg, "autostart"),
+        os.path.join(data, "systemd", "user"),
+    }
+
+
+def _path_ident(path: str) -> tuple[int, int] | None:
+    """(st_dev, st_ino) for the validation-time inode a later O_PATH pin
+    must still match, or None when the path does not exist (binds of
+    missing paths fail in bwrap exactly as before)."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+# O_PATH availability guard (Linux 2.6.39+; every kernel that runs bwrap
+# has it — this only keeps exotic interpreters honest).
+_O_PATH = getattr(os, "O_PATH", 0)
+
+
+def open_path_pinned(path: str, expect: tuple[int, int] | None = None,
+                     max_hops: int = 40) -> int:
+    """O_PATH|O_NOFOLLOW-open `path` with no TOCTOU window.
+
+    os.path.realpath() validation + a later plain open() leaves a race: a
+    concurrent sandbox sharing a writable directory can swap a component
+    for a symlink in between, redirecting the bind (e.g. onto ~/.ssh).
+    Instead every component is opened with openat(O_PATH|O_NOFOLLOW)
+    relative to the pinned parent directory only; symlinks are resolved
+    textually (absolute targets restart the walk at /, .. pops to the
+    pinned parent — never through a re-resolved path) and bounded by
+    max_hops. The final inode must match `expect` (captured at validation
+    time by _path_ident): an attacker may move the validated object, but
+    never substitute a different one. Raises OSError (ENOENT etc.) or
+    ValueError on an inode mismatch; the caller owns the returned fd.
+    """
+    if not _O_PATH:
+        raise OSError(errno.ENOSYS, "O_PATH unavailable", path)
+    if not os.path.isabs(path):
+        raise OSError(errno.EINVAL, "pinning needs an absolute path", path)
+    remaining = path.split("/")
+    stack = [os.open("/", _O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)]
+    hops = 0
+    final = None
+    try:
+        while remaining:
+            comp = remaining.pop(0)
+            if comp in ("", "."):
+                continue
+            if comp == "..":
+                if len(stack) > 1:
+                    os.close(stack.pop())
+                continue
+            cur = os.open(comp, _O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                          dir_fd=stack[-1])
+            if stat.S_ISLNK(os.fstat(cur).st_mode):
+                hops += 1
+                if hops > max_hops:
+                    raise OSError(errno.ELOOP, "too many symlink hops", path)
+                # readlinkat against the pinned dir: the target read may
+                # race a swap of this very name, but a mixed walk cannot
+                # reach the validated inode of a DIFFERENT object — the
+                # final expect check below is what makes substitution
+                # impossible, this only keeps legit symlinks working.
+                target = os.readlink(comp, dir_fd=stack[-1])
+                os.close(cur)
+                if target.startswith("/"):
+                    for fd in stack[1:]:
+                        os.close(fd)
+                    del stack[1:]
+                remaining = target.split("/") + remaining
+                continue
+            if remaining:
+                stack.append(cur)
+            else:
+                final = cur
+        if final is None:  # path was "/" (or only . / .. components)
+            final = stack.pop()
+        if expect is not None:
+            st = os.fstat(final)
+            if (st.st_dev, st.st_ino) != expect:
+                raise ValueError(
+                    f"{path}: pinned inode ({st.st_dev}, {st.st_ino}) != "
+                    f"validated inode {expect} — the path was swapped "
+                    "between validation and mount")
+        return final
+    except BaseException:
+        if final is not None:
+            try:
+                os.close(final)
+            except OSError:
+                pass
+        raise
+    finally:
+        for fd in stack:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+class BindPinner:
+    """Pins validated bind sources as O_PATH fds for bwrap --[ro-]bind-fd.
+
+    bwrap >= 0.10 mounts the object the fd refers to and re-verifies the
+    inode after mounting, so validation and mount can no longer diverge.
+    With `enabled=False` (old bwrap, or capabilities unknown) every pin()
+    is a no-op and callers emit the plain path-based flags instead.
+    """
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.fds: dict[str, int] = {}
+
+    def pin(self, path: str, expect: tuple[int, int] | None = None) -> int | None:
+        """An O_PATH fd for `path` (cached; the sandbox only ever mounts
+        each source once), or None when pinning is unavailable and the
+        path form must be used. ENOENT maps to None as well: --bind-socket
+        legitimately names runtime paths that do not exist yet, and the
+        path form preserves bwrap's own not-found error. Anything else —
+        including an inode mismatch — dies: an actively raced path must
+        not silently fall back to the TOCTOU-vulnerable form."""
+        if path in self.fds:
+            return self.fds[path]
+        if not self.enabled:
+            return None
+        try:
+            fd = open_path_pinned(path, expect)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                return None
+            die(f"cannot pin bind source {path} ({e.strerror or e}) — refusing")
+        except ValueError as e:
+            die(f"{e} — refusing")
+        self.fds[path] = fd
+        return fd
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds.clear()
+
+
 def _contains_socket(root: str, max_depth: int = 3, max_entries: int = 5000) -> str | None:
     """Bounded scan for a Unix socket inside root (depth- and entry-capped
     so huge trees stay cheap); returns the first socket path found, or None.
@@ -1264,11 +1878,12 @@ def _contains_socket(root: str, max_depth: int = 3, max_entries: int = 5000) -> 
     return None
 
 
-def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
+def check_bind_paths(opts, home: str) -> list[tuple[str, str, tuple[int, int] | None]]:
     """Validate -b/--ro-bind before anything is started; return the resolved
-    (flag, realpath) pairs that build_bwrap mounts — validation and mount
-    must use the same path, so symlink swaps and relative paths can't make
-    bwrap mount something that was never checked.
+    (flag, realpath, inode-identity) triples that build_bwrap mounts via
+    O_PATH pins — validation and mount must use the same object, so symlink
+    swaps and relative paths can't make bwrap mount something that was
+    never checked (the identity survives until the --bind-fd mount).
 
     Whatever these paths really point at is handed to the sandbox, so refuse
     anything that covers a protected path (an ancestor of — or equal to —
@@ -1332,7 +1947,18 @@ def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
                         die(f"{flag} {p}: contains a Unix socket ({found}) — "
                             "control-socket territory; pass --bind-socket to "
                             "bind it anyway")
-            binds.append((flag, rp))
+            if flag == "--bind" and not exempt:
+                # Persistence, not escape: code planted through these rw
+                # binds executes AS THE HOST USER at next login/session
+                # (the --home notes cover the exempt whole-home case).
+                hits = sorted(q for q in persistence_paths(home) if covers(rp, q))
+                if hits:
+                    err(f"note: {flag} {p} covers host persistence path(s): "
+                        + ", ".join(hits)
+                        + " — sandboxed code can plant things there that run "
+                        "as you at next login/session; prefer -r or a "
+                        "narrower bind")
+            binds.append((flag, rp, _path_ident(rp)))
     if opts.home:
         home_socks = sorted(s for s in CONTROL_SOCKETS
                             if covers(real_home, s) and os.path.exists(s))
@@ -1359,9 +1985,26 @@ def agent_socket_path() -> str:
     return path
 
 
-def build_bwrap(opts, sand: str, sock: str, home: str, user_binds: list[tuple[str, str]],
-                agent: str | None, ssh_cfg: str | None) -> tuple[list[str], str]:
+def build_bwrap(opts, sand: str, sock: str, home: str,
+                user_binds: list[tuple[str, str, tuple[int, int] | None]],
+                agent: str | None, ssh_cfg: str | None,
+                pinner: BindPinner | None = None) -> tuple[list[str], str]:
     import pwd  # POSIX only; we require Linux anyway (bwrap)
+
+    def mount_args(flag: str, src: str, dest: str,
+                   ident: tuple[int, int] | None = None) -> list[str]:
+        """One bind, TOCTOU-free where possible: with a pinner (bwrap
+        >= 0.10) the validated source is handed over as an O_PATH fd
+        (mount-by-inode, no re-resolution at mount time); without one
+        this is the classic path-based flag. Used for sources another
+        sandbox could race — user binds, the cwd mount, $HOME. System
+        trees (/usr, /etc/ssl, ...), the 0700 $WORK dir and the runtime
+        sockets below stay path-based on purpose: they are not writable
+        by sandboxed processes, so there is nothing to race."""
+        fd = pinner.pin(src, ident) if pinner is not None else None
+        if fd is not None:
+            return [flag + "-fd", str(fd), dest]
+        return [flag, src, dest]
 
     uid = os.getuid()
     user = os.environ.get("USER") or pwd.getpwuid(uid).pw_name
@@ -1432,7 +2075,11 @@ def build_bwrap(opts, sand: str, sock: str, home: str, user_binds: list[tuple[st
         inner = INNER_DIRECT
 
     if opts.home:
-        bw += ["--bind", home, home]
+        # NOTE: the identity must be of the RESOLVED path — $HOME itself is
+        # often a symlink, and its lstat inode is the link's, never the
+        # target's (a false "swapped" refusal otherwise).
+        real_home_src = os.path.realpath(home)
+        bw += mount_args("--bind", real_home_src, home, _path_ident(real_home_src))
     else:
         bw += ["--perms", "0700", "--tmpfs", home]
 
@@ -1493,21 +2140,24 @@ def build_bwrap(opts, sand: str, sock: str, home: str, user_binds: list[tuple[st
     # mount must come first for explicit -r/-b flags to win — `-r "$PWD"`
     # would otherwise silently end up read-write.
     if bind:
-        bw += ["--ro-bind" if opts.ro_cwd else "--bind", project, project]
+        bw += mount_args("--ro-bind" if opts.ro_cwd else "--bind", project, project,
+                         _path_ident(project))
 
-    for flag, rp in user_binds:
-        bw += [flag, rp, rp]  # mount exactly the validated (resolved) path
+    for flag, rp, ident in user_binds:
+        # mount exactly the validated (resolved) object, ideally by fd
+        bw += mount_args(flag, rp, rp, ident)
 
     # bwrap applies --chdir after all mounts, wherever it sits in argv.
-    user_bound = {rp for _, rp in user_binds}
+    user_bound = {rp for _, rp, _ in user_binds}
     if bind or any(covers(b, project) for b in user_bound):
         bw += ["--chdir", project]
     else:
         bw += ["--chdir", "/tmp"]
 
-    # inner ends with a plain exec: the seccomp helper (when present) is
-    # exec'd by bwrap BEFORE this script (see run_sandbox), so the filter
-    # it installs covers the shell, the socat bridge AND the command. That
+    # inner ends with a plain exec: bwrap installs the seccomp filter (when
+    # enabled) as the very last step before exec'ing THIS script (see
+    # run_sandbox assembling the argv), so the filter covers the shell,
+    # the socat bridge AND the command from their first instruction. That
     # ordering is load-bearing: once sh execs the command, the command is
     # the bridge's parent, and Yama scope 1 lets a process ptrace (or
     # /proc/<pid>/mem-write) its own descendants — an unfiltered bridge
@@ -1571,6 +2221,18 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
     procs: list[subprocess.Popen] = []
     sandbox: subprocess.Popen | None = None
     proxy: subprocess.Popen | None = None
+    pinner = BindPinner(enabled=False)  # O_PATH bind pins (opened below)
+    seccomp_fd: int | None = None       # read end bwrap loads the filter from
+    # --filter-output state (set up below, just before bwrap starts).
+    master: int | None = None        # pty master: host-side, never sandboxed
+    slave: int | None = None         # pty slave: bwrap's only stdio
+    raw_stdin: int | None = None     # host tty fd we set raw (to restore)
+    saved_termios = None
+    tty_fd: int | None = None        # winsize source for SIGWINCH forwards
+    stdin_fd: int | None = None      # host stdin forwarded into the master
+    prev_winch = None                # previous SIGWINCH handler
+    winch = {"hit": False}           # mutable: the signal handler flips it
+    sanitizer: OutputSanitizer | None = None
     try:
         # mkdtemp inside the try: early_signal raises SystemExit, and a
         # signal landing anywhere between mkdtemp() and the setup below must
@@ -1586,10 +2248,40 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         user_binds = check_bind_paths(opts, os.environ["HOME"])
         agent = agent_socket_path() if opts.ssh_agent else None
         ssh_cfg = None
-        # Seccomp deny-list (best-effort: None with a warning when this
-        # machine or sandbox has no usable python3; --no-seccomp skips it;
-        # --require-seccomp makes unavailability fatal).
-        seccomp = None if opts.no_seccomp else seccomp_exec(sand, opts.verbose, opts.require_seccomp)
+        # bwrap capabilities (probed once in main(); deliberately NOT
+        # probed here — a test shim on $PATH must not be asked). Missing
+        # means unknown: only the conservative path-based forms are used,
+        # and seccomp (which cannot degrade) fails closed in that case.
+        caps = getattr(opts, "_bwrap_caps", None) or {}
+        # TOCTOU-free binds: pin every source another sandbox could race
+        # (user binds, the cwd mount, $HOME) as O_PATH fds for bwrap
+        # --[ro-]bind-fd. Old bwrap keeps the path-based flags instead —
+        # loud, not silent (a pinned bind is strictly stronger).
+        pinner.enabled = bool(caps.get("bind_fd"))
+        if user_binds and not pinner.enabled:
+            err("note: this bwrap lacks --bind-fd — binds re-resolve their "
+                "source path at mount time (TOCTOU window if another sandbox "
+                "can write a parent dir); bwrap >= 0.10 mounts by pinned fd")
+        hardening: list[str] = []
+        if not opts.no_seccomp:
+            # Fail-closed: seccomp_fd_args dies when bwrap cannot install
+            # the filter (--no-seccomp is the explicit opt-out).
+            opt, seccomp_fd = seccomp_fd_args(caps, opts.verbose)
+            hardening += [opt, str(seccomp_fd)]
+        if caps.get("disable_userns"):
+            # Kernel-level: bwrap sets max_user_namespaces=1 in a nested
+            # user namespace, consumes the one slot itself, and (with
+            # --assert-userns-disabled) refuses to run unless nesting is
+            # really dead — belt and braces under the unshare/setns deny
+            # rules, immune to hand-typed-number mistakes. The explicit
+            # --unshare-user is required: --unshare-all only sets
+            # --unshare-user-try, and bwrap checks the combination before
+            # its non-root "just DWIM" fallback gets a chance to run.
+            hardening += ["--unshare-user",
+                          "--disable-userns", "--assert-userns-disabled"]
+            if opts.verbose:
+                err("userns: nested user namespaces disabled at the kernel level "
+                    "(--disable-userns --assert-userns-disabled)")
 
         if not opts.net:
             # Created 0600 from the start — it may carry upstream credentials.
@@ -1617,17 +2309,62 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             with open(ssh_cfg, "w", encoding="utf-8") as fh:
                 fh.write(SSH_CLIENT_CONFIG)
 
-        bw, inner = build_bwrap(opts, sand, sock, os.environ["HOME"], user_binds, agent, ssh_cfg)
-        # The seccomp helper must be the FIRST process in the sandbox: the
-        # filter it installs (and self-probes) is inherited by everything it
-        # execs — the shell, the socat bridge and the command. bwrap's own
-        # namespace setup runs outside and is untouched. Passing the helper
-        # as argv (never a shell string) also avoids quoting pitfalls.
-        argv = ["bwrap"] + bw + ["--"]
-        if seccomp:
-            argv += seccomp
+        bw, inner = build_bwrap(opts, sand, sock, os.environ["HOME"], user_binds, agent, ssh_cfg,
+                                pinner)
+        if opts.filter_output:
+            # Fail closed: without a pty there is no host-side filtering,
+            # so refuse to run rather than pass output through raw.
+            try:
+                master, slave = pty.openpty()
+            except OSError as e:
+                die(f"--filter-output: cannot allocate a pty ({e}) — refusing to run unfiltered")
+            sanitizer = OutputSanitizer(strict_cr=getattr(opts, "strict_crlf", False))
+            tty_fd = _host_tty_fd()
+            if tty_fd is not None:
+                _copy_winsize(tty_fd, master)  # initial size for the pair
+            raw_stdin, saved_termios = _enter_raw_mode()
+            stdin_fd = raw_stdin if raw_stdin is not None else _forwardable_stdin_fd()
+            if raw_stdin is None and stdin_fd is not None:
+                # Piped/closed stdin: no interactive echo through the pty
+                # (the slave echoes by default — script(1) behavior — which
+                # would duplicate piped data in the output).
+                try:
+                    attrs = termios.tcgetattr(slave)
+                    attrs[3] &= ~termios.ECHO
+                    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+                except (OSError, termios.error):
+                    pass
+
+        # bwrap installs the seccomp filter (hardening, above) as the very
+        # last step before exec'ing /bin/sh, so the shell, the socat bridge
+        # and the command inherit it from their first instruction; --seccomp
+        # fds and pin fds travel via pass_fds (nothing terminal-shaped ever
+        # enters bwrap — close_fds stays on for everything else).
+        argv = ["bwrap"] + hardening + bw + ["--"]
         argv += ["/bin/sh", "-c", inner, "sbox-sh"] + command
-        sandbox = subprocess.Popen(argv)
+        pass_fds = tuple(([seccomp_fd] if seccomp_fd is not None else [])
+                         + list(pinner.fds.values()))
+        if opts.filter_output:
+            # The sandbox's ONLY terminal is the pty slave: fds 0/1/2 are
+            # it, and close_fds (the Popen default) hands over nothing
+            # else — the host's real terminal fd never enters bwrap. The
+            # master stays host-side and feeds the sanitizer.
+            sandbox = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
+                                       pass_fds=pass_fds)
+            os.close(slave)  # else the host holds EOF away from us
+            slave = None
+            # Non-blocking master: the pump must survive a full pty
+            # buffer (a sandbox that stopped reading stdin) without
+            # freezing the output direction.
+            fcntl.fcntl(master, fcntl.F_SETFL,
+                        fcntl.fcntl(master, fcntl.F_GETFL) | os.O_NONBLOCK)
+        else:
+            sandbox = subprocess.Popen(argv, pass_fds=pass_fds)
+        # bwrap has inherited everything it needs; our copies may go.
+        if seccomp_fd is not None:
+            os.close(seccomp_fd)
+            seccomp_fd = None
+        pinner.close()
         procs.append(sandbox)
 
         seen_signals: set[int] = set()
@@ -1656,6 +2393,16 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, forward)
 
+        # --filter-output: forward terminal resizes while the pump runs.
+        if opts.filter_output:
+            def on_winch(_signum, _frame):
+                winch["hit"] = True
+            prev_winch = signal.signal(signal.SIGWINCH, on_winch)
+
+        pending = bytearray()   # stdin bytes the sandbox has not read yet
+        master_eof = False
+        stdin_eof = False
+
         # Supervisor: if the proxy dies, tear the sandbox down (and vice versa).
         while sandbox.poll() is None:
             if proxy is not None and proxy.poll() is not None:
@@ -1667,7 +2414,52 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
                     sandbox.kill()
                     sandbox.wait()
                 return 1
-            time.sleep(0.1)
+            if sanitizer is None:
+                time.sleep(0.1)
+                continue
+            # One pump round (select timeout = the old poll interval):
+            # master -> filtered stdout, host stdin -> master, resizes.
+            if winch["hit"]:
+                winch["hit"] = False
+                if tty_fd is not None:
+                    _copy_winsize(tty_fd, master)
+            fds = [] if master_eof else [master]
+            if stdin_fd is not None and not stdin_eof:
+                fds.append(stdin_fd)
+            if not fds:
+                time.sleep(0.1)
+                continue
+            try:
+                ready, _, _ = select.select(fds, [], [], 0.1)
+            except OSError:
+                continue
+            if master in ready:
+                data = _read_maybe(master)
+                if data == b"":
+                    master_eof = True  # every slave fd closed: EOF
+                elif data:
+                    _emit_filtered(sanitizer.feed(data))
+            if stdin_fd is not None and not stdin_eof and stdin_fd in ready:
+                idata = _read_maybe(stdin_fd, 4096)
+                if idata == b"":
+                    # Host stdin closed. A pty has no EOF to inherit, so
+                    # deliver the line discipline's VEOF (^D) instead —
+                    # twice: once to flush a pending partial line, once
+                    # to signal EOF to the reader.
+                    stdin_eof = True
+                    pending += b"\x04\x04"
+                elif idata and len(pending) < MAX_PENDING_INPUT:
+                    pending += idata  # past the cap: input is dropped
+            if not master_eof and pending:
+                try:
+                    n = os.write(master, bytes(pending))
+                    del pending[:n]
+                except (BlockingIOError, InterruptedError):
+                    pass  # pty buffer full: retry after the next round
+                except OSError:
+                    pending.clear()
+        if sanitizer is not None and not master_eof:
+            _drain_master(master, sanitizer)
         rc = sandbox.returncode
         if rc is None:
             rc = 1
@@ -1679,6 +2471,26 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         # (a skipped rm_tree_writable would leave proxy.json behind).
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)
+        # Restore the host terminal FIRST: the teardown below can block
+        # for seconds, and a raw terminal is unusable meanwhile.
+        global _raw_term
+        if raw_stdin is not None and saved_termios is not None:
+            _restore_termios(raw_stdin, saved_termios)
+        _raw_term = False
+        if prev_winch is not None:
+            signal.signal(signal.SIGWINCH, prev_winch or signal.SIG_DFL)
+        for fd in (master, slave):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if seccomp_fd is not None:  # bwrap was never spawned (or died early)
+            try:
+                os.close(seccomp_fd)
+            except OSError:
+                pass
+        pinner.close()
         for p in procs:
             if p.poll() is None:
                 p.terminate()
@@ -1765,38 +2577,71 @@ Notes:
     fail-closed). --net installs nothing (direct egress, no allowlist).
     No known_hosts is injected: host-key verification fails closed (tmpfs
     home, no TTY) — pass -r ~/.ssh/known_hosts or pin hosts yourself.
-  - The cwd is mounted read-write by default: sandboxed code can plant
-    .git/hooks, Makefiles etc. that run on the host later. Use --ro-cwd
-    for untrusted code.
+  - The cwd is mounted read-write when it is a normal directory: sandboxed
+    code can plant .git/hooks, Makefiles, .envrc or package.json scripts
+    that execute on the HOST later — that is the default persistence
+    trade-off. --ro-cwd mounts it read-only (combine with -b for a
+    build-output dir); -r "$PWD" does the same ad hoc. EXCEPTIONS: a cwd
+    inside $HOME is NOT mounted at all unless --home is given (the sandbox
+    $HOME is a tmpfs — sbox falls back to /tmp with a note; use --home or
+    an explicit -b "$PWD"/-r "$PWD" to have it), and cwds covering
+    protected paths (/etc, /usr, /run, ...) are never auto-mounted either.
   - Explicit -b/-r binds overlay the automatic cwd mount when they cover
     it: -r "$PWD" from inside the directory gives a read-only cwd, and
     likewise -b over --ro-cwd gives read-write (the explicit flag wins).
+    Read-write binds covering $HOME persistence paths (shell rc files,
+    ~/.ssh/authorized_keys, systemd user units, XDG autostart,
+    ~/.local/bin) are warned about: each means host code execution at the
+    next login/session. Validated bind sources are handed to bwrap
+    (>= 0.10) as pinned fds, so a concurrent sandbox cannot swap a path
+    component between check and mount.
   - The sandbox runs in a new session (TIOCSTI protection): Ctrl-C reaches
     sbox.py, which then tears the whole sandbox down — a hard kill: bwrap
     does not relay signals, so the command itself never sees a catchable
     SIGINT (graceful shutdown inside the sandbox is not supported).
   - Seccomp deny-list: io_uring_*, bpf, perf_event_open, userfaultfd,
     keyring, namespace (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
-    admin (mount/pivot_root/chroot/kexec/module loading/open_by_handle_at
-    and the new mount API fsopen/fsmount/move_mount/...), process-
-    inspection/injection (ptrace, process_vm_*/kcmp/pidfd_getfd/personality)
-    syscalls plus ioctl(TIOCSTI/TIOCLINUX) are refused inside the sandbox;
-    socket() is limited to AF_UNIX/AF_INET/AF_INET6/AF_NETLINK (AF_VSOCK
-    bypasses netns isolation in VM guests on older kernels) — ENOSYS where
-    runtimes have fallbacks, EPERM otherwise; foreign-ABI binaries (e.g.
-    32-bit compat, x32) are killed. The filter covers everything inside
-    the sandbox from the first process (the socat bridge included; the
-    payload runs as pid 1, so no unfiltered bwrap reaper init remains).
-    Needs python3 inside the sandbox; perf, io_uring runtimes, unshare-
+    admin (mount/pivot_root/chroot/kexec/module loading/open_by_handle_at/
+    name_to_handle_at/quotactl/syslog and the new mount API fsopen/fsmount/
+    move_mount/...), process-inspection/injection (ptrace, process_vm_*/
+    kcmp/pidfd_getfd/personality, vmsplice), fanotify_init and
+    ioctl(TIOCSTI/TIOCLINUX) are refused inside the sandbox; socket() is
+    limited to AF_UNIX/AF_INET/AF_INET6/AF_NETLINK (AF_VSOCK bypasses
+    netns isolation in VM guests on older kernels) — ENOSYS where runtimes
+    have fallbacks, EPERM otherwise; foreign-ABI binaries (e.g. 32-bit
+    compat, x32) are killed. bwrap itself installs the filter right before
+    exec'ing the payload (no python3 needed inside the sandbox), so
+    everything inside is covered from the first process (the socat bridge
+    included; the payload runs as pid 1, so no unfiltered bwrap reaper
+    init remains). bwrap >= 0.8 additionally gets --disable-userns:
+    nested user namespaces die at the kernel level, not just by syscall
+    number. FAILS CLOSED: without seccomp support (bwrap < 0.4.1) or on an
+    unsupported architecture the launcher refuses to run — --no-seccomp is
+    the explicit opt-out (needed for perf, io_uring runtimes, unshare-
     based builders, keyring-using kerberos, debuggers (gdb/strace), setarch
-    or nested containers need --no-seccomp. Without it the launcher
-    FAILS OPEN with a warning — --require-seccomp makes that fatal and is
-    the recommended default for untrusted work (put it in your alias).
+    or nested containers).
+  - --filter-output sanitizes terminal output host-side: the sandbox
+    runs on a pty slave (the host terminal fd never enters the sandbox)
+    and everything it prints passes an allowlist — text, \n/\r/\t and
+    safe SGR colors pass; OSC strings (clipboard writes, titles,
+    hyperlinks), DCS/APC/PM/SOS, non-SGR CSI (cursor moves, screen
+    clears, device queries), 2-byte ESC sequences, other C0/C1 controls
+    and bidi/zero-width characters are dropped. WITHOUT it, raw sandbox
+    bytes reach your terminal unchanged — use it for untrusted work. The
+    host tty goes raw (stdin and SIGWINCH forwarded, termios restored on
+    exit). --strict-crlf (implies --filter-output) additionally drops \r
+    not followed by \n: a bare \r lets payload output visually overwrite
+    the current line after you read it (progress bars break). Known
+    limits: Ctrl-C reaches the sandbox as a byte — a command that never
+    reads stdin cannot be interrupted from the keyboard (kill sbox.py
+    from another shell); hidden text is not prevented beyond SGR 8
+    conceal (matching fg/bg colors hide text just as well).
 
 Examples:
   sbox.py -a pypi.org -a files.pythonhosted.org -- pip install requests
   sbox.py -a github.com -- git clone https://github.com/torvalds/linux
   sbox.py -a example.com -v -- curl -sI https://example.com
+  sbox.py -a example.com --filter-output -- curl -s https://example.com
   sbox.py --ssh-agent -a github.com -- git clone git@github.com:me/repo.git
 """,
     )
@@ -1825,6 +2670,22 @@ Examples:
                              "loaded in the agent, and the agent protocol also lets it remove identities or "
                              "lock the agent (ssh-add -D/-x) — prefer a dedicated agent (ssh-add -c/-h) "
                              "for untrusted code.")
+    parser.add_argument(
+        "--filter-output",
+        action="store_true",
+        help="Sanitize stdout/stderr on the host via a host-side PTY filter. "
+             "Strips dangerous ANSI escape sequences (OSC 52 clipboard writes, "
+             "terminal queries, invisible text, cursor manipulations) while preserving "
+             "standard text and safe SGR colors. Recommended for untrusted work; "
+             "without it raw sandbox bytes reach your terminal unchanged."
+    )
+    parser.add_argument(
+        "--strict-crlf",
+        action="store_true",
+        help="With --filter-output (implied): additionally drop \\r not immediately followed "
+             "by \\n — a bare \\r lets sandbox output visually overwrite the current line "
+             "after you read it. Breaks progress bars and \\r-based redraw."
+    )
     parser.add_argument("--upstream", metavar="URL",
                         help="Egress through an upstream proxy: http://, https://, socks5://, socks5h:// "
                              "(userinfo supported). Default: $SBOX_UPSTREAM, else $https_proxy/$HTTPS_PROXY. "
@@ -1837,11 +2698,10 @@ Examples:
     parser.add_argument("--no-seccomp", action="store_true",
                         help="Do not install the seccomp deny-list (otherwise io_uring_*, bpf, "
                              "perf_event_open, userfaultfd, keyring, unshare/setns/clone3/CLONE_NEWUSER, "
-                             "mount/kexec/module-loading, ptrace/process_vm_* syscalls and "
-                             "ioctl TIOCSTI/TIOCLINUX are blocked with ENOSYS/EPERM inside the sandbox).")
-    parser.add_argument("--require-seccomp", action="store_true",
-                        help="Abort instead of warning when the seccomp filter cannot be installed "
-                             "(no python3 inside the sandbox, unsupported architecture).")
+                             "mount/kexec/module-loading, ptrace/process_vm_* and friends are blocked with "
+                             "ENOSYS/EPERM inside the sandbox). Note the launcher FAILS CLOSED without it: "
+                             "when the filter cannot be installed (bwrap < 0.4.1, unsupported architecture) "
+                             "it refuses to run instead of running unfiltered.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log allow/deny decisions to stderr.")
     parser.add_argument("--shell", action="store_true", help="Run an interactive shell ($SHELL if available).")
     parser.add_argument("--_proxy", nargs=3, metavar=("SOCK", "CFG", "PPID"), help=argparse.SUPPRESS)
@@ -1857,11 +2717,20 @@ def main(argv: list[str]) -> int:
     parser, opts, command = parse_cli(argv)
     if opts._proxy:
         return proxy_main(*opts._proxy)
-    if opts.no_seccomp and opts.require_seccomp:
-        parser.error("--no-seccomp and --require-seccomp are contradictory")
+    if opts.strict_crlf:
+        opts.filter_output = True  # --strict-crlf is a --filter-output mode
 
     if not shutil.which("bwrap"):
         die("missing dependency: bwrap (needed on the host)")
+    # Probe bwrap's capabilities ONCE here (never lazily inside run_sandbox:
+    # a test shim on $PATH would not survive `bwrap --help`). opts carries
+    # the result; run_sandbox reads it via getattr with a conservative
+    # default for direct/unit-test callers.
+    opts._bwrap_caps = bwrap_caps()
+    if not opts._bwrap_caps and not opts.no_seccomp:
+        # seccomp_fd_args would die with the dedicated message; say why the
+        # probe failed first when the binary is otherwise fine.
+        err("warning: cannot determine this bwrap's capabilities (bwrap --help failed)")
     if not opts.net and not shutil.which("socat"):
         die("missing dependency: socat (needed on the host for the in-sandbox bridge)")
     if "HOME" not in os.environ:

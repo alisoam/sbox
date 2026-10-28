@@ -7,8 +7,12 @@ in `tests/` (plain `python3 tests/test_seccomp.py`, pytest-compatible).
 
 ## Hard constraints
 
-- Host dependencies: `bwrap` + `socat`; a `python3` under `/usr` or `/bin` must
-  exist inside the sandbox or seccomp hardening is skipped (loud warning).
+- Host dependencies: `bwrap` + `socat` + host `python3 >= 3.8`. The seccomp
+  filter is installed by bwrap itself (`--add-seccomp-fd`, `--seccomp` on
+  bwrap >= 0.4.1) — nothing is needed *inside* the sandbox, and if bwrap
+  cannot install the filter the launcher **dies** (fail-closed; only
+  `--no-seccomp` opts out). `--disable-userns` needs bwrap >= 0.8,
+  fd-pinned binds need >= 0.10 (older bwrap degrades with a loud note).
 - The module docstring *is* the spec (security model, known limits); the
   argparse epilog and option help duplicate the user-facing parts. Behavior
   changes must update docstring and epilog/help together.
@@ -24,16 +28,39 @@ in `tests/` (plain `python3 tests/test_seccomp.py`, pytest-compatible).
   CFG PPID` flag. The proxy runs host-side on a Unix socket bound read-only
   into the sandbox at `/run/proxy.sock`; a `socat` bridge inside exposes it at
   `127.0.0.1:1080`.
-- Seccomp is a hand-compiled cBPF deny-list (`build_seccomp_bpf`), injected
-  as a generated stdlib-only `/tmp/.sbox-seccomp.py` that bwrap execs as the
-  **FIRST sandbox process**: it installs + self-probes the filter, then
-  execs the command line (`run_sandbox` assembles the argv — the helper is
-  never interpolated into the shell script). Everything below inherits the
-  filter: sh, the socat bridge, the command. That order is load-bearing —
-  never start the bridge before the helper: once sh execs the command, the
-  command is the bridge's *parent*, and Yama scope 1 allows
-  ptrace/`/proc/<pid>/mem` against your own descendants, so any unfiltered
-  process below the command is a syscall-injection bypass.
+- Seccomp is a hand-compiled cBPF deny-list (`build_seccomp_bpf`) handed to
+  **bwrap itself** via `--add-seccomp-fd`/`--seccomp` through a pipe
+  (`seccomp_fd_args` writes the raw `sock_filter` bytes — a multiple of 8,
+  **no length prefix**; bwrap reads the fd at argv-parse time and applies
+  the filter as the very last step before `execve` of `/bin/sh`). So sh,
+  the socat bridge, the command and every descendant are filtered from
+  their first instruction — there is deliberately NO in-sandbox installer
+  anymore (the old python3 helper ran *after* site.py had processed user
+  `.pth`/usercustomize, and failed open when the sandbox lacked python3).
+  The Yama-scope-1 argument still holds: never arrange for anything
+  unfiltered below the command — once sh execs the command, the command is
+  the bridge's *parent*, and ptrace/`/proc/<pid>/mem` against your own
+  descendants is allowed, so an unfiltered process below the command is a
+  syscall-injection bypass.
+- bwrap capabilities are **probed, not version-matched**: `bwrap_caps()`
+  runs `bwrap --help` once and `parse_bwrap_caps()` greps the option names
+  (0.6.3 backported `--bind-fd` from 0.10, version numbers lie). The probe
+  happens in `main()` and travels via `opts._bwrap_caps`; `run_sandbox`
+  must NOT probe lazily — tests put fake `bwrap` shims on `$PATH` whose
+  `--help` would hang. Missing caps ⇒ conservative defaults there.
+- On bwrap >= 0.8 the argv also carries `--unshare-user --disable-userns
+  --assert-userns-disabled` (nested user namespaces die at the kernel
+  level via `max_user_namespaces` in a nested userns, verified by bwrap).
+  The **explicit `--unshare-user` is required**: `--unshare-all` only sets
+  `--unshare-user-try`, and bwrap checks the combination *before* its
+  non-root "just DWIM" fallback — without it bwrap dies at argv parse.
+- User binds, the cwd mount and `--home` are mounted **by pinned fd**
+  (`BindPinner` + `open_path_pinned`): a component-by-component
+  `openat(O_PATH|O_NOFOLLOW)` walk whose final inode must match the stat
+  captured at validation time (`check_bind_paths` returns
+  `(flag, realpath, ident)` triples) — validation and mount cannot diverge.
+  System trees, `$WORK` and runtime sockets stay path-based (not writable
+  by other sandboxes, nothing to race).
 - Proxy config travels via `$WORK/proxy.json` (mode 0600 — it may hold
   upstream credentials) and is unlinked as soon as the proxy has read it.
 
@@ -48,12 +75,16 @@ python3 tests/test_seccomp.py   # syscall table vs references + live filter
 # Pure functions import side-effect-free; unit-check without bwrap:
 python3 -c "import sbox; print(sbox.parse_allow_entry('example.com:443'))"
 python3 -c "import sbox; print(len(sbox.build_seccomp_bpf())//8, 'filter insns')"
+python3 -c "import sbox; print(sbox.bwrap_caps())"        # real bwrap's options
+python3 -c "import sbox, os; fd=sbox.open_path_pinned('/tmp'); print(os.fstat(fd))"
 # Live smoke tests — bwrap needs unprivileged user namespaces, which THIS
 # container does not allow (bwrap dies with "No permissions to create a new
 # namespace"); run these on a real host. Everything before bwrap (allowlist
 # parsing, proxy start, fail-closed self-test) does run even here.
 ./sbox.py -a example.com -v -- curl -sI https://example.com   # allow + decision log
 ./sbox.py -- curl -sI https://example.com                     # must be denied
+./sbox.py --filter-output -- sh -c 'printf "\033]52;c:aGk=\033\\visible\033[31m!\033[0m\n"'
+                                                              # OSC 52 stripped, text+color kept
 ./sbox.py --shell                                            # interactive poking
 ```
 
@@ -72,9 +103,40 @@ Allowlist/denial semantics:
   `redact_userinfo()` for upstream URLs (credentials), sanitized single-line
   `X-Sbox-Error` header.
 
+Output filter specifics (`--filter-output`):
+- bwrap's fds 0/1/2 are a host-side pty **slave** — `Popen(argv,
+  stdin=slave, stdout=slave, stderr=slave)` with the default `close_fds`
+  is what keeps the real host terminal fd out of the sandbox; never pass
+  anything else terminal-shaped. The master stays host-side, non-blocking,
+  pumped inside the supervisor loop's select (output to stdout, host
+  stdin into the master with a bounded backlog, SIGWINCH → TIOCSWINSZ);
+  the post-exit drain is deadline-bounded because a daemonized child can
+  hold the slave open forever. termios/raw restore happens FIRST in the
+  finally.
+- `OutputSanitizer` is an **allowlist**: printable text, `\n\r\t`, and SGR
+  `[0-9;]{0,64}` params without conceal (8) — everything else is DROPPED,
+  never rewritten or "fixed up" (dropping shows less, never more). C1
+  chars (U+009B CSI) are dropped as characters, NOT interpreted as
+  sequence starters. `strict_cr=True` (the `--strict-crlf` flag, which
+  implies `--filter-output`) drops `\r` unless the NEXT byte is `\n`: the
+  pending `\r` is held across `feed()` boundaries and dropped at
+  `flush()` — that one byte of lookahead must stay split-invariant.
+  Hidden text is otherwise NOT prevented (fg==bg colors) — documented,
+  not "fixed". Extend tests/test_sandbox.py's sanitizer tests with
+  every rule change — including the chunk-boundary equivalence property
+  (splitting a stream at any read boundary must filter identically, in
+  BOTH default and strict_cr modes).
+
 Lifecycle and path handling:
-- `check_bind_paths` validates *realpaths* and `build_bwrap` mounts those same
-  resolved paths — validation and mount must never diverge (symlink swaps).
+- `check_bind_paths` validates *realpaths* and returns
+  `(flag, realpath, ident)` triples — `ident` is the `(st_dev, st_ino)`
+  captured at validation time; `build_bwrap`/`BindPinner` mount those same
+  objects (see the pinned-fd architecture note above) — validation and
+  mount must never diverge (symlink swaps). In `BindPinner.pin`, ENOENT
+  falls back to the path form (bwrap's own not-found error preserved,
+  `--bind-socket` names runtime paths that may not exist yet); an inode
+  mismatch or any other pin failure DIES, never silently falls back to the
+  racy form.
   Binds covering protected paths are refused, and so are control sockets:
   known ones via `CONTROL_SOCKETS` matched **bidirectionally** (`covers` in
   both directions: `-b /run/docker`, `--bind-socket .../keyring/ssh` and
@@ -86,6 +148,11 @@ Lifecycle and path handling:
   for the shape/scan rules ONLY, mounts **read-only**, and takes a value —
   keep it in `OPTS_WITH_VALUE`. `-b $HOME --home` re-binds what `--home`
   binds: exempt from the socket rules but surfaced as a stderr note.
+- Read-write binds covering known `$HOME` persistence paths
+  (`persistence_paths`: shell rc files, `authorized_keys`, systemd user
+  units, XDG autostart, `~/.local/bin`, `~/.gitconfig`) print a WARNING
+  naming the paths — refused would just lag reality; `--home`'s own notes
+  cover the whole-home case. Read-only binds stay silent.
 - bwrap argv order matters: the automatic cwd bind is emitted **before** user
   binds (a later bind shadows an earlier one at the same target), so explicit
   `-r "$PWD"` wins over the default read-write cwd.
@@ -102,14 +169,17 @@ Lifecycle and path handling:
 Seccomp specifics:
 - **The syscall tables are hand-typed** — a wrong number silently denies the
   wrong syscall (this shipped once: ioctl=29/shmget, unshare=310/
-  process_vm_readv on x86_64). Three layers pin it down: `tests/
-  test_seccomp.py` checks every entry against kernel headers /
-  `scmp_sys_resolver` / `ausyscall`, its runtime probe calls `unshare(0)` /
-  `ioctl(TIOCSTI)` / `ptrace(ATTACH)` / `personality(0)` through the
+  process_vm_readv on x86_64; and in this revision's draft:
+  vmsplice=316/278, fanotify_init=290/262). Two layers pin it down:
+  `tests/test_seccomp.py` checks every entry against kernel headers /
+  `scmp_sys_resolver` / `ausyscall`, and its runtime probe installs the
+  real filter in a forked child and calls `unshare(0)` / `ioctl(TIOCSTI)`
+  / `ptrace(ATTACH)` / `personality(0)` / `vmsplice` through the
   **C library wrappers** (name→number ground truth, so the table cannot
-  fool its own probe), and the sandbox helper self-probes fail-closed at
-  startup before exec'ing the command. Extend the table only together with
-  the test.
+  fool its own probe) — this is the fail-closed self-probe the old
+  in-sandbox helper used to perform, kept alive in the test suite.
+  Extend the table only together with the test (interpreter golden cases
+  included).
 - `socket()` is family-gated to `SOCKET_FAMILIES` (AF_UNIX/INET/INET6/
   NETLINK, the Flatpak set) — AF_VSOCK bypasses netns isolation in VM
   guests on older kernels. Kill actions use `SECCOMP_RET_KILL_PROCESS`
@@ -141,6 +211,8 @@ Seccomp specifics:
   foreign-ABI binaries (e.g. 32-bit compat) are killed — syscall numbers are
   per-ABI, number-based filtering would be meaningless.
 - It is a **deny-list**: everything unlisted stays allowed so ordinary
-  toolchains keep working. Unsupported arch or no sandbox python3 ⇒ skip with
-  a warning, never filter the wrong numbers (`--require-seccomp` makes the
-  skip fatal; it contradicts `--no-seccomp` — the launcher refuses both).
+  toolchains keep working. Installation is **fail-closed**: an
+  unsupported architecture or a bwrap without seccomp support kills the
+  launcher (`--no-seccomp` is the explicit opt-out; the old
+  fail-open-with-warning path and its `--require-seccomp` crutch are
+  gone — never reintroduce a "run unfiltered with a warning" mode).

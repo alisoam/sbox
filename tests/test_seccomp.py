@@ -12,10 +12,13 @@ self-test philosophy:
   2. test_filter_runtime_probe — install the real generated cBPF filter in
      a forked child (PR_SET_NO_NEW_PRIVS + PR_SET_SECCOMP — no bwrap, no
      root needed) and probe the deny-list end to end on the native arch.
-  3. test_seccomp_helper_execs / test_sandbox_end_to_end_probe — the real
-     helper file (including its fail-closed unshare(0) self-probe) and the
-     whole sbox.py pipeline, exactly like:
-       sbox.py -- python3 -c "... l.syscall(<unshare_nr>,0) ..."  # -1 1
+     (In production bwrap installs the same bytes via --add-seccomp-fd /
+     --seccomp right before exec'ing the payload — the runtime self-probe
+     the old in-sandbox helper used to do lives on here instead.)
+  3. test_sandbox_end_to_end_probe — the whole sbox.py pipeline, exactly
+     like:
+       sbox.py -- python3 -c "... l.syscall(<unshare_nr>, 0) ..."  # -1 1
+     plus a Seccomp:2 check over every process inside the sandbox.
 
 Run without any dependencies:   python3 tests/test_seccomp.py
 or under pytest, if installed:  pytest tests/
@@ -34,7 +37,6 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -247,6 +249,21 @@ def test_filter_runtime_probe():
             # (glibc wrapper => ground truth for the number).
             results.append(probe_fn("personality(0) denied EPERM",
                                     lambda: libc.personality(0), EPERM))
+            # Newer deny entries (each once shipped wrong somewhere):
+            # vmsplice(pipe_w, NULL, 0, 0) is rc==0 unfiltered (zero
+            # segments) — EPERM under the filter (glibc wrapper => ground
+            # truth for the number).
+            if hasattr(libc, "vmsplice"):
+                results.append(probe_fn("vmsplice(0 segs) denied EPERM",
+                                        lambda: libc.vmsplice(wfd, None, 0, 0),
+                                        EPERM))
+            # filter<->table consistency for the remaining new names
+            # (ground truth for their NUMBERS comes from layer 1; these
+            # raw-number probes catch a mismatch between table and BPF).
+            for name in ("syslog", "name_to_handle_at", "quotactl",
+                         "fanotify_init", "vmsplice"):
+                results.append(probe(f"{name}(0,...) denied EPERM", nr[name],
+                                     0, 0, 0, 0, expect_errno=EPERM))
             if kver >= (5, 3):
                 # Unfiltered clone3(NULL, 0) is EINVAL; filtered ENOSYS.
                 results.append(probe("clone3(NULL,0) ENOSYS", nr["clone3"],
@@ -360,58 +377,14 @@ def test_tables_structurally_consistent():
             f"{arch}: socket families {fams} != {sbox.SOCKET_FAMILIES}")
 
 
-def test_seccomp_helper_execs():
-    """The real generated helper: installs the filter, self-probes, execs."""
-    machine = sbox.seccomp_machine()
-    if machine not in sbox.SECCOMP_SYSCALLS:
-        raise unittest.SkipTest(f"no seccomp table for {machine}")
-    nr = sbox.SECCOMP_SYSCALLS[machine]
-    with tempfile.TemporaryDirectory(prefix="sbox-test.") as tmp:
-        if sbox.seccomp_exec(tmp, verbose=False) is None:
-            raise unittest.SkipTest("seccomp hardening unavailable here "
-                                    "(warning printed above)")
-        helper = os.path.join(tmp, ".sbox-seccomp.py")
-        py = sbox.sandbox_python3()
-
-        r = subprocess.run([py, helper, "/bin/true"],
-                           capture_output=True, text=True, timeout=30)
-        assert r.returncode == 0, f"helper failed: rc={r.returncode}\n{r.stderr}"
-
-        # The filter must survive execvp (the fix's load-bearing property:
-        # the helper execs sh, which execs the command — everything below
-        # must stay filtered). An exec'd probe process must get EPERM.
-        probe_code = ("import ctypes,sys\n"
-                      "l=ctypes.CDLL(None,use_errno=True)\n"
-                      "r=l.unshare(0)\n"
-                      "sys.exit(0 if r==0 else 1)\n")
-        r = subprocess.run([py, helper, py, "-c", probe_code],
-                           capture_output=True, text=True, timeout=30)
-        assert r.returncode == 1, (
-            f"exec'd command not filtered: rc={r.returncode}\n{r.stdout}\n{r.stderr}")
-
-        # Fail-closed path: tamper the self-probe so the filter does NOT
-        # deny it (the wrong-number bug class) — the helper must refuse to
-        # exec instead of running unfiltered-verified.
-        good_call = "libc.unshare(0)"
-        bad_call = f"libc.syscall({max(nr.values()) + 1}, 0)"  # not in table => allowed
-        original = open(helper, encoding="utf-8").read()
-        assert good_call in original  # sanity: the probe call text is present
-        tampered = original.replace(good_call, bad_call, 1)
-        bad_helper = os.path.join(tmp, "tampered.py")
-        open(bad_helper, "w", encoding="utf-8").write(tampered)
-        r = subprocess.run([py, bad_helper, "/bin/true"],
-                           capture_output=True, text=True, timeout=30)
-        assert r.returncode != 0 and "self-probe" in r.stderr, (
-            f"tampered helper did not fail closed: rc={r.returncode}\n{r.stderr}")
-
-
 def test_bwrap_inner_runs_command_under_filter():
-    """Regression guard for the bridge bypass: the seccomp helper must be
-    exec'd by bwrap BEFORE /bin/sh (assembled in run_sandbox), so the inner
-    script must never interpolate the helper — the filter then covers the
-    shell, the socat bridge and the command (the command becomes the
-    bridge's parent, and Yama scope 1 allows ptrace//proc/<pid>/mem against
-    your own descendants, so nothing unfiltered may remain below it)."""
+    """Regression guard for the bridge bypass: the inner script must end in
+    a plain exec and never interpolate anything seccomp-related — bwrap
+    installs the filter BEFORE exec'ing /bin/sh (assembled in run_sandbox),
+    so the filter covers the shell, the socat bridge and the command (the
+    command becomes the bridge's parent, and Yama scope 1 allows
+    ptrace//proc/<pid>/mem against your own descendants, so nothing
+    unfiltered may remain below it)."""
     import argparse
     opts = argparse.Namespace(net=False, home=False, gui=False, ssh_agent=False,
                               ro_cwd=False, bind=[], ro_bind=[])
@@ -420,14 +393,29 @@ def test_bwrap_inner_runs_command_under_filter():
         bw, inner = sbox.build_bwrap(opts, "/tmp/sbox-test-sand", "/tmp/sbox-test-sock",
                                      os.environ["HOME"], [], None, None)
         assert inner.endswith('exec "$@"\n'), f"net={net}: inner must end in a plain exec"
-        assert "sbox-seccomp" not in inner, (
-            f"net={net}: helper interpolated into the shell script — it must "
-            "be exec'd by bwrap before the shell instead (see run_sandbox)")
-    with tempfile.TemporaryDirectory(prefix="sbox-test.") as tmp:
-        prefix = sbox.seccomp_exec(tmp, verbose=False)
-        if prefix is not None:
-            assert prefix == [sbox.sandbox_python3(), "/tmp/.sbox-seccomp.py"], (
-                f"seccomp_exec must return the argv pair, got {prefix!r}")
+        assert "sbox-seccomp" not in inner and "seccomp" not in inner, (
+            f"net={net}: something seccomp-related interpolated into the "
+            "shell script — the filter must be handed to bwrap itself "
+            "(--add-seccomp-fd), not installed from inside the sandbox")
+
+
+def _sandbox_python3():
+    """A python3 that exists inside the sandbox: the RESOLVED interpreter
+    (only /usr, /bin, ... are mounted there — $HOME/.pyenv/bin/python or
+    an activated venv's ~/venv/bin/python is a tmpfs path inside, even
+    when it symlinks to /usr/bin/python3.x). Only needed by the END-TO-END
+    probe below (production no longer needs python3 in the sandbox at
+    all — bwrap installs the filter itself)."""
+    for cand in (sys.executable, "/usr/bin/python3", "/bin/python3", "/usr/bin/python"):
+        if not cand:
+            continue
+        try:
+            real = os.path.realpath(cand)
+        except OSError:
+            continue
+        if os.path.isfile(real) and real.startswith(("/usr/", "/bin/")):
+            return real
+    return None
 
 
 def test_sandbox_end_to_end_probe():
@@ -440,7 +428,7 @@ def test_sandbox_end_to_end_probe():
     machine = sbox.seccomp_machine()
     if machine not in sbox.SECCOMP_SYSCALLS:
         raise unittest.SkipTest(f"no seccomp table for {machine}")
-    py = sbox.sandbox_python3()
+    py = _sandbox_python3()
     if py is None:
         raise unittest.SkipTest("no python3 available inside the sandbox")
     unshare_nr = sbox.SECCOMP_SYSCALLS[machine]["unshare"]
@@ -475,39 +463,53 @@ def test_sandbox_end_to_end_probe():
         f"unexpected probe output (want '-1 1 []'): {r.stdout!r}")
 
 
-def test_sandbox_python3_returns_resolved_path():
-    """Regression: an activated venv's ~/venv/bin/python (symlink to
-    /usr/bin/python3.x) passed the mounted-tree CHECK, but the returned
-    symlink path itself lives in the tmpfs $HOME inside the sandbox, so
-    bwrap exec'd a nonexistent interpreter (127) and the filter never
-    engaged. The returned path must be the RESOLVED interpreter."""
-    real = sbox.sandbox_python3()
-    if real is None:
-        raise unittest.SkipTest("no python3 under /usr or /bin here")
-    with tempfile.TemporaryDirectory(prefix="sbox-test.") as tmp:
-        link = os.path.join(tmp, "bin", "python")  # like an activated venv
-        os.makedirs(os.path.dirname(link))
-        os.symlink(real, link)
-        old = sys.executable
-        try:
-            sys.executable = link
-            got = sbox.sandbox_python3()
-        finally:
-            sys.executable = old
-        assert got == os.path.realpath(link), (
-            f"sandbox_python3 must return the resolved interpreter, got {got!r}")
-        assert got.startswith(("/usr/", "/bin/")), (
-            f"resolved interpreter must live in a mounted tree: {got!r}")
+def test_seccomp_fd_args_and_fail_closed():
+    """The fail-closed handoff: seccomp_fd_args writes the exact bytes of
+    build_seccomp_bpf() into the pipe and names the bwrap option; a bwrap
+    without seccomp support (or an unsupported machine) is a hard exit,
+    never a warning-and-run-unfiltered."""
+    if sbox.build_seccomp_bpf() is None:
+        raise unittest.SkipTest(f"no seccomp table for {platform.machine()}")
+    opt, r = sbox.seccomp_fd_args({"seccomp": "--add-seccomp-fd"}, verbose=False)
+    assert opt == "--add-seccomp-fd"
+    try:
+        data = b""
+        while True:
+            chunk = os.read(r, 65536)
+            if not chunk:
+                break
+            data += chunk
+        assert data == sbox.build_seccomp_bpf(), "fd must carry the raw cBPF"
+        assert len(data) % 8 == 0  # bwrap rejects anything else
+    finally:
+        os.close(r)
+    opt, r = sbox.seccomp_fd_args({"seccomp": "--seccomp"}, verbose=False)
+    assert opt == "--seccomp"
+    os.close(r)
+    # no seccomp capability at all -> die (fail-closed), not warn
+    try:
+        sbox.seccomp_fd_args({"seccomp": None}, verbose=False)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("bwrap without seccomp support must be fatal")
+    try:
+        sbox.seccomp_fd_args({}, verbose=False)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("unknown bwrap capabilities must be fatal")
 
 
-def test_require_seccomp_conflicts_with_no_seccomp():
-    """--require-seccomp and --no-seccomp are contradictory: the launcher
-    must refuse (exit 2) before starting anything."""
+def test_require_seccomp_flag_removed():
+    """The old --require-seccomp fail-open patch is gone: fail-closed is
+    now the only behavior, so the flag no longer exists (unknown options
+    make argparse exit 2 — loud, never silent)."""
     r = subprocess.run(
         [sys.executable, os.path.join(HERE, "..", "sbox.py"),
-         "--no-seccomp", "--require-seccomp", "--", "/bin/true"],
+         "--require-seccomp", "--", "/bin/true"],
         capture_output=True, text=True, timeout=60)
-    assert r.returncode == 2 and "contradictory" in r.stderr, (
+    assert r.returncode == 2 and "require-seccomp" in r.stderr, (
         f"rc={r.returncode}, stderr={r.stderr!r}")
 
 
@@ -580,6 +582,13 @@ def test_bpf_interpreter_golden_cases():
             ("personality", [0], _EPERM),
             ("open_tree", [0], _EPERM),
             ("mount_setattr", [0], _EPERM),
+            # the newer deny entries (numbers were each mistyped once in
+            # draft: vmsplice 316!=278, fanotify_init 290!=262)
+            ("syslog", [0], _EPERM),
+            ("name_to_handle_at", [0], _EPERM),
+            ("quotactl", [0], _EPERM),
+            ("fanotify_init", [0], _EPERM),
+            ("vmsplice", [0], _EPERM),
         ]
         # An unlisted syscall (read: x86_64=0, generic=63) must stay allowed.
         unlisted = 0 if arch == "x86_64" else 63

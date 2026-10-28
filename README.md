@@ -20,7 +20,15 @@ Python file with no third-party proxy dependency.
 
 - Linux with unprivileged user namespaces (many containers block this —
   bwrap then fails with "No permissions to create a new namespace")
-- `bwrap` and `socat` on the host; `python3 >= 3.8` (stdlib only)
+- `bwrap` and `socat` on the host; `python3 >= 3.8` on the host (stdlib
+  only — the seccomp filter is installed by bwrap itself, no python3 is
+  needed inside the sandbox)
+- seccomp deny-list: any `bwrap >= 0.4.1` (`--seccomp`) or newer
+  (`--add-seccomp-fd`); `>= 0.8` additionally disables nested user
+  namespaces at the kernel level (`--disable-userns`) and `>= 0.10`
+  mounts binds from pinned fds (no check-to-mount race). Older bwrap
+  degrades with a loud note; without seccomp support the launcher refuses
+  to run unless `--no-seccomp` is passed explicitly.
 - `--net` mode needs `bwrap` only
 
 ## Install
@@ -51,11 +59,12 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `--home` | Bind the real `$HOME` (default: private tmpfs home). |
 | `--gui` | Pass through Wayland (preferred) and X11 sockets. |
 | `--ssh-agent` | Forward `$SSH_AUTH_SOCK` read-only to `/run/ssh-agent.sock`. |
+| `--filter-output` | Sanitize stdout/stderr host-side through a PTY filter: strip dangerous ANSI escape sequences (OSC 52 clipboard writes, terminal queries, invisible text, cursor manipulation), keep text and safe SGR colors. Without it raw sandbox bytes reach your terminal — use it for untrusted work. |
+| `--strict-crlf` | With `--filter-output` (implied): additionally drop `\r` not followed by `\n`, defeating single-line overwrite spoofs. Breaks progress bars. |
 | `--upstream URL` | Chain egress through an upstream proxy: `http://`, `https://`, `socks5://`, `socks5h://` (userinfo supported). Default: `$SBOX_UPSTREAM`, else `$https_proxy`/`$HTTPS_PROXY`; empty string forces direct. |
 | `--upstream-insecure` | Skip TLS verification of an `https://` upstream (or `$SBOX_UPSTREAM_INSECURE`). |
 | `--net` | Share the host network namespace: direct egress, no proxy/allowlist (`-a/-A/--upstream` ignored). |
-| `--no-seccomp` | Do not install the seccomp deny-list. |
-| `--require-seccomp` | Abort instead of warning when the seccomp filter cannot be installed (no python3 inside the sandbox, unsupported architecture). |
+| `--no-seccomp` | Do not install the seccomp deny-list. Without it the launcher FAILS CLOSED: if the filter cannot be installed (bwrap < 0.4.1, unsupported architecture) it refuses to run rather than run unfiltered. |
 | `-v, --verbose` | Log every allow/deny decision to stderr. |
 | `--shell` | Run an interactive shell (`$SHELL` if usable, else bash). |
 
@@ -81,30 +90,54 @@ Everything after the first positional (or `--`) is the sandboxed command.
   fail-closed guarantee is checked, not assumed.
 - **Seccomp hardening:** a deny-list filter (io_uring, bpf, perf_event_open,
   userfaultfd, kernel keyring, nested user namespaces, mount/kexec/module
-  syscalls plus the new mount API, process-injection APIs — ptrace,
-  process_vm_readv/writev, kcmp, pidfd_getfd, personality — and
-  `ioctl(TIOCSTI/TIOCLINUX)`) is installed by the *first* process inside the
-  sandbox and inherited by everything below it: the shell, the socat bridge
-  and the command — which also runs as pid 1 (`--as-pid-1`), so no unfiltered
-  bwrap reaper init remains inside (on Yama `ptrace_scope=0` systems that
+  syscalls plus the new mount API, file handles — `open_by_handle_at`,
+  `name_to_handle_at` — `quotactl`, `syslog`, `fanotify_init`, `vmsplice`,
+  process-injection APIs — ptrace, `process_vm_readv/writev`, kcmp,
+  `pidfd_getfd`, personality — and `ioctl(TIOCSTI/TIOCLINUX)`) is
+  installed **by bwrap itself**, as the very last step before exec'ing the
+  payload (`--add-seccomp-fd`, `--seccomp` on older bwrap): the shell, the
+  socat bridge and the command inherit it from their first instruction —
+  no in-sandbox helper, no python3 dependency, no pre-filter window. The
+  command also runs as pid 1 (`--as-pid-1`), so no unfiltered bwrap
+  reaper init remains inside (on Yama `ptrace_scope=0` systems that
   parent could otherwise be `/proc/1/mem`-injected, bypassing the filter).
   Note pid-1 semantics: long-lived commands that abandon children see
   zombies, and `kill 1` from inside is ignored unless handled.
   `socket()` is limited to `AF_UNIX`/`AF_INET`/`AF_INET6`/`AF_NETLINK`
   (AF_VSOCK bypasses netns isolation in VM guests on older kernels). ENOSYS
   where runtimes have fallbacks, EPERM elsewhere; foreign-ABI binaries are
-  killed, thread group included. Without a usable python3 inside the sandbox
-  the filter is **skipped with a warning (fail-open)** — fatal with
-  `--require-seccomp`, the recommended default for untrusted work:
-
-  ```sh
-  alias sbox='sbox.py --require-seccomp'
-  ```
-
-  Debuggers (gdb/strace) and `setarch` need `--no-seccomp`.
+  killed, thread group included. On bwrap >= 0.8, nested user namespaces
+  are additionally disabled **at the kernel level**
+  (`--disable-userns --assert-userns-disabled`: `max_user_namespaces` in a
+  nested user namespace, verified) instead of relying only on the
+  hand-typed syscall numbers. Fail-closed: if the filter cannot be
+  installed (bwrap < 0.4.1, unsupported architecture) the launcher
+  refuses to run — `--no-seccomp` is the explicit opt-out (needed for
+  debuggers (gdb/strace), `setarch`, perf, io_uring runtimes, unshare-based
+  builders, keyring-using kerberos, nested containers). The syscall
+  tables are cross-checked against kernel headers and a live filter probe
+  by `tests/test_seccomp.py`.
 - **Lifecycle:** if any component dies, everything dies (supervisor loop,
   `--die-with-parent`, `PR_SET_PDEATHSIG` on the proxy) — even a SIGKILLed
   launcher takes the proxy with it.
+- **Output filtering (`--filter-output`):** the sandbox normally shares the
+  host terminal, and a payload can print escape sequences the terminal
+  *emulator executes* — OSC 52 rewrites the clipboard, device queries elicit
+  answerback replies, cursor/erase sequences can forge already-reviewed
+  output, SGR 8 (conceal) hides text. With the flag, bwrap's stdin/stdout/
+  stderr become a host-side pty **slave** (the real host terminal fd never
+  enters the sandbox), and everything read from the master passes an
+  **allowlist** before it reaches the host terminal: printable text,
+  `\n`/`\r`/`\t` and SGR color/style sequences (`[0-9;]{0,64}` params,
+  conceal stripped) pass; OSC/DCS/APC/PM/SOS strings, non-SGR CSI,
+  2-byte ESC sequences, remaining C0/C1 controls and bidi/zero-width
+  characters are dropped. Unterminated sequences are held across read
+  boundaries and dropped past 4096 bytes. A bare `\r` passes by default —
+  which also lets payload output *visually overwrite the current line*
+  after you read it; `--strict-crlf` (implies `--filter-output`) drops
+  `\r` unless followed by `\n`, at the cost of progress bars. The host
+  tty runs raw while the sandbox lives (stdin and SIGWINCH forwarded,
+  termios restored on exit).
 
 ## Security model
 
@@ -129,9 +162,30 @@ Everything after the first positional (or `--`) is the sandboxed command.
 
 ### Trust decisions — read before using
 
-- The **cwd is mounted read-write by default**: sandboxed code can plant
-  `.git/hooks`, Makefiles etc. that run on the host later. Use `--ro-cwd` for
-  untrusted code.
+- The **cwd is mounted read-write when it is a normal directory**:
+  sandboxed code can plant `.git/hooks`, Makefiles, `.envrc` or
+  `package.json` scripts that execute on the host later — that is the
+  default persistence trade-off. Use `--ro-cwd` (plus a `-b` for a
+  build-output directory) or `-r "$PWD"` for untrusted code. **A cwd
+  inside `$HOME` is not mounted at all without `--home`** (the sandbox
+  `$HOME` is a tmpfs; sbox falls back to `/tmp` with a note) — pass
+  `--home`, or an explicit `-b "$PWD"` / `-r "$PWD"` if you want it.
+  Likewise, cwds covering protected paths (`/etc`, `/usr`, `/run`, ...)
+  are never auto-mounted.
+- **Read-write binds of `$HOME` children are host code execution at next
+  login/session**: shell rc files (`~/.bashrc`, `~/.profile`, ...),
+  `~/.ssh/authorized_keys`, systemd user units, XDG autostart entries and
+  `~/.local/bin` each run as you sooner or later. Covering any of them
+  with `-b` produces a loud warning naming the paths — prefer `-r` or a
+  narrower bind.
+- **Bind validation cannot be raced**: user binds, the cwd mount and
+  `--home` are validated on their realpaths, pinned as `O_PATH`
+  descriptors (component-by-component `openat` walk, inode re-checked)
+  and handed to bwrap (>= 0.10) via `--bind-fd`/`--ro-bind-fd` — a
+  concurrent sandbox sharing a writable directory cannot swap a path
+  component for a symlink between check and mount. Older bwrap falls
+  back to path-based binds with a note (that residual window is why the
+  pinned form is preferred).
 - `--home` exposes the real `$HOME`: `~/.bashrc`, `~/.local/bin` and any agent
   sockets in it run with your full identity.
 - `--ssh-agent` lets *any* code in the sandbox sign with every key loaded in
@@ -183,6 +237,19 @@ Design trade-offs, not bugs:
 - The proxy has no connection caps, idle timeouts or header-count limits;
   tunnels have no TCP half-close, and only the first resolved address is tried
   when chaining through an upstream.
+- `--filter-output`: the pty slave is an inherited fd and cannot become the
+  sandbox's controlling terminal, so job control inside is limited; with the
+  host tty raw, Ctrl-C is delivered to the sandbox as a **byte** — a command
+  that never reads stdin cannot be interrupted from the keyboard (kill sbox.py
+  from another shell). The filter is an allowlist: other non-printable
+  characters (NBSP, soft hyphen, ...) are dropped too, and an unterminated
+  OSC/DCS swallows following output until its terminator or the 4096-byte cap
+  (fail-safe: less is displayed, never more). Hidden text is **not** prevented
+  beyond SGR 8 conceal: matching foreground/background colors
+  (e.g. `\x1b[30;40m` black-on-black, truecolor fg==bg) hide text just as
+  well — review with colors off if it matters. If the host terminal is not in
+  UTF-8 mode while the filter emits UTF-8, continuation bytes of multibyte
+  characters can be read as raw C1 controls (niche misconfiguration).
 
 ## Development
 
