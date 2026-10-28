@@ -90,11 +90,12 @@ bwrap only.
 Known limits (design trade-offs, not bugs):
   - -b/--ro-bind paths are refused when they cover a protected path
     (system dirs, $HOME, /run/user/<uid>) or are socket-shaped: a known
-    host control socket (CONTROL_SOCKETS: docker/containerd, D-Bus,
-    systemd, libvirt, X11, keyring, gpg-agent, ...) or, by rule, any
-    socket file and anything under /run, /var/run or $XDG_RUNTIME_DIR
-    (--bind-socket PATH opts back in per path — the list of names would
-    always lag reality, the shape rule fail-closes it). Anything else you
+    host control socket or its directory (CONTROL_SOCKETS, matched in
+    both directions), any socket file, anything under /run, /var/run or
+    $XDG_RUNTIME_DIR, or any directory containing a Unix socket (bounded
+    scan) (--bind-socket PATH — read-only — opts back into the shape/scan
+    rules per path; the list of names would always lag reality, the shape
+    rules fail-close it). Anything else you
     bind — the launcher's /tmp/sbox.* work dir, which holds proxy.json and
     any upstream credentials, included — is handed over as requested.
   - --as-pid-1 makes the command pid 1 of the sandbox: long-lived commands
@@ -1214,7 +1215,12 @@ CONTROL_SOCKETS = {
     "/run/snapd.socket", "/run/snapd-snap.socket",
     "/run/tailscale/tailscaled.sock",
     "/run/incus/unix.socket", "/var/snap/lxd/common/lxd/unix.socket",
-    "/tmp/.X11-unix",
+    # Daemon directories as well: the bidirectional (ancestor/descendant)
+    # match must also catch differently-NAMED sockets in a known control
+    # dir (podman-run.sock, systemd/notify, ...) even via --bind-socket.
+    "/run/podman", "/run/systemd", "/run/containerd", "/run/crio",
+    "/run/dbus", "/run/libvirt", "/run/incus",
+    "/tmp/.X11-unix", "/tmp/.ICE-unix", f"/tmp/tmux-{os.getuid()}",
     f"/run/user/{os.getuid()}/bus",
     f"/run/user/{os.getuid()}/gnupg/S.gpg-agent",
     f"/run/user/{os.getuid()}/pipewire-0",
@@ -1223,6 +1229,12 @@ CONTROL_SOCKETS = {
     f"/run/user/{os.getuid()}/systemd/private",
     f"/run/user/{os.getuid()}/keyring",      # gnome-keyring: secrets + ssh agent
     os.path.expanduser("~/.1password/agent.sock"),
+    # Root-equivalent VM/container daemons that live in $HOME (Docker
+    # Desktop, colima; lima's sockets move around ~/.lima/*/sock — the
+    # _contains_socket scan catches those when ~/.lima is bound).
+    os.path.expanduser("~/.docker/desktop/docker.sock"),
+    os.path.expanduser("~/.docker/run/docker.sock"),
+    os.path.expanduser("~/.colima/default/docker.sock"),
 }
 
 
@@ -1231,6 +1243,25 @@ def _is_socket(path: str) -> bool:
         return stat.S_ISSOCK(os.stat(path).st_mode)
     except OSError:
         return False
+
+
+def _contains_socket(root: str, max_depth: int = 3, max_entries: int = 5000) -> str | None:
+    """Bounded scan for a Unix socket inside root (depth- and entry-capped
+    so huge trees stay cheap); returns the first socket path found, or None.
+    Binding a directory that contains a socket usually means binding a
+    control socket we simply do not know by name."""
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath[len(root):].count("/") >= max_depth:
+            dirnames[:] = []
+        for name in filenames:
+            n += 1
+            if n > max_entries:
+                return None
+            p = os.path.join(dirpath, name)
+            if _is_socket(p):
+                return p
+    return None
 
 
 def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
@@ -1243,10 +1274,12 @@ def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
     anything that covers a protected path (an ancestor of — or equal to —
     $HOME, a system dir, or the user runtime dir with its agent/pipewire/
     D-Bus sockets), covers a known host control socket (CONTROL_SOCKETS),
-    or is socket-shaped by rule: any socket file, and anything under /run,
-    /var/run or $XDG_RUNTIME_DIR — control-socket territory where a
-    name list will always lag reality. --bind-socket PATH is the explicit
-    per-path opt-in for the socket-shaped rule. Children of protected
+    or is socket-shaped by rule: any socket file, anything under /run,
+    /var/run or $XDG_RUNTIME_DIR, or a directory that contains a Unix
+    socket (bounded _contains_socket scan) — control-socket territory
+    where a name list will always lag reality. --bind-socket PATH
+    (mounted read-only) is the explicit per-path opt-in for the
+    socket-shaped rules; known control sockets are never overridable. Children of protected
     paths are fine otherwise (e.g. -b ~/proj). -b $HOME itself is
     only acceptable together with --home (which binds it anyway); anything
     that merely covers $HOME, like /home, is still refused.
@@ -1260,29 +1293,53 @@ def check_bind_paths(opts, home: str) -> list[tuple[str, str]]:
         runtime_roots.add(os.path.realpath(xdg))
     binds: list[tuple[str, str]] = []
     for flag, paths in (("--bind", opts.bind), ("--ro-bind", opts.ro_bind),
-                        ("--bind", opts.bind_socket)):
+                        # --bind-socket mounts read-only: connect() works
+                        # through a ro-bind (as /run/proxy.sock proves), and
+                        # rw would let the sandbox replace the socket file.
+                        ("--ro-bind", opts.bind_socket)):
         for p in paths:
             rp = os.path.realpath(p)
+            # -b $HOME together with --home re-binds what --home binds
+            # anyway: exempt from ALL socket checks (but surface the risk
+            # in the --home note below, so it is never silent).
             exempt = flag == "--bind" and opts.home and rp == real_home
             hits = [] if exempt else [q for q in protected if covers(rp, q)]
             if hits:
                 die(f"{flag} {p} covers protected path(s): {', '.join(hits)}"
                     + ("; use --home to bind $HOME itself"
                        if flag == "--bind" and rp == real_home else ""))
-            sock_hits = sorted(s for s in CONTROL_SOCKETS if covers(rp, s))
-            if sock_hits or rp.startswith("/tmp/.X11-unix/"):
-                die(f"{flag} {p} covers host control socket(s): "
-                    f"{', '.join(sock_hits) or rp} — that hands the sandbox "
-                    "full control of the host (container runtime, D-Bus/"
-                    "systemd, keyring, X11, ...); refusing")
-            if rp not in explicit and (
-                    any(covers(root, rp) for root in runtime_roots)
-                    or _is_socket(rp)):
-                die(f"{flag} {p}: {rp} is a socket or lives under a runtime "
-                    "dir — control-socket territory (a full host escape "
-                    "waiting for a name we forgot); pass "
-                    "--bind-socket to bind it anyway")
+            if not exempt:
+                # Bidirectional: neither an ancestor of a listed socket
+                # (-b /run/docker) nor a descendant of a listed directory
+                # (--bind-socket .../keyring/ssh) may pass.
+                sock_hits = sorted(s for s in CONTROL_SOCKETS
+                                   if covers(rp, s) or covers(s, rp))
+                if sock_hits:
+                    die(f"{flag} {p} overlaps host control socket(s): "
+                        f"{', '.join(sock_hits)} — that hands the sandbox "
+                        "full control of the host (container runtime, D-Bus/"
+                        "systemd, keyring, X11, ...); refusing")
+                if rp not in explicit and (
+                        any(covers(root, rp) for root in runtime_roots)
+                        or _is_socket(rp)):
+                    die(f"{flag} {p}: {rp} is a socket or lives under a runtime "
+                        "dir — control-socket territory (a full host escape "
+                        "waiting for a name we forgot); pass "
+                        "--bind-socket to bind it anyway")
+                if rp not in explicit and os.path.isdir(rp):
+                    found = _contains_socket(rp)
+                    if found:
+                        die(f"{flag} {p}: contains a Unix socket ({found}) — "
+                            "control-socket territory; pass --bind-socket to "
+                            "bind it anyway")
             binds.append((flag, rp))
+    if opts.home:
+        home_socks = sorted(s for s in CONTROL_SOCKETS
+                            if covers(real_home, s) and os.path.exists(s))
+        if home_socks:
+            err("note: --home carries known control socket(s) inside $HOME: "
+                + ", ".join(home_socks)
+                + " — that is your full identity; see the --home notes")
     return binds
 
 
@@ -1576,11 +1633,14 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         seen_signals: set[int] = set()
 
         def forward(signum, _frame):
-            # The first signal is relayed as-is; a sandboxed command that
-            # traps or ignores it would otherwise hang the launcher forever
-            # (repeated Ctrl-C did nothing useful), so the same signal
-            # arriving twice escalates to SIGKILL. --die-with-parent already
-            # covers a SIGKILL of the launcher itself.
+            # Reality check: bwrap does NOT relay signals. SIGINT/SIGTERM
+            # to it kill the bwrap parent outright, and --die-with-parent's
+            # PDEATHSIG then SIGKILLs the sandbox payload — so Ctrl-C has
+            # always been a hard kill and the sandboxed command never sees
+            # a catchable signal (a --info-fd child-pid relay would be
+            # needed for graceful shutdown). The escalation below is only
+            # belt and braces for the window where bwrap has not died yet;
+            # --die-with-parent covers a SIGKILL of the launcher itself.
             escalate = signum in seen_signals
             seen_signals.add(signum)
             if sandbox is None or sandbox.poll() is not None:
@@ -1712,7 +1772,9 @@ Notes:
     it: -r "$PWD" from inside the directory gives a read-only cwd, and
     likewise -b over --ro-cwd gives read-write (the explicit flag wins).
   - The sandbox runs in a new session (TIOCSTI protection): Ctrl-C reaches
-    sbox.py, which then tears the whole sandbox down.
+    sbox.py, which then tears the whole sandbox down — a hard kill: bwrap
+    does not relay signals, so the command itself never sees a catchable
+    SIGINT (graceful shutdown inside the sandbox is not supported).
   - Seccomp deny-list: io_uring_*, bpf, perf_event_open, userfaultfd,
     keyring, namespace (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
     admin (mount/pivot_root/chroot/kexec/module loading/open_by_handle_at

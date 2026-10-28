@@ -46,7 +46,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `-A, --allow-file FILE` | File with allow entries, one per line, `#` comments. Repeatable. |
 | `-b, --bind PATH` | Bind `PATH` read-write into the sandbox. Repeatable. |
 | `-r, --ro-bind PATH` | Bind `PATH` read-only. Repeatable. |
-| `--bind-socket PATH` | Explicit opt-in to bind a socket / runtime-dir path that `-b`/`-r` refuse by default. Repeatable; known control sockets and protected paths stay refused. |
+| `--bind-socket PATH` | Explicit opt-in (mounted **read-only**) to bind a socket, a runtime-dir path, or a socket-bearing directory that `-b`/`-r` refuse by default. Repeatable; known control sockets and protected paths stay refused. |
 | `--ro-cwd` | Mount the current directory read-only (default: read-write). |
 | `--home` | Bind the real `$HOME` (default: private tmpfs home). |
 | `--gui` | Pass through Wayland (preferred) and X11 sockets. |
@@ -151,13 +151,17 @@ Everything after the first positional (or `--`) is the sandboxed command.
   execution). Treat X11 passthrough as unsandboxed; prefer Wayland.
 - Binding host control sockets via `-b`/`-r` is refused outright — by name
   (`docker.sock`, `containerd`, `podman`, `crio`, D-Bus, `systemd`,
-  `libvirt`, `snapd`, `tailscaled`, `incus`/LXD, X11, `gnome-keyring`,
-  `gpg-agent`, pipewire, 1Password — parent dirs included), and by **shape**:
-  any socket file, and anything under `/run`, `/var/run` or
-  `$XDG_RUNTIME_DIR` (rootless daemons, agents, anything we forgot to name).
-  Each is a trivial full escape. `--bind-socket PATH` is the explicit
-  per-path opt-in for the shape rule; known control sockets and protected
-  paths stay refused.
+  `libvirt`, `snapd`, `tailscaled`, `incus`/LXD, X11, `tmux`, `gnome-keyring`,
+  `gpg-agent`, pipewire, 1Password, Docker Desktop/colima in `$HOME` —
+  parent dirs *and* sibling files in known control dirs included), and by
+  **shape**: any socket file, anything under `/run`, `/var/run` or
+  `$XDG_RUNTIME_DIR`, and any directory containing a Unix socket (bounded
+  scan — that closes the "project dir with a dev-server socket" case
+  outside `/run`). Each is a trivial full escape. `--bind-socket PATH`
+  (read-only) is the explicit per-path opt-in for the shape/scan rules;
+  known control sockets and protected paths stay refused. `--home` (and
+  `-b ~` with it) binds the whole home by design — known control sockets
+  inside `$HOME` produce a note, not a refusal.
 - `--net` shares the host network namespace: the allowlist is **not** enforced,
   and host loopback services and abstract Unix sockets (D-Bus, X11, ...) become
   reachable. Only use it for trusted work.

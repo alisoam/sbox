@@ -76,17 +76,24 @@ Lifecycle and path handling:
 - `check_bind_paths` validates *realpaths* and `build_bwrap` mounts those same
   resolved paths — validation and mount must never diverge (symlink swaps).
   Binds covering protected paths are refused, and so are control sockets:
-  known ones via `CONTROL_SOCKETS` with the **same ancestor test** (`covers`,
-  so `-b /run/docker` and `-b ~/.gnupg` are caught too), plus a shape rule —
-  any socket file (`S_ISSOCK`) and anything under `/run`, `/var/run` or
-  `$XDG_RUNTIME_DIR`. `--bind-socket PATH` is the explicit per-path opt-in
-  for the shape rule ONLY (known sockets/protected paths stay refused), and
-  it takes a value — keep it in `OPTS_WITH_VALUE`.
+  known ones via `CONTROL_SOCKETS` matched **bidirectionally** (`covers` in
+  both directions: `-b /run/docker`, `--bind-socket .../keyring/ssh` and
+  sibling files in listed daemon dirs are all caught; the daemon *dirs* are
+  listed too), plus a shape rule — any socket file (`S_ISSOCK`), anything
+  under `/run`, `/var/run` or `$XDG_RUNTIME_DIR`, and any `-b`/`-r`
+  directory containing a socket (bounded `_contains_socket` scan,
+  depth/entry-capped). `--bind-socket PATH` is the explicit per-path opt-in
+  for the shape/scan rules ONLY, mounts **read-only**, and takes a value —
+  keep it in `OPTS_WITH_VALUE`. `-b $HOME --home` re-binds what `--home`
+  binds: exempt from the socket rules but surfaced as a stderr note.
 - bwrap argv order matters: the automatic cwd bind is emitted **before** user
   binds (a later bind shadows an earlier one at the same target), so explicit
   `-r "$PWD"` wins over the default read-write cwd.
-- Signals: `early_signal` (startup) → `forward` (same signal twice escalates
-  to SIGKILL) → `SIG_IGN` during cleanup so `$WORK` removal cannot be
+- Signals: `early_signal` (startup) → `forward` (bwrap does NOT relay
+  signals — SIGINT/SIGTERM kill bwrap, `--die-with-parent` then SIGKILLs
+  the payload; the escalation branch in `forward` is only for the window
+  where bwrap lingers; graceful shutdown would need a `--info-fd`
+  child-pid relay) → `SIG_IGN` during cleanup so `$WORK` removal cannot be
   interrupted. The proxy dies with the launcher (PR_SET_PDEATHSIG + ppid
   check); bwrap gets `--die-with-parent`.
 - `rm_tree_writable` uses `lstat` everywhere: never chmod through a symlink
