@@ -34,9 +34,11 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -261,7 +263,7 @@ def test_filter_runtime_probe():
             # (ground truth for their NUMBERS comes from layer 1; these
             # raw-number probes catch a mismatch between table and BPF).
             for name in ("syslog", "name_to_handle_at", "quotactl",
-                         "fanotify_init", "vmsplice"):
+                         "fanotify_init", "vmsplice", "fspick"):
                 results.append(probe(f"{name}(0,...) denied EPERM", nr[name],
                                      0, 0, 0, 0, expect_errno=EPERM))
             if kver >= (5, 3):
@@ -384,19 +386,27 @@ def test_bwrap_inner_runs_command_under_filter():
     so the filter covers the shell, the socat bridge and the command (the
     command becomes the bridge's parent, and Yama scope 1 allows
     ptrace//proc/<pid>/mem against your own descendants, so nothing
-    unfiltered may remain below it)."""
+    unfiltered may remain below it). Runs from a scratch cwd so the
+    automatic cwd mount does not depend on where the runner started."""
     import argparse
-    opts = argparse.Namespace(net=False, home=False, gui=False, ssh_agent=False,
-                              ro_cwd=False, bind=[], ro_bind=[])
-    for net in (False, True):
-        opts.net = net
-        bw, inner = sbox.build_bwrap(opts, "/tmp/sbox-test-sand", "/tmp/sbox-test-sock",
-                                     os.environ["HOME"], [], None, None)
-        assert inner.endswith('exec "$@"\n'), f"net={net}: inner must end in a plain exec"
-        assert "sbox-seccomp" not in inner and "seccomp" not in inner, (
-            f"net={net}: something seccomp-related interpolated into the "
-            "shell script — the filter must be handed to bwrap itself "
-            "(--add-seccomp-fd), not installed from inside the sandbox")
+    with tempfile.TemporaryDirectory(prefix="sbox-test.") as tmp:
+        oldcwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            opts = argparse.Namespace(net=False, home=False, gui=False, ssh_agent=False,
+                                      ro_cwd=False, bind=[], ro_bind=[])
+            for net in (False, True):
+                opts.net = net
+                bw, inner, _dups = sbox.build_bwrap(
+                    opts, "/tmp/sbox-test-sand", "/tmp/sbox-test-sock",
+                    os.environ["HOME"], [], None, None)
+                assert inner.endswith('exec "$@"\n'), f"net={net}: inner must end in a plain exec"
+                assert "sbox-seccomp" not in inner and "seccomp" not in inner, (
+                    f"net={net}: something seccomp-related interpolated into the "
+                    "shell script — the filter must be handed to bwrap itself "
+                    "(--add-seccomp-fd), not installed from inside the sandbox")
+        finally:
+            os.chdir(oldcwd)
 
 
 def _sandbox_python3():
@@ -422,7 +432,13 @@ def test_sandbox_end_to_end_probe():
     """The user-facing probe: through a real sbox sandbox, unshare(0) must
     print '-1 1' (rc -1, errno EPERM), and EVERY process inside the sandbox
     must report Seccomp: 2 in /proc — including the socat bridge (the
-    unfiltered-bridge ptrace bypass is exactly what this catches)."""
+    unfiltered-bridge ptrace bypass is exactly what this catches). The
+    run also carries a pinned -b bind and a --bind-socket socket: the
+    payload must see NO fd whose target is a bound source (bwrap closes
+    --bind-fd fds after mounting — a leftover O_PATH fd is the runc
+    CVE-2024-21626 escape), and the socket must arrive mounted, proving
+    bwrap accepts a non-directory O_PATH fd for --ro-bind-fd on this
+    machine."""
     if not shutil.which("bwrap") or not shutil.which("socat"):
         raise unittest.SkipTest("bwrap/socat not installed")
     machine = sbox.seccomp_machine()
@@ -432,45 +448,74 @@ def test_sandbox_end_to_end_probe():
     if py is None:
         raise unittest.SkipTest("no python3 available inside the sandbox")
     unshare_nr = sbox.SECCOMP_SYSCALLS[machine]["unshare"]
-    code = (
-        "import ctypes,sys,os\n"
-        "l=ctypes.CDLL(None,use_errno=True)\n"
-        "l.syscall.restype=ctypes.c_long\n"
-        f"r=l.syscall({unshare_nr},0)\n"
-        "unf=[]\n"
-        "for p in os.listdir('/proc'):\n"
-        "    if not p.isdigit(): continue\n"
-        "    try: st=open(f'/proc/{p}/status').read()\n"
-        "    except OSError: continue\n"
-        "    try: sc=[x for x in st.splitlines() if x.startswith('Seccomp:')][0].split()[1]\n"
-        "    except IndexError: continue\n"
-        "    if sc!='2': unf.append(p)\n"
-        "print(r, ctypes.get_errno(), unf)\n"
-        "sys.exit(0 if (r==-1 and ctypes.get_errno()==1 and not unf) else 1)\n"
-    )
-    try:
-        r = subprocess.run(
-            [sys.executable, os.path.join(HERE, "..", "sbox.py"), "--", py, "-c", code],
-            capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        raise AssertionError("sbox.py run timed out")
-    if "No permissions to create a new namespace" in r.stderr:
-        raise unittest.SkipTest("this container forbids user namespaces "
-                                "(bwrap unusable) — run on a real host")
-    assert r.returncode == 0, f"sandboxed probe failed:\n{r.stdout}\n{r.stderr}"
-    out = r.stdout.strip().splitlines()[-1]
-    assert out.startswith("-1 1") and out.endswith("[]"), (
-        f"unexpected probe output (want '-1 1 []'): {r.stdout!r}")
+    with tempfile.TemporaryDirectory(prefix="sbox-test.") as tmp:
+        # the -b dir must be socket-free (the scan would refuse it — that
+        # is the feature); the socket lives in its own dir and travels
+        # through --bind-socket's read-only pin
+        bindsrc = os.path.realpath(os.path.join(tmp, "binddir"))
+        os.makedirs(bindsrc)
+        sockpath = os.path.join(tmp, "sockdir", "probe.sock")
+        os.makedirs(os.path.dirname(sockpath))
+        keeper = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # keep it alive
+        keeper.bind(sockpath)
+        code = (
+            "import ctypes,os,stat,sys\n"
+            "l=ctypes.CDLL(None,use_errno=True)\n"
+            "l.syscall.restype=ctypes.c_long\n"
+            f"r=l.syscall({unshare_nr},0)\n"
+            "unf=[]\n"
+            "leak=[]\n"
+            "for p in os.listdir('/proc'):\n"
+            "    if not p.isdigit(): continue\n"
+            "    try: st=open(f'/proc/{p}/status').read()\n"
+            "    except OSError: continue\n"
+            "    try: sc=[x for x in st.splitlines() if x.startswith('Seccomp:')][0].split()[1]\n"
+            "    except IndexError: continue\n"
+            "    if sc!='2': unf.append(p)\n"
+            "for f in os.listdir('/proc/self/fd'):\n"
+            "    try: t=os.readlink(f'/proc/self/fd/{f}')\n"
+            "    except OSError: continue\n"
+            f"    if t in ({bindsrc!r},{sockpath!r}): leak.append((f,t))\n"
+            f"sock_ok=os.path.exists({sockpath!r}) and stat.S_ISSOCK(os.stat({sockpath!r}).st_mode)\n"
+            f"dir_ok=os.path.isdir({bindsrc!r})\n"
+            "print(r, ctypes.get_errno(), unf, leak, sock_ok, dir_ok)\n"
+            "sys.exit(0 if (r==-1 and ctypes.get_errno()==1 and not unf and "
+            "not leak and sock_ok and dir_ok) else 1)\n"
+        )
+        try:
+            r = subprocess.run(
+                [sys.executable, os.path.join(HERE, "..", "sbox.py"),
+                 "-b", bindsrc, "--bind-socket", sockpath,
+                 "--", py, "-c", code],
+                capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("sbox.py run timed out")
+        finally:
+            keeper.close()
+        if "No permissions to create a new namespace" in r.stderr:
+            raise unittest.SkipTest("this container forbids user namespaces "
+                                    "(bwrap unusable) — run on a real host")
+        assert r.returncode == 0, f"sandboxed probe failed:\n{r.stdout}\n{r.stderr}"
+        out = r.stdout.strip().splitlines()[-1]
+        assert out.startswith("-1 1") and out.endswith("[] [] True True"), (
+            f"unexpected probe output (want '-1 1 [] [] True True'): {r.stdout!r}")
 
 
 def test_seccomp_fd_args_and_fail_closed():
-    """The fail-closed handoff: seccomp_fd_args writes the exact bytes of
+    """The fail-closed handoff: seccomp_fd_args self-probes the compiled
+    filter (fork + prctl install + libc unshare(0) must be EPERM — see
+    test_seccomp_selfprobe in test_sandbox.py), writes the exact bytes of
     build_seccomp_bpf() into the pipe and names the bwrap option; a bwrap
     without seccomp support (or an unsupported machine) is a hard exit,
     never a warning-and-run-unfiltered."""
     if sbox.build_seccomp_bpf() is None:
         raise unittest.SkipTest(f"no seccomp table for {platform.machine()}")
-    opt, r = sbox.seccomp_fd_args({"seccomp": "--add-seccomp-fd"}, verbose=False)
+    try:
+        opt, r = sbox.seccomp_fd_args({"seccomp": "--add-seccomp-fd"}, verbose=False)
+    except SystemExit:
+        raise unittest.SkipTest(
+            "cannot install seccomp filters here (the launch-time self-probe "
+            "would fail too — sbox.py refuses to run on this machine)")
     assert opt == "--add-seccomp-fd"
     try:
         data = b""
@@ -589,6 +634,7 @@ def test_bpf_interpreter_golden_cases():
             ("quotactl", [0], _EPERM),
             ("fanotify_init", [0], _EPERM),
             ("vmsplice", [0], _EPERM),
+            ("fspick", [0], _EPERM),              # the missing new-mount-API entry
         ]
         # An unlisted syscall (read: x86_64=0, generic=63) must stay allowed.
         unlisted = 0 if arch == "x86_64" else 63

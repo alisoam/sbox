@@ -25,10 +25,13 @@ Python file with no third-party proxy dependency.
   needed inside the sandbox)
 - seccomp deny-list: any `bwrap >= 0.4.1` (`--seccomp`) or newer
   (`--add-seccomp-fd`); `>= 0.8` additionally disables nested user
-  namespaces at the kernel level (`--disable-userns`) and `>= 0.10`
-  mounts binds from pinned fds (no check-to-mount race). Older bwrap
-  degrades with a loud note; without seccomp support the launcher refuses
-  to run unless `--no-seccomp` is passed explicitly.
+  namespaces at the kernel level (`--disable-userns` — probed once per
+  launch with the same namespace/pid flags as the real argv; hosts where
+  that combination cannot work, e.g. setuid bwrap, keep running on the
+  seccomp deny rules alone, with a note shown at most once a day) and
+  `>= 0.10` mounts binds from pinned fds (no check-to-mount race). Older
+  bwrap degrades with a loud note; without seccomp support the launcher
+  refuses to run unless `--no-seccomp` is passed explicitly.
 - `--net` mode needs `bwrap` only
 
 ## Install
@@ -54,7 +57,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `-A, --allow-file FILE` | File with allow entries, one per line, `#` comments. Repeatable. |
 | `-b, --bind PATH` | Bind `PATH` read-write into the sandbox. Repeatable. |
 | `-r, --ro-bind PATH` | Bind `PATH` read-only. Repeatable. |
-| `--bind-socket PATH` | Explicit opt-in (mounted **read-only**) to bind a socket, a runtime-dir path, or a socket-bearing directory that `-b`/`-r` refuse by default. Repeatable; known control sockets and protected paths stay refused. |
+| `--bind-socket PATH` | Explicit opt-in to bind a socket, a runtime-dir path, or a socket-bearing directory that `-b`/`-r` refuse by default. **Read-only** for socket files and `/run`/`$XDG_RUNTIME_DIR` paths (connect-only — *never* read-write: `-b PATH --bind-socket PATH` is refused too); **read-write** for a plain directory (socket-bearing project dirs — `puma.sock`, `.s.PGSQL.5432`, `.git/fsmonitor--daemon.ipc`; combine with `-r PATH` for read-only; rw does let the sandbox replace the sockets inside it — the intended trade-off, since such dirs need writes). Repeatable; known control sockets, protected paths and anything inside `/proc`, `/sys` or `/dev` stay refused. |
 | `--ro-cwd` | Mount the current directory read-only (default: read-write). |
 | `--home` | Bind the real `$HOME` (default: private tmpfs home). |
 | `--gui` | Pass through Wayland (preferred) and X11 sockets. |
@@ -110,9 +113,18 @@ Everything after the first positional (or `--`) is the sandboxed command.
   are additionally disabled **at the kernel level**
   (`--disable-userns --assert-userns-disabled`: `max_user_namespaces` in a
   nested user namespace, verified) instead of relying only on the
-  hand-typed syscall numbers. Fail-closed: if the filter cannot be
-  installed (bwrap < 0.4.1, unsupported architecture) the launcher
-  refuses to run — `--no-seccomp` is the explicit opt-out (needed for
+  hand-typed syscall numbers — probed once per launch with the same
+  namespace/pid flags as the real argv, and hosts where that combination
+  cannot work (e.g. setuid bwrap without unprivileged user namespaces)
+  keep running on the deny rules alone, with a note shown at most once a
+  day. Fail-closed: every launch self-probes the compiled filter host-side
+  first (install it in a forked child; the libc `unshare()`,
+  `ioctl(TIOCSTI)`, `socket(AF_VSOCK)`, `personality()` and `ptrace()`
+  wrappers must all return EPERM — the hand-typed numbers are verified on
+  this machine), and if
+  the filter cannot be installed (bwrap < 0.4.1, unsupported
+  architecture) the launcher refuses to run — `--no-seccomp` is the
+  explicit opt-out (needed for
   debuggers (gdb/strace), `setarch`, perf, io_uring runtimes, unshare-based
   builders, keyring-using kerberos, nested containers). The syscall
   tables are cross-checked against kernel headers and a live filter probe
@@ -137,7 +149,12 @@ Everything after the first positional (or `--`) is the sandboxed command.
   after you read it; `--strict-crlf` (implies `--filter-output`) drops
   `\r` unless followed by `\n`, at the cost of progress bars. The host
   tty runs raw while the sandbox lives (stdin and SIGWINCH forwarded,
-  termios restored on exit).
+  termios restored on exit); **non-tty stdin (a pipe, file, `/dev/null`)
+  is inherited directly** instead, so binary data and long lines
+  round-trip byte-exact (`tar c . | sbox.py --filter-output -- tar x`).
+  The pty also merges stdout and stderr (`2>/dev/null` inside the sandbox
+  stops working) and ONLCR translates `\n` to `\r\n` (also in redirected
+  output).
 
 ## Security model
 
@@ -151,7 +168,8 @@ Everything after the first positional (or `--`) is the sandboxed command.
   guard — use them with care.
 - **Loud, not wide.** Catch-all entries (`*`, `0.0.0.0/0`, effectively-global
   CIDRs) and CIDRs with host bits set (`203.0.113.7/24`) are rejected loudly
-  instead of being widened or silently allowed.
+  instead of being widened or silently allowed; single-label entries
+  (`-a com` — a whole TLD) are warned about.
 - **Ports** are unrestricted unless an entry carries `:port`.
 - **The allowlist is also an exfiltration channel.** Suffix matching means
   `-a github.com` allows *pushing* to (and gisting from) any repo of yours,
@@ -170,22 +188,44 @@ Everything after the first positional (or `--`) is the sandboxed command.
   inside `$HOME` is not mounted at all without `--home`** (the sandbox
   `$HOME` is a tmpfs; sbox falls back to `/tmp` with a note) — pass
   `--home`, or an explicit `-b "$PWD"` / `-r "$PWD"` if you want it.
-  Likewise, cwds covering protected paths (`/etc`, `/usr`, `/run`, ...)
-  are never auto-mounted.
+  Cwds are never auto-mounted when they cover protected paths
+  (`/etc`, `/usr`, `/run`, ...), lie inside `/proc`/`/sys`/`/dev`, or hit
+  the same control-socket rules as
+  `-b` (`cd /tmp/.X11-unix`, an LXD or tmux socket dir, or a directory
+  containing a Unix socket): a **warning** fires and the command runs
+  with the sandbox's `/tmp` as its working directory — never silently
+  somewhere you did not intend. `--bind-socket "$PWD"` opts a
+  socket-bearing cwd back in **read-write** for a plain directory
+  (connect-only ground opts back in read-only; or `-r "$PWD"
+  --bind-socket "$PWD"` to force read-only).
+  For untrusted work consider an alias that makes the safe choices
+  defaults: `alias sbox='sbox.py --ro-cwd --filter-output'`.
 - **Read-write binds of `$HOME` children are host code execution at next
-  login/session**: shell rc files (`~/.bashrc`, `~/.profile`, ...),
-  `~/.ssh/authorized_keys`, systemd user units, XDG autostart entries and
-  `~/.local/bin` each run as you sooner or later. Covering any of them
-  with `-b` produces a loud warning naming the paths — prefer `-r` or a
-  narrower bind.
-- **Bind validation cannot be raced**: user binds, the cwd mount and
-  `--home` are validated on their realpaths, pinned as `O_PATH`
-  descriptors (component-by-component `openat` walk, inode re-checked)
-  and handed to bwrap (>= 0.10) via `--bind-fd`/`--ro-bind-fd` — a
+  login/session**: shell rc/session files (`~/.bashrc`, `~/.profile`,
+  `~/.xprofile`, `~/.xsessionrc`, ...), `~/.ssh/authorized_keys`,
+  systemd user units, XDG autostart entries and `environment.d`,
+  `~/.local/share/applications` (`.desktop` `Exec=`), `~/.config/nvim`,
+  and the PATH dirs `~/.local/bin`, `~/.cargo/bin`, `~/go/bin` each run
+  as you sooner or later. Covering any of them with a **read-write**
+  mount — `-b`, or a `--bind-socket` directory (which mounts rw) —
+  produces a loud warning naming the paths — in **both directions**, so
+  `-b ~/.local/bin/mytool` (a file on your PATH) warns exactly like
+  `-b ~/.local/bin`. Prefer `-r` or a narrower bind.
+- **Bind validation cannot be raced**: validation is fd-first — user
+  binds, the cwd mount and `--home` are resolved to realpaths, pinned as
+  `O_PATH` descriptors (component-by-component `openat` walk that
+  refuses every symlink — the input is fully resolved, so a symlink
+  means something was swapped), checked on the pinned object (socket
+  shape, contains-socket scan, and the kernel's own `/proc/self/fd`
+  view must still name the validated path), and handed to bwrap
+  (>= 0.10) via `--bind-fd`/`--ro-bind-fd` as exactly those fds — a
   concurrent sandbox sharing a writable directory cannot swap a path
-  component for a symlink between check and mount. Older bwrap falls
-  back to path-based binds with a note (that residual window is why the
-  pinned form is preferred).
+  component between check and mount. Only the fds the bwrap argv names
+  reach the sandbox (a refused cwd's pin is closed, never inherited —
+  a stray `O_PATH` fd would be the CVE-2024-21626 escape), and a
+  missing `-b`/`-r` source is a hard error rather than a racy
+  path-form fallback. Older bwrap falls back to path-based binds with a
+  note (that residual window is why the pinned form is preferred).
 - `--home` exposes the real `$HOME`: `~/.bashrc`, `~/.local/bin` and any agent
   sockets in it run with your full identity.
 - `--ssh-agent` lets *any* code in the sandbox sign with every key loaded in
@@ -212,8 +252,13 @@ Everything after the first positional (or `--`) is the sandboxed command.
   `$XDG_RUNTIME_DIR`, and any directory containing a Unix socket (bounded
   scan — that closes the "project dir with a dev-server socket" case
   outside `/run`). Each is a trivial full escape. `--bind-socket PATH`
-  (read-only) is the explicit per-path opt-in for the shape/scan rules;
-  known control sockets and protected paths stay refused. `--home` (and
+  (read-only) is the explicit per-path opt-in for the shape/scan rules —
+  never for a read-write mount of connect-only ground; known control
+  sockets and protected paths stay refused. Paths **inside `/proc`,
+  `/sys` or `/dev`** are refused under every flag with no opt-in:
+  `/proc/<pid>/root`, `/proc/<pid>/fd`, `/dev/pts`, ... are host escapes
+  (magic links resolve in the host task's context; the sandbox already
+  gets a fresh, safe `/proc` and `/dev`). `--home` (and
   `-b ~` with it) binds the whole home by design — known control sockets
   inside `$HOME` produce a note, not a refusal.
 - `--net` shares the host network namespace: the allowlist is **not** enforced,
@@ -225,7 +270,8 @@ Everything after the first positional (or `--`) is the sandboxed command.
 Design trade-offs, not bugs:
 
 - `-b`/`-r` binds are only refused when they cover a protected path (system
-  dirs, `$HOME`, `/run/user/<uid>`); anything else you bind is handed over as
+  dirs, `$HOME`, `/run/user/<uid>`), lie inside `/proc`/`/sys`/`/dev`, or
+  are socket-shaped; anything else you bind is handed over as
   requested — including the launcher's `/tmp/sbox.*` work dir with any upstream
   credentials.
 - No resource limits (CPU/memory/PID/fds) inside the sandbox; the boundary is

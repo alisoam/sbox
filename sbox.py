@@ -36,7 +36,9 @@ Security model of the proxy (default-deny):
     sub.example.com, but not notexample.com. Entries may carry a port
     (example.com:443); IPs and CIDRs are also accepted. Catch-all entries
     (bare '*', 0.0.0.0/0, ::/0) and CIDRs with host bits set (203.0.113.7/24)
-    are rejected loudly instead of being widened or allowed silently.
+    are rejected loudly instead of being widened or allowed silently, and
+    single-label entries (-a com — a whole TLD) are warned about (intranet
+    single-label hosts are a legitimate use).
   - Optional upstream chaining (--upstream, or $SBOX_UPSTREAM / $https_proxy):
     schemes http, https (TLS to the proxy), socks5 and socks5h; userinfo in
     the URL is passed on (Basic auth / RFC 1929). Destinations are still
@@ -64,13 +66,18 @@ Security model of the proxy (default-deny):
     launcher also passes --disable-userns --assert-userns-disabled: nested
     user namespaces are then blocked at the kernel level
     (max_user_namespaces in a nested user namespace; bwrap verifies it),
-    not only by the hand-typed syscall numbers below. The filter blocks
+    not only by the hand-typed syscall numbers below. That combination is
+    probed once per launch with a throwaway sandbox (userns_probe_ok,
+    mirroring the real argv's namespace/pid/session flags): hosts where
+    it cannot work at all (setuid bwrap, unprivileged_userns_clone=0,
+    max_user_namespaces=0) keep running without it — with a note shown
+    at most once a day — resting on the deny rules. The filter blocks
     kernel surface namespaces cannot hide — io_uring_*, bpf,
     perf_event_open, userfaultfd, the (non-namespaced) kernel keyring,
     nested user namespaces (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
     admin ops (mount, umount2, pivot_root, chroot, kexec, module loading,
     open_by_handle_at, name_to_handle_at, quotactl, syslog and the new
-    mount API: fsopen/fsconfig/fsmount/move_mount/open_tree/
+    mount API: fsopen/fsconfig/fsmount/fspick/move_mount/open_tree/
     mount_setattr), process-injection APIs (ptrace, process_vm_readv/
     writev, kcmp, pidfd_getfd, personality, vmsplice) and ioctl
     TIOCSTI/TIOCLINUX; fanotify_init is denied too; socket() is limited to
@@ -81,10 +88,17 @@ Security model of the proxy (default-deny):
     whole thread group included. Fail-closed, not fail-open: if the filter
     cannot be installed (unsupported architecture, or a bwrap without
     seccomp support) the launcher refuses to run; --no-seccomp is the
-    explicit opt-out. The hand-typed syscall tables are cross-checked
-    against kernel headers / scmp_sys_resolver / ausyscall and a live
-    filter probe by tests/test_seccomp.py (a wrong number once shipped
-    here).
+    explicit opt-out. The hand-typed syscall tables are pinned down at
+    RUNTIME too: every launch starts with a host-side self-probe
+    (seccomp_selfprobe — the filter is installed in a forked child and
+    the C library's unshare(), ioctl(TIOCSTI), socket(AF_VSOCK),
+    personality() and ptrace() wrappers must all come back EPERM; the
+    libc name-to-number mapping is ground truth the table cannot fool),
+    and tests/test_seccomp.py cross-checks every entry against kernel
+    headers / scmp_sys_resolver / ausyscall and a live filter probe (a
+    wrong number once shipped here). The launch-time probe SAMPLES five
+    entries; the rest of the hand-typed table is pinned only by that
+    test suite — run it after editing the tables.
 
   - --filter-output (terminal output filtering): the sandbox shares the
     host terminal, and output is input to the terminal EMULATOR — OSC 52
@@ -106,12 +120,24 @@ Security model of the proxy (default-deny):
     --strict-crlf (implies --filter-output) drops \r unless it is
     immediately followed by \n. Trailing incomplete sequences
     are held across read() chunk boundaries and dropped past 4096 bytes;
-    decoding is stateful UTF-8 with errors="replace". Host stdin is
+    decoding is stateful UTF-8 with errors="replace". Host TTY stdin is
     forwarded byte-wise into the pty — the host tty runs in raw mode for
     the duration (SIGWINCH forwarded via TIOCGWINSZ/TIOCSWINSZ, termios
-    restored in a finally); piped stdin is forwarded too (EOF delivered
-    as the pty's VEOF, ^D). Needs no new dependencies
-    (pty/tty/termios/select).
+    restored in a finally) — while NON-tty stdin (a pipe, file or
+    /dev/null) is inherited by the sandbox directly: feeding it through
+    the pty would subject the bytes to the slave's canonical line
+    discipline (4095-byte line truncation, ^D/^U/^W/^V/^R editing, \r
+    turned into \n by ICRNL, ^C/^Z/^\\ eaten by ISIG), so binary streams
+    and long lines round-trip byte-exact (tar c . | sbox.py
+    --filter-output -- tar x). A stdin that IS a terminal but could not
+    be put in raw mode (hung-up tty, no usable sys.stdin) is a hard
+    error: inheriting it would hand the sandbox the host terminal fd
+    itself — O_RDWR, so write(0, ...) would bypass the filter and read()
+    your keystrokes. Two output-side consequences of the
+    pty: stdout and stderr are MERGED (both are the pty slave, so
+    2>/dev/null inside the sandbox stops working), and redirecting
+    sbox.py's own stdout to a file captures \r\n (the slave's ONLCR).
+    Needs no new dependencies (pty/tty/termios/select).
 
   - --net skips all of the above: bwrap then shares the host network
     namespace (--unshare-all --share-net), /etc/resolv.conf is mounted, and
@@ -131,26 +157,62 @@ note. --net mode needs bwrap only.
 
 Known limits (design trade-offs, not bugs):
   - -b/--ro-bind paths are refused when they cover a protected path
-    (system dirs, $HOME, /run/user/<uid>) or are socket-shaped: a known
+    (system dirs, $HOME, /run/user/<uid>), lie INSIDE /proc, /sys or
+    /dev (host pseudo-fs ground: /proc/<pid>/root and /proc/<pid>/fd/*
+    are magic links that resolve in the host task's context — the
+    ptrace_may_access gate is a kuid comparison, so the same uid passes
+    even from a child user namespace, and with Yama ptrace_scope=0
+    /proc/<pid>/mem is writable; /dev/pts exposes every terminal's
+    slave; never bindable, no --bind-socket override), or are
+    socket-shaped: a known
     host control socket or its directory (CONTROL_SOCKETS, matched in
     both directions), any socket file, anything under /run, /var/run or
     $XDG_RUNTIME_DIR, or any directory containing a Unix socket (bounded
-    scan) (--bind-socket PATH — read-only — opts back into the shape/scan
-    rules per path; the list of names would always lag reality, the shape
-    rules fail-close it). Anything else you
+    scan) (--bind-socket PATH opts back into the shape/scan rules per
+    path — read-only for socket files and runtime-dir paths (connect-
+    only ground: NEVER read-write, not even via -b P --bind-socket P —
+    a rw mount would let the sandbox replace the socket and impersonate
+    the service), READ-WRITE for plain directories, so a socket-bearing
+    project dir (puma.sock, .s.PGSQL.5432, .git/fsmonitor--daemon.ipc)
+    keeps its read-write cwd — read-write does mean the sockets inside it
+    can be replaced by the sandbox (impersonating the service to host
+    clients); that is the intended trade-off, because such dirs need
+    writes to function. The list of names would always lag
+    reality, the shape rules fail-close it). Anything else you
     bind — the launcher's /tmp/sbox.* work dir, which holds proxy.json and
     any upstream credentials, included — is handed over as requested.
-    Validation and mount cannot diverge: the resolved source paths are
-    opened O_PATH|O_NOFOLLOW (component-by-component openat walk, inode
-    re-checked) and passed to bwrap >= 0.10 as --bind-fd/--ro-bind-fd, so
-    a concurrent sandbox sharing a writable directory cannot swap a
-    component for a symlink between check and mount (older bwrap: path
-    binds, with a note).
+    Validation and mount cannot diverge: validation is fd-FIRST — the
+    resolved source path is pinned (component-by-component
+    openat(O_PATH|O_NOFOLLOW) walk that refuses every symlink; its input
+    is a realpath(), so a symlink means something was swapped) and every
+    check (socket shape, contains-socket scan) runs on the pinned object
+    via /proc/self/fd; bwrap >= 0.10 then mounts exactly that fd
+    (--bind-fd/--ro-bind-fd), so a concurrent sandbox sharing a writable
+    directory cannot swap a component between check and mount (older
+    bwrap: path binds and path-based checks, with a note). A missing
+    -b/-r source is a hard error at validation (the path form would
+    re-open the swap race); only --bind-socket of a not-yet-created
+    runtime path keeps the path form and bwrap's own not-found error.
+    And only the fds the bwrap argv names are passed to it — a pin for
+    a refused source is closed, never inherited (an O_PATH fd to host
+    ground in the payload would be the CVE-2024-21626 escape).
+    The automatic cwd mount goes through the same validation, refusals
+    included — a cwd that overlaps a control socket (cd /tmp/.X11-unix,
+    an LXD or tmux socket dir), lies under /proc//sys//dev, or contains
+    a socket is not auto-mounted: a WARNING says the command runs with
+    the sandbox's /tmp as its cwd (--bind-socket "$PWD" opts back in,
+    read-write for a plain dir, read-only on connect-only ground).
   - Read-write binds of $HOME children are host code execution at next
-    login/session (shell rc files, ~/.ssh/authorized_keys, systemd user
-    units, XDG autostart, ~/.local/bin): a warning names the covered
-    PERSISTENCE_PATHS — refusal would just lag reality. The rw cwd mount
-    is the same deal by design (.git/hooks et al.); see the epilog.
+    login/session (shell rc and session files, ~/.ssh/authorized_keys,
+    systemd user units, XDG autostart and environment.d, ~/.local/bin,
+    ~/.cargo/bin, ~/go/bin, ~/.config/nvim): a warning names the covered
+    PERSISTENCE_PATHS — matched in BOTH directions, so a bind of a
+    descendant (-b ~/.local/bin/mytool, -b ~/.config/systemd/user/
+    foo.service) warns just like an ancestor (-b ~/.config); a
+    --bind-socket DIRECTORY that mounts read-write warns identically
+    (the note is keyed on the final mount mode, not the flag spelling).
+    Refusal would just lag reality. The rw cwd mount is the same deal by
+    design (.git/hooks et al.); see the epilog.
   - --as-pid-1 makes the command pid 1 of the sandbox: long-lived commands
     that spawn and abandon children accumulate zombies (nothing reaps
     them; a shell as pid 1 reaps via waitpid(-1)), and signals sent to
@@ -249,6 +311,9 @@ import urllib.parse
 
 PROG = "sbox.py"
 PR_SET_PDEATHSIG = 1
+PR_SET_NO_NEW_PRIVS = 38
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
 CONNECT_TIMEOUT = 15.0  # seconds; TCP + upstream handshakes
 
 # Networks that an allowlisted *name* must never resolve into (SSRF guard).
@@ -264,6 +329,23 @@ SYSTEM_DIRS = {
     "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/run",
     "/sbin", "/sys", "/tmp", "/usr", "/var",
 }
+
+# Roots whose DESCENDANTS are never bindable, by any label and with no
+# --bind-socket override. SYSTEM_DIRS above only blocks ANCESTORS (-b /proc
+# itself); the children went through: -r /proc/<pid>, --bind-socket
+# /proc/self (realpath'd to /proc/<launcher-pid>) mounted READ-WRITE. A bind
+# is not a fresh proc mount — /proc/<pid>/root and /proc/<pid>/fd/* are magic
+# links that resolve in the HOST task's context, gated only by
+# ptrace_may_access(PTRACE_MODE_READ_FSCREDS): a kuid comparison, so the same
+# uid passes even from inside a child user namespace and Yama does not apply
+# to READ mode. With Yama ptrace_scope=0, /proc/<pid>/mem is writable too —
+# the same attack class as CVE-2024-21626 reached through a bind. /dev/pts
+# exposes every terminal's slave (mode 0620, owned by you): the sandbox can
+# read keystrokes typed into other terminals and write raw escapes to them;
+# /dev/shm is a shared IPC namespace with host processes. bwrap already
+# provides a fresh /proc (--proc) and /dev (--dev) with exactly the safe
+# subset; binding host pseudo-fs state is never what anyone wants.
+NO_DESCEND_ROOTS = ("/proc", "/sys", "/dev")
 
 UPSTREAM_SCHEMES = ("http", "https", "socks5", "socks5h")
 
@@ -365,6 +447,16 @@ def parse_allow_entry(raw: str) -> dict:
     return {"kind": "net", "value": str(net), "port": port}
 
 
+def _warn_single_label(entry: dict, raw: str) -> None:
+    """A single-label name entry (com, uk, local, ...) suffix-matches EVERY
+    host under that label — a whole TLD/registry, almost never what anyone
+    means. Warned, not refused: intranet setups do use single-label hosts."""
+    if entry["kind"] == "name" and "." not in entry["value"]:
+        err(f"warning: allow entry {raw!r} is a single label — it allows "
+            f"every host under {entry['value']!r} (a whole TLD/registry); "
+            "add a domain part unless that is intended")
+
+
 def load_allows(opt_allows: list[str], opt_files: list[str]) -> list[dict]:
     entries: list[dict] = []
     for path in opt_files:
@@ -376,14 +468,18 @@ def load_allows(opt_allows: list[str], opt_files: list[str]) -> list[dict]:
                 if not raw:
                     continue
                 try:
-                    entries.append(parse_allow_entry(raw))
+                    entry = parse_allow_entry(raw)
                 except ValueError as e:
                     die(f"{path}:{lineno}: {e}")
+                _warn_single_label(entry, raw)
+                entries.append(entry)
     for raw in opt_allows:
         try:
-            entries.append(parse_allow_entry(raw))
+            entry = parse_allow_entry(raw)
         except ValueError as e:
             die(f"--allow: {e}")
+        _warn_single_label(entry, raw)
+        entries.append(entry)
     return entries
 
 
@@ -958,8 +1054,9 @@ SGR_PARAMS_RE = re.compile(r"[0-9;]{0,64}")
 MAX_PENDING_SEQ = 4096
 
 # Backlog cap for stdin bytes the sandbox is not reading: the pty buffer
-# is small, the pump never blocks, so slow consumers must not make the
-# host-side buffer unbounded. Beyond it, newly read input is dropped.
+# is small, the pump never blocks, so the host-side buffer must stay
+# bounded. At the cap the pump backpressures (stops selecting on the tty
+# until the sandbox drains some) instead of dropping bytes.
 MAX_PENDING_INPUT = 262144
 
 # Filter states: plain text, after ESC, ESC + intermediates, inside CSI,
@@ -1030,7 +1127,10 @@ class OutputSanitizer:
     else — OSC/DCS/APC/PM/SOS strings, non-SGR CSI (cursor movement,
     screen clears, device queries), 2-byte and intermediate ESC
     sequences, remaining C0/C1 controls, bidi overrides and zero-width
-    characters — is dropped silently.
+    characters — is dropped silently. A C0 control interleaved inside a
+    pending CSI/ESC sequence is EXECUTED, not swallowed (\\n/\\r/\\t
+    pass, the rest drop, the sequence keeps waiting) — a stray ESC
+    before a \\n must not eat the newline.
 
     strict_cr=True additionally drops every \\r that is not immediately
     followed by \\n: a bare \\r moves the cursor to column 0, so payload
@@ -1095,6 +1195,21 @@ class OutputSanitizer:
 
     def _filter(self, text: str) -> str:
         out: list[str] = []
+
+        def execute_c0(ch: str, o: int) -> None:
+            # A C0 control (or DEL) interleaved in a pending sequence is
+            # EXECUTED, like a real terminal (VT parsers run C0 controls
+            # even inside escape sequences) instead of swallowed: a stray
+            # ESC used to eat a following \n AND the next printable
+            # character (which was then consumed as the sequence's final
+            # byte). Allowed controls (\n \r \t) pass — strict_cr defers
+            # \r with the same one-byte lookahead as in plain text — the
+            # rest drop, and the sequence state is left untouched.
+            if ch == "\r" and self.strict_cr:
+                self._cr_pending = True
+            elif ch in "\n\r\t":
+                out.append(ch)
+
         for ch in text:
             if self._cr_pending:
                 # strict mode: the previous \r is only emitted when THIS
@@ -1129,7 +1244,9 @@ class OutputSanitizer:
                     self._state = _F_ESC_INT
                 elif 0x30 <= o <= 0x7E:  # 2-byte escape: never allowed
                     self._seq_drop()
-                # anything else (stray C0/C1/DEL): swallowed, keep waiting
+                elif o < 0x20 or o == 0x7F:
+                    execute_c0(ch, o)  # stray C0/DEL: executed, not eaten
+                # anything else (C1, non-ASCII): swallowed, keep waiting
                 # for the sequence to complete (or the cap to drop it)
             elif st == _F_ESC_INT:
                 o = ord(ch)
@@ -1141,6 +1258,8 @@ class OutputSanitizer:
                     self._seq_add(ch)  # further intermediates
                 elif 0x30 <= o <= 0x7E:  # final byte: charset etc. — dropped
                     self._seq_drop()
+                elif o < 0x20 or o == 0x7F:
+                    execute_c0(ch, o)
                 # else swallowed
             elif st == _F_CSI:
                 o = ord(ch)
@@ -1153,7 +1272,9 @@ class OutputSanitizer:
                     self._seq_drop()
                 elif 0x20 <= o <= 0x3F:  # parameter bytes + intermediates
                     self._seq_add(ch)
-                # else swallowed (stray controls/DEL/non-ASCII in the body)
+                elif o < 0x20 or o == 0x7F:
+                    execute_c0(ch, o)
+                # else swallowed (stray C1/DEL/non-ASCII in the body)
             elif st == _F_STR:
                 if ch == BEL:  # OSC-BEL terminator
                     self._seq_drop()
@@ -1250,18 +1371,6 @@ def _host_tty_fd() -> int | None:
     return None
 
 
-def _forwardable_stdin_fd() -> int | None:
-    """An fd to forward host stdin from when there is no raw tty: a
-    real stdin keeps `... | sbox.py --filter-output -- cmd` pipelines
-    working exactly like the non-filtered mode (bwrap inherits stdin)."""
-    try:
-        if sys.stdin is not None:
-            return sys.stdin.fileno()
-    except (OSError, ValueError, AttributeError):
-        pass
-    return None
-
-
 def _enter_raw_mode() -> tuple[int | None, list | None]:
     """Put the host stdin tty into raw mode; returns (fd, saved termios)
     for restoring, or (None, None) when stdin is not a usable tty. Raw
@@ -1269,15 +1378,63 @@ def _enter_raw_mode() -> tuple[int | None, list | None]:
     buffering, no host-side signal/echo processing)."""
     global _raw_term
     try:
-        if not sys.stdin.isatty():
+        if sys.stdin is None or not sys.stdin.isatty():
             return None, None
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
         tty.setraw(fd)
-    except (OSError, ValueError, termios.error):
+    except (AttributeError, OSError, ValueError, termios.error):
         return None, None
     _raw_term = True
     return fd, saved
+
+
+def _check_filter_stdin_early() -> None:
+    """Fail FAST (top of run_sandbox, before the proxy, the self-test or
+    the pty exist) on the cheap half of _filter_child_stdin's refusal: a
+    stdin that IS a terminal but cannot even be tcgetattr'd (hung-up tty)
+    must die here rather than three subsystems later. The expensive half
+    — raw mode itself failing while tcgetattr succeeds — is still caught
+    by _filter_child_stdin before anything is spawned."""
+    try:
+        src = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    if src is None or not os.isatty(src):
+        return
+    try:
+        termios.tcgetattr(src)
+    except (OSError, termios.error) as e:
+        die(f"--filter-output: stdin is a terminal but cannot be configured "
+            f"({e}) — refusing to hand the host tty to the sandbox unfiltered")
+
+
+def _filter_child_stdin(slave: int, raw_stdin: int | None):
+    """What to hand bwrap as stdin under --filter-output: the pty slave
+    for a real (raw-mode) host tty; the EXACT non-tty fd sys.stdin wraps
+    otherwise (a pipe/file inherits byte-exact — routing it through the
+    pty would feed it to the slave's canonical line discipline: 4095-byte
+    line truncation, ^D/^U/^W/^V/^R editing, ICRNL, ISIG); /dev/null when
+    there is no usable stdin. FAILS CLOSED on a terminal that could not
+    be put in raw mode (tcgetattr on a hung-up tty, sys.stdin None):
+    inheriting it (stdin=None) would give the sandbox the host terminal
+    fd itself, and a shell-launched process's tty fd 0 is O_RDWR —
+    write(0, "\\x1b]52;...") reaches the terminal emulator UNFILTERED, and
+    keystrokes become readable. The decision is made on the very fd that
+    is returned (sys.stdin and fd 0 can disagree; a blind inherit would
+    follow fd 0, not the object the pump reasoned about)."""
+    if raw_stdin is not None:
+        return slave
+    try:
+        src = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        src = None
+    if src is None:
+        return subprocess.DEVNULL
+    if os.isatty(src):
+        die("--filter-output: stdin is a terminal but raw mode failed — "
+            "refusing to hand the host tty to the sandbox unfiltered")
+    return src
 
 
 def _restore_termios(fd: int, saved) -> None:
@@ -1328,8 +1485,8 @@ def _restore_termios(fd: int, saved) -> None:
 #   personality, chroot       legacy attack surface (setarch -R needs
 #                             --no-seccomp)
 #   fsopen, fsmount, fsconfig, the new mount API: same powers as mount(),
-#   move_mount, open_tree,    which the caps normally already gate — pure
-#   mount_setattr             defense in depth
+#   move_mount, open_tree,     which the caps normally already gate — pure
+#   fspick, mount_setattr      defense in depth
 #   socket(AF_VSOCK/AF_       AF_VSOCK reaches the hypervisor in VM guests,
 #   PACKET/...)               bypassing the netns on older kernels; only
 #                             AF_UNIX/INET/INET6/NETLINK pass (Flatpak's set)
@@ -1364,6 +1521,7 @@ SECCOMP_SYSCALLS = {
         "bpf": 321, "userfaultfd": 323, "io_uring_setup": 425,
         "io_uring_enter": 426, "io_uring_register": 427, "open_tree": 428,
         "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432,
+        "fspick": 433,
         "clone3": 435, "pidfd_getfd": 438, "mount_setattr": 442,
     },
     "aarch64": {
@@ -1379,6 +1537,7 @@ SECCOMP_SYSCALLS = {
         "bpf": 280, "userfaultfd": 282, "io_uring_setup": 425,
         "io_uring_enter": 426, "io_uring_register": 427, "open_tree": 428,
         "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432,
+        "fspick": 433,
         "clone3": 435, "pidfd_getfd": 438, "mount_setattr": 442,
     },
 }
@@ -1401,7 +1560,7 @@ SECCOMP_EPERM = (
     "init_module", "finit_module", "delete_module", "open_by_handle_at",
     "name_to_handle_at", "quotactl", "syslog", "fanotify_init",
     "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount",
-    "mount_setattr",
+    "fspick", "mount_setattr",
 )
 
 CLONE_NEWUSER = 0x10000000
@@ -1421,7 +1580,6 @@ _BPF_JSET_K = 0x45     # if A & k  jump jt else jf
 _BPF_RET_K = 0x06
 _SECCOMP_RET_ALLOW = 0x7FFF0000
 _SECCOMP_RET_ERRNO = 0x00050000
-_SECCOMP_RET_KILL_THREAD = 0x00000000
 # Kills the whole thread group, not just the calling thread (kernel >= 4.14;
 # bwrap sandboxes require user namespaces anyway, so old kernels are moot).
 _SECCOMP_RET_KILL_PROCESS = 0x80000000
@@ -1436,8 +1594,9 @@ def seccomp_machine(machine: str = "") -> str:
 def build_seccomp_bpf(machine: str = "") -> bytes | None:
     """Compile the deny-list into a cBPF program for prctl(PR_SET_SECCOMP).
 
-    Returns None on unsupported architectures (the caller warns and runs
-    without the filter rather than blocking the wrong numbers).
+    Returns None on unsupported architectures — the caller DIES on that
+    (fail-closed: running without the filter would allow everything the
+    list denies; --no-seccomp is the explicit opt-out).
     """
     machine = seccomp_machine(machine)
     table = SECCOMP_SYSCALLS.get(machine)
@@ -1534,8 +1693,11 @@ def build_seccomp_bpf(machine: str = "") -> bytes | None:
 # launcher dies (--no-seccomp is the explicit opt-out).
 def parse_bwrap_caps(text: str) -> dict:
     """Parse `bwrap --help` output into the options this launcher relies on.
-    Capability probing (not version parsing) so distro backports like
-    bwrap 0.6.3 (--bind-fd backported from 0.10) are detected correctly."""
+    Capability probing (not version parsing) so distro backports of
+    individual options are detected correctly — upstream version numbers
+    are a poor guide (options have appeared in distro releases ahead of
+    the upstream version that introduced them), and the probe does not
+    care either way."""
     def has(opt: str) -> bool:
         return re.search(rf"(?<![\w-]){re.escape(opt)}(?![\w-])", text) is not None
 
@@ -1547,7 +1709,11 @@ def parse_bwrap_caps(text: str) -> dict:
         # (max_user_namespaces in a nested userns; --assert-... makes bwrap
         # verify it and die otherwise)
         "disable_userns": has("--disable-userns") and has("--assert-userns-disabled"),
-        # >= 0.10 (or 0.6.3): TOCTOU-free binds via pinned O_PATH fds
+        # >= 0.10 (or a distro backport): TOCTOU-free binds via pinned
+        # O_PATH fds. NOTE: a socket-file pin through --ro-bind-fd is only
+        # exercised end to end by the real-bwrap probe in
+        # tests/test_seccomp.py (a fake-bwrap shim cannot verify bwrap
+        # accepts non-directory O_PATH fds).
         "bind_fd": has("--bind-fd") and has("--ro-bind-fd"),
     }
 
@@ -1569,6 +1735,161 @@ def bwrap_caps(binpath: str = "bwrap") -> dict:
     return _BWRAP_CAPS
 
 
+def userns_probe_ok(binpath: str = "bwrap", share_net: bool = False) -> bool:
+    """Can this bwrap+kernel really run --unshare-user --disable-userns
+    --assert-userns-disabled? Probed once per launch with a throwaway
+    minimal sandbox before the flags are committed to the real argv.
+
+    The explicit --unshare-user (required: --unshare-all only sets
+    --unshare-user-try) replaces bwrap's non-root "just DWIM" fallback,
+    and on hosts where unprivileged user namespaces are off — setuid
+    bwrap, kernel.unprivileged_userns_clone=0, hardened kernels with
+    max_user_namespaces=0 — that combination used to turn working setups
+    into hard launch failures. Failing closed there is not a security
+    gain (the whole sandbox cannot start at all), so probe instead: on
+    failure the launcher keeps the flags off, notes it, and rests on the
+    seccomp unshare/setns/clone deny rules alone.
+
+    The probe argv mirrors the real launch's namespace/pid/session flags
+    (--unshare-all --die-with-parent --new-session --as-pid-1, and
+    --share-net in --net mode): the point is to catch flag INTERACTIONS
+    on some bwrap version, so a probe that runs a different argv than
+    the launch would pass while the launch dies — exactly the hard
+    failure this probe exists to prevent. The seccomp fd is the one
+    deliberate difference (bwrap consumes the pipe's bytes, and its
+    option is handled at argv-parse time, long before namespace setup).
+    """
+    argv = [binpath, "--unshare-all", "--die-with-parent", "--new-session",
+            "--as-pid-1"]
+    if share_net:
+        argv += ["--share-net"]
+    argv += ["--unshare-user", "--disable-userns", "--assert-userns-disabled",
+             "--ro-bind", "/", "/", "--", "/bin/true"]
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=10)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# Notes that would print on EVERY launch get lossy in the noise; show them
+# at most once a day (a stamp file in the user cache dir — unwritable cache
+# just means the note prints every time).
+_NOTE_STAMP_MAX_AGE = 24 * 3600
+
+
+def _note_stamp_path(key: str) -> str:
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "sbox", key)
+
+
+def note_recently_shown(key: str) -> bool:
+    try:
+        return time.time() - os.path.getmtime(_note_stamp_path(key)) < _NOTE_STAMP_MAX_AGE
+    except OSError:
+        return False
+
+
+def mark_note_shown(key: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_note_stamp_path(key)), exist_ok=True)
+        with open(_note_stamp_path(key), "w", encoding="utf-8") as fh:
+            fh.write(str(int(time.time())) + "\n")
+    except OSError:
+        pass
+
+
+def seccomp_selfprobe(bpf: bytes) -> None:
+    """Verify on THIS machine, before anything starts, that the compiled
+    filter denies what it claims — dies unless it does.
+
+    The syscall tables are hand-typed, and a wrong number fails silently:
+    the filter loads fine and denies the WRONG syscall (or nothing). That
+    shipped once (unshare carried ioctl's number). tests/test_seccomp.py
+    pins the table down against kernel headers and a live probe, but a
+    guarantee that only exists when someone runs the tests is no
+    guarantee — so every launch checks it here, host-side, no python3
+    needed inside the sandbox: install the filter in a forked child
+    (PR_SET_NO_NEW_PRIVS + PR_SET_SECCOMP, the same prctl path the old
+    in-sandbox helper used) and call the C library wrappers — the libc
+    name->number mapping is ground truth the hand-typed table cannot
+    fool. Probed (all harmless no-ops with distinguishable unfiltered
+    errors): unshare(0) (the number that once shipped wrong),
+    ioctl(TIOCSTI) on a non-tty fd (ENOTTY unfiltered), socket(AF_VSOCK)
+    (the netns-bypass family the gate refuses), personality(0) and
+    ptrace(PTRACE_ATTACH, 0). Anything but -1/EPERM means the deny-list
+    is not what we think, and the launcher refuses to run (--no-seccomp
+    is the explicit opt-out and never reaches here). Coverage note: this
+    probe SAMPLES the table — five entries whose numbers the libc
+    wrappers pin down; the remaining hand-typed numbers are verified only
+    by tests/test_seccomp.py (kernel headers / scmp_sys_resolver /
+    ausyscall cross-checks), so run it after touching SECCOMP_SYSCALLS.
+    Cost: one fork, about a millisecond.
+    """
+    class _SF(ctypes.Structure):
+        _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                    ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint)]
+
+    class _SFP(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(_SF))]
+
+    pid = os.fork()
+    if pid == 0:
+        # The child never returns to Python teardown: reset the launcher's
+        # signal handlers and report through the exit status only.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_DFL)
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            n = len(bpf) // 8
+            prog = _SFP(n, (_SF * n).from_buffer_copy(bpf))
+            if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+                os._exit(5)  # cannot install — bwrap could not either
+            if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER,
+                          ctypes.byref(prog), 0, 0) != 0:
+                os._exit(5)
+
+            def denied(fn) -> bool:
+                ctypes.set_errno(0)
+                return fn() == -1 and ctypes.get_errno() == errno.EPERM
+
+            if not denied(lambda: libc.unshare(0)):
+                os._exit(3)
+            devnull = os.open(os.devnull, os.O_RDWR | os.O_CLOEXEC)
+            if not denied(lambda: libc.ioctl(devnull, TIOCSTI,
+                                             ctypes.c_char_p(b"x"))):
+                os._exit(30)
+            # AF_VSOCK is 40 on every ABI we support.
+            if not denied(lambda: libc.socket(40, 1, 0)):
+                os._exit(31)
+            if not denied(lambda: libc.personality(0)):
+                os._exit(32)
+            # PTRACE_ATTACH to pid 0 errors either way; EPERM only under
+            # the filter.
+            if not denied(lambda: libc.ptrace(16, 0, 0, 0)):
+                os._exit(33)
+            os._exit(0)
+        except BaseException:
+            os._exit(4)
+    _, st = os.waitpid(pid, 0)
+    exit_code = os.WEXITSTATUS(st) if os.WIFEXITED(st) else -1
+    detail = {
+        0: None,
+        3: "unshare(0) was not denied by the filter — the hand-typed "
+           "syscall table does not match this machine",
+        30: "ioctl(TIOCSTI) was not denied by the filter",
+        31: "socket(AF_VSOCK) was not denied by the filter",
+        32: "personality(0) was not denied by the filter",
+        33: "ptrace(PTRACE_ATTACH) was not denied by the filter",
+        4: "probe child crashed",
+        5: "cannot install seccomp filters here (prctl PR_SET_SECCOMP)",
+    }.get(exit_code, "probe child died unexpectedly")
+    if detail is not None:
+        die(f"seccomp self-probe failed: {detail} — refusing to run "
+            "(pass --no-seccomp to override)")
+
+
 def seccomp_fd_args(caps: dict, verbose: bool) -> tuple[str, int]:
     """Compile the deny-list and hand it to bwrap through a pipe.
 
@@ -1586,6 +1907,9 @@ def seccomp_fd_args(caps: dict, verbose: bool) -> tuple[str, int]:
         die("this bwrap supports neither --add-seccomp-fd nor --seccomp — cannot "
             "install the seccomp deny-list (upgrade bwrap >= 0.4.1, or pass "
             "--no-seccomp)")
+    # Fail-closed ON THIS MACHINE, not just in the test suite: the filter
+    # must really deny unshare(0) before it is handed to bwrap.
+    seccomp_selfprobe(bpf)
     r, w = os.pipe()  # empty pipe, blocking fd: completes for << 64K; the
     try:              # loop is belt and braces for a much bigger filter
         view = memoryview(bpf)
@@ -1625,8 +1949,19 @@ Host *
 
 
 def protected_paths(home: str) -> set[str]:
-    """Paths a user-supplied bind (or the cwd bind) must never cover."""
-    return set(SYSTEM_DIRS) | {os.path.realpath(home), "/run/user", f"/run/user/{os.getuid()}"}
+    """Paths a user-supplied bind (or the cwd bind) must never cover. The
+    resolved $XDG_RUNTIME_DIR is included as a ROOT: when it lives outside
+    /run (some distros/setups put it in $HOME or /tmp), an ANCESTOR bind of
+    it (-b of its parent) is not caught by the runtime-root shape rule
+    (which only refuses the root itself and its descendants) and would
+    otherwise depend on the depth-3 socket scan happening to find a socket
+    in time."""
+    paths = set(SYSTEM_DIRS) | {os.path.realpath(home), "/run/user",
+                                f"/run/user/{os.getuid()}"}
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        paths.add(os.path.realpath(xdg))
+    return paths
 
 
 # Well-known host control sockets: binding any of these hands the sandbox
@@ -1676,6 +2011,17 @@ CONTROL_SOCKETS = {
 }
 
 
+def _control_sockets() -> set[str]:
+    """CONTROL_SOCKETS plus realpath'd copies of every entry: refusal
+    compares against realpath'd bind sources, and the $HOME-relative
+    entries above are expanded from $HOME WITHOUT resolving symlinks — on
+    systems where $HOME goes through one (Fedora Silverblue/Kinoite:
+    /home -> /var/home, or any $HOME that is itself a link) the raw
+    spelling never matched anything, so --bind-socket ~/.docker/run/
+    docker.sock sailed through and the --home note stayed silent."""
+    return CONTROL_SOCKETS | {os.path.realpath(s) for s in CONTROL_SOCKETS}
+
+
 def _is_socket(path: str) -> bool:
     try:
         return stat.S_ISSOCK(os.stat(path).st_mode)
@@ -1684,25 +2030,35 @@ def _is_socket(path: str) -> bool:
 
 
 # Well-known $HOME persistence paths: a read-write bind covering any of
-# these is host code execution at the next login/session — shell rc files
-# run at shell startup, ~/.ssh/authorized_keys at the next sshd login,
-# systemd user units and XDG autostart at session start, ~/.local/bin is
-# on default PATHs, ~/.gitconfig aliases execute shell commands. Like
-# CONTROL_SOCKETS this list will always lag reality, but unlike control
-# sockets these binds are legitimate far more often, so they are WARNED
-# about (naming the paths), never refused. Read-only binds are fine.
+# these is host code execution at the next login/session — shell rc and
+# session files run at shell startup, ~/.ssh/authorized_keys at the next
+# sshd login, systemd user units and XDG autostart at session start,
+# environment.d feeds systemd user sessions, .desktop Exec= lines run on
+# click, ~/.local/bin, ~/.cargo/bin and ~/go/bin sit on default PATHs,
+# ~/.gitconfig aliases execute shell commands, neovim config ships
+# lua/plugin autostart. Like CONTROL_SOCKETS this list will always lag
+# reality, but unlike control sockets these binds are legitimate far more
+# often, so they are WARNED about (naming the paths), never refused.
+# Read-only binds are fine.
 def persistence_paths(home: str) -> set[str]:
     h = os.path.realpath(home)
     cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(h, ".config")
     data = os.environ.get("XDG_DATA_HOME") or os.path.join(h, ".local", "share")
     # XDG spec: relative values are ignored, i.e. resolved under $HOME.
+    # realpath both: they are compared against realpath'd bind sources, and
+    # $XDG_* (like $HOME) may go through a symlink (same mismatch class as
+    # the CONTROL_SOCKETS entries).
     if not os.path.isabs(cfg):
         cfg = os.path.join(h, cfg)
     if not os.path.isabs(data):
         data = os.path.join(h, data)
+    cfg = os.path.realpath(cfg)
+    data = os.path.realpath(data)
     return {
         os.path.join(h, ".bashrc"), os.path.join(h, ".bash_profile"),
-        os.path.join(h, ".bash_login"), os.path.join(h, ".profile"),
+        os.path.join(h, ".bash_login"), os.path.join(h, ".bash_logout"),
+        os.path.join(h, ".profile"), os.path.join(h, ".xprofile"),
+        os.path.join(h, ".xsessionrc"), os.path.join(h, ".pam_environment"),
         os.path.join(h, ".zprofile"), os.path.join(h, ".zshrc"),
         os.path.join(h, ".zshenv"), os.path.join(h, ".zlogin"),
         os.path.join(h, ".kshrc"),
@@ -1710,22 +2066,34 @@ def persistence_paths(home: str) -> set[str]:
         os.path.join(h, ".gitconfig"), os.path.join(cfg, "git", "config"),
         os.path.join(h, ".ssh", "authorized_keys"),
         os.path.join(h, ".local", "bin"),
+        os.path.join(h, ".cargo", "bin"),
+        os.path.join(h, "go", "bin"),
         os.path.join(cfg, "fish", "config.fish"),
+        os.path.join(cfg, "nvim"),
         os.path.join(cfg, "systemd", "user"),
         os.path.join(cfg, "autostart"),
+        os.path.join(cfg, "environment.d"),
         os.path.join(data, "systemd", "user"),
+        os.path.join(data, "applications"),
     }
 
 
-def _path_ident(path: str) -> tuple[int, int] | None:
-    """(st_dev, st_ino) for the validation-time inode a later O_PATH pin
-    must still match, or None when the path does not exist (binds of
-    missing paths fail in bwrap exactly as before)."""
-    try:
-        st = os.stat(path, follow_symlinks=False)
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino)
+def _persistence_warning(label: str, p: str, rp: str, home: str) -> str | None:
+    """The rw-bind persistence note for (label, p, rp): keyed on the final
+    MOUNT MODE (read-write), never on the CLI label — a --bind-socket
+    DIRECTORY mounts rw just like -b, so both must warn. Both directions:
+    an ancestor (-b ~/.config) and a descendant (-b ~/.local/bin/mytool, a
+    single systemd unit) are equally dangerous — the file on PATH / the
+    unit becomes writable."""
+    hits = sorted(q for q in persistence_paths(home)
+                  if covers(rp, q) or covers(q, rp))
+    if hits:
+        return (f"note: {label} {p} covers host persistence path(s): "
+                + ", ".join(hits)
+                + " — sandboxed code can plant things there that run "
+                "as you at next login/session; prefer -r or a "
+                "narrower bind")
+    return None
 
 
 # O_PATH availability guard (Linux 2.6.39+; every kernel that runs bwrap
@@ -1733,21 +2101,23 @@ def _path_ident(path: str) -> tuple[int, int] | None:
 _O_PATH = getattr(os, "O_PATH", 0)
 
 
-def open_path_pinned(path: str, expect: tuple[int, int] | None = None,
-                     max_hops: int = 40) -> int:
-    """O_PATH|O_NOFOLLOW-open `path` with no TOCTOU window.
+def open_path_pinned(path: str) -> int:
+    """O_PATH|O_NOFOLLOW-open `path`, refusing ANY symlink on the way.
 
-    os.path.realpath() validation + a later plain open() leaves a race: a
-    concurrent sandbox sharing a writable directory can swap a component
-    for a symlink in between, redirecting the bind (e.g. onto ~/.ssh).
-    Instead every component is opened with openat(O_PATH|O_NOFOLLOW)
-    relative to the pinned parent directory only; symlinks are resolved
-    textually (absolute targets restart the walk at /, .. pops to the
-    pinned parent — never through a re-resolved path) and bounded by
-    max_hops. The final inode must match `expect` (captured at validation
-    time by _path_ident): an attacker may move the validated object, but
-    never substitute a different one. Raises OSError (ENOENT etc.) or
-    ValueError on an inode mismatch; the caller owns the returned fd.
+    The input is always a realpath() result (fully resolved — every
+    caller resolves first), so a symlink met anywhere in the walk —
+    intermediate component or final object — means the tree changed since
+    realpath() ran: a concurrent sandbox swapped a component (or the
+    object itself) for a symlink to redirect the bind (e.g. onto
+    ~/.ssh). Each component is opened with openat(O_PATH|O_NOFOLLOW)
+    relative to the pinned parent directory only, so the walk cannot be
+    steered through a re-resolved path. There is deliberately NO
+    "expected inode" parameter and no symlink resolution: validation
+    happens fd-FIRST (the caller fstat()s and scans this very fd), so
+    the fd you validated is the fd you mount — there is no second
+    resolution whose result could diverge. Raises OSError (ENOENT etc.)
+    or ValueError when a symlink is encountered; the caller owns the
+    returned fd.
     """
     if not _O_PATH:
         raise OSError(errno.ENOSYS, "O_PATH unavailable", path)
@@ -1755,7 +2125,6 @@ def open_path_pinned(path: str, expect: tuple[int, int] | None = None,
         raise OSError(errno.EINVAL, "pinning needs an absolute path", path)
     remaining = path.split("/")
     stack = [os.open("/", _O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)]
-    hops = 0
     final = None
     try:
         while remaining:
@@ -1769,35 +2138,17 @@ def open_path_pinned(path: str, expect: tuple[int, int] | None = None,
             cur = os.open(comp, _O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
                           dir_fd=stack[-1])
             if stat.S_ISLNK(os.fstat(cur).st_mode):
-                hops += 1
-                if hops > max_hops:
-                    raise OSError(errno.ELOOP, "too many symlink hops", path)
-                # readlinkat against the pinned dir: the target read may
-                # race a swap of this very name, but a mixed walk cannot
-                # reach the validated inode of a DIFFERENT object — the
-                # final expect check below is what makes substitution
-                # impossible, this only keeps legit symlinks working.
-                target = os.readlink(comp, dir_fd=stack[-1])
                 os.close(cur)
-                if target.startswith("/"):
-                    for fd in stack[1:]:
-                        os.close(fd)
-                    del stack[1:]
-                remaining = target.split("/") + remaining
-                continue
+                raise ValueError(
+                    f"{path}: component {comp!r} is a symlink — the path "
+                    "changed between realpath() and the pin (a concurrent "
+                    "sandbox trying to redirect the bind?)")
             if remaining:
                 stack.append(cur)
             else:
                 final = cur
         if final is None:  # path was "/" (or only . / .. components)
             final = stack.pop()
-        if expect is not None:
-            st = os.fstat(final)
-            if (st.st_dev, st.st_ino) != expect:
-                raise ValueError(
-                    f"{path}: pinned inode ({st.st_dev}, {st.st_ino}) != "
-                    f"validated inode {expect} — the path was swapped "
-                    "between validation and mount")
         return final
     except BaseException:
         if final is not None:
@@ -1814,41 +2165,83 @@ def open_path_pinned(path: str, expect: tuple[int, int] | None = None,
                 pass
 
 
+def _fd_reaches(fd: int, path: str) -> bool:
+    """Does the kernel still reach `fd`'s object at exactly `path`? The
+    readlink of /proc/self/fd/<fd> is the kernel's own view of what the
+    fd holds — immune to whatever raced with the open (a rename or swap
+    shows up as a different path, a deleted object as " (deleted)")."""
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}") == path
+    except OSError:
+        return False
+
+
 class BindPinner:
     """Pins validated bind sources as O_PATH fds for bwrap --[ro-]bind-fd.
 
-    bwrap >= 0.10 mounts the object the fd refers to and re-verifies the
-    inode after mounting, so validation and mount can no longer diverge.
-    With `enabled=False` (old bwrap, or capabilities unknown) every pin()
-    is a no-op and callers emit the plain path-based flags instead.
+    Validation is fd-FIRST: pin() takes a realpath, refuses any symlink
+    met on the walk (open_path_pinned), and confirms via /proc/self/fd
+    that the kernel still reaches the pinned object at that exact path
+    (_fd_reaches). Every check the callers run — socket shape (fstat),
+    the contains-socket scan (rooted at /proc/self/fd/<fd>) — then runs
+    on the pinned object, and bwrap >= 0.10 mounts exactly that fd: the
+    object that was validated is the object that is mounted, and there
+    is no separate "expected identity" to keep in sync (the fd IS the
+    identity). One fd per source path (cached): the cwd mount and a -b
+    of the same path share the object validation checked. With
+    `enabled=False` (old bwrap, or capabilities unknown) every pin() is
+    a no-op and callers emit the plain path-based flags instead — with
+    the documented path-based (TOCTOU) checks.
     """
 
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self.fds: dict[str, int] = {}
 
-    def pin(self, path: str, expect: tuple[int, int] | None = None) -> int | None:
-        """An O_PATH fd for `path` (cached; the sandbox only ever mounts
-        each source once), or None when pinning is unavailable and the
-        path form must be used. ENOENT maps to None as well: --bind-socket
-        legitimately names runtime paths that do not exist yet, and the
-        path form preserves bwrap's own not-found error. Anything else —
-        including an inode mismatch — dies: an actively raced path must
-        not silently fall back to the TOCTOU-vulnerable form."""
+    def pin(self, path: str, allow_missing: bool = False) -> int | None:
+        """An O_PATH fd for `path` (a realpath), or None when the path is
+        legitimately missing (allow_missing, used for --bind-socket of
+        not-yet-created runtime paths: the path form then preserves
+        bwrap's own not-found error). A missing -b/-r source DIES instead:
+        those use non---try bwrap flags, so bwrap would fail on a missing
+        source anyway, and falling back to the path form would re-open
+        the swap race (pin nothing, let bwrap resolve a path a concurrent
+        sandbox can plant a symlink at). Anything else — a symlink on the
+        walk, or the kernel no longer reaching the pinned object at
+        `path` — dies too: an actively raced path must not silently fall
+        back to the TOCTOU-vulnerable path form."""
         if path in self.fds:
             return self.fds[path]
         if not self.enabled:
             return None
         try:
-            fd = open_path_pinned(path, expect)
+            fd = open_path_pinned(path)
+            if not _fd_reaches(fd, path):
+                actual = os.readlink(f"/proc/self/fd/{fd}")
+                os.close(fd)
+                die(f"{path}: changed during validation — the kernel reaches "
+                    f"it as {actual!r} (rename or swap?) — refusing")
         except OSError as e:
-            if e.errno == errno.ENOENT:
+            if e.errno == errno.ENOENT and allow_missing:
                 return None
             die(f"cannot pin bind source {path} ({e.strerror or e}) — refusing")
         except ValueError as e:
             die(f"{e} — refusing")
         self.fds[path] = fd
         return fd
+
+    def release(self, path: str) -> None:
+        """Close and forget the pin for `path` — called when a validated
+        source ends up NOT being mounted (a refused cwd): a live O_PATH
+        fd for host ground must never linger in the bookkeeping, because
+        pass_fds derives from the argv only but the cache is what gets
+        closed after the spawn. No-op for unpinned paths."""
+        fd = self.fds.pop(path, None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def close(self) -> None:
         for fd in self.fds.values():
@@ -1859,18 +2252,31 @@ class BindPinner:
         self.fds.clear()
 
 
-def _contains_socket(root: str, max_depth: int = 3, max_entries: int = 5000) -> str | None:
+def _contains_socket(root: str, max_depth: int = 3, max_entries: int = 5000,
+                     shown: str | None = None, verbose: bool = False) -> str | None:
     """Bounded scan for a Unix socket inside root (depth- and entry-capped
     so huge trees stay cheap); returns the first socket path found, or None.
     Binding a directory that contains a socket usually means binding a
-    control socket we simply do not know by name."""
+    control socket we simply do not know by name. Directories count toward
+    the entry cap too (a directory-heavy tree — node_modules at depth <= 3 —
+    must not turn the cap into "walk everything"), and hitting the cap is
+    FAIL-OPEN by design (ordinary big trees must keep binding) — so it says
+    so on stderr, but at most once a day (or with --verbose): a large cwd
+    would otherwise print it on EVERY launch. `shown` is the HOST-path
+    spelling for that note (root is often a /proc/self/fd/N pin)."""
     n = 0
     for dirpath, dirnames, filenames in os.walk(root):
         if dirpath[len(root):].count("/") >= max_depth:
             dirnames[:] = []
-        for name in filenames:
+        for name in dirnames + filenames:
             n += 1
             if n > max_entries:
+                if verbose or not note_recently_shown("socket-scan-gaveup.note"):
+                    mark_note_shown("socket-scan-gaveup.note")
+                    err(f"note: socket scan of {shown or root} gave up after "
+                        f"{max_entries} entries (depth <= {max_depth}) — the bind "
+                        "is allowed, but an unscanned socket could lurk there; "
+                        "--bind-socket is only needed when you know there is one")
                 return None
             p = os.path.join(dirpath, name)
             if _is_socket(p):
@@ -1878,90 +2284,207 @@ def _contains_socket(root: str, max_depth: int = 3, max_entries: int = 5000) -> 
     return None
 
 
-def check_bind_paths(opts, home: str) -> list[tuple[str, str, tuple[int, int] | None]]:
-    """Validate -b/--ro-bind before anything is started; return the resolved
-    (flag, realpath, inode-identity) triples that build_bwrap mounts via
-    O_PATH pins — validation and mount must use the same object, so symlink
-    swaps and relative paths can't make bwrap mount something that was
-    never checked (the identity survives until the --bind-fd mount).
-
-    Whatever these paths really point at is handed to the sandbox, so refuse
-    anything that covers a protected path (an ancestor of — or equal to —
-    $HOME, a system dir, or the user runtime dir with its agent/pipewire/
-    D-Bus sockets), covers a known host control socket (CONTROL_SOCKETS),
-    or is socket-shaped by rule: any socket file, anything under /run,
-    /var/run or $XDG_RUNTIME_DIR, or a directory that contains a Unix
-    socket (bounded _contains_socket scan) — control-socket territory
-    where a name list will always lag reality. --bind-socket PATH
-    (mounted read-only) is the explicit per-path opt-in for the
-    socket-shaped rules; known control sockets are never overridable. Children of protected
-    paths are fine otherwise (e.g. -b ~/proj). -b $HOME itself is
-    only acceptable together with --home (which binds it anyway); anything
-    that merely covers $HOME, like /home, is still refused.
-    """
-    real_home = os.path.realpath(home)
-    protected = sorted(protected_paths(home))
-    explicit = {os.path.realpath(p) for p in getattr(opts, "bind_socket", [])}
-    runtime_roots = {"/run", "/var/run"}
+def _runtime_roots() -> set[str]:
+    """Roots whose contents are control-socket ground: /run, /var/run and
+    the resolved $XDG_RUNTIME_DIR."""
+    roots = {"/run", "/var/run"}
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        runtime_roots.add(os.path.realpath(xdg))
-    binds: list[tuple[str, str]] = []
-    for flag, paths in (("--bind", opts.bind), ("--ro-bind", opts.ro_bind),
-                        # --bind-socket mounts read-only: connect() works
-                        # through a ro-bind (as /run/proxy.sock proves), and
-                        # rw would let the sandbox replace the socket file.
-                        ("--ro-bind", opts.bind_socket)):
+        roots.add(os.path.realpath(xdg))
+    return roots
+
+
+def validate_bind_source(pinner: BindPinner | None, label: str, p: str,
+                         opts, home: str) -> tuple[str | None, str | None, str, int | None]:
+    """Validate one bind source for -b/-r/--bind-socket AND the automatic
+    cwd mount (label="cwd"): pin FIRST (after the string-only rules), then
+    validate the pinned object — the fd you validated is the fd you mount.
+
+    Returns (refusal, warning, rp, fd): `refusal` is a reason string when
+    the bind must not happen (check_bind_paths dies on it; the cwd path
+    downgrades it to the "not mounting it" warning), `warning` is the
+    persistence note or None, `rp` the resolved path, `fd` the pinned
+    O_PATH fd (None when the source does not exist yet or fd pinning is
+    unavailable — checks then run on the path, the documented old-bwrap
+    fallback).
+
+    Whatever these paths really point at is handed to the sandbox, so
+    refuse anything that covers a protected path (an ancestor of — or
+    equal to — $HOME, a system dir, or the user runtime dir with its
+    agent/pipewire/D-Bus sockets), lies INSIDE /proc, /sys or /dev
+    (NO_DESCEND_ROOTS: host pseudo-fs ground — magic links resolve in the
+    host task's context — never bindable, no --bind-socket override),
+    covers a known host control socket (_control_sockets(), matched
+    bidirectionally), or is socket-shaped by rule: any socket file,
+    anything under /run, /var/run or $XDG_RUNTIME_DIR, or a directory
+    that contains a Unix socket (bounded _contains_socket scan, rooted
+    at the pinned fd when there is one) — control-socket territory where
+    a name list will always lag reality. --bind-socket PATH is the
+    explicit per-path opt-in for the socket-shaped rules ONLY, and never
+    for a read-write mount: socket files and runtime-dir paths are
+    connect-only (a rw mount would let the sandbox replace the socket and
+    impersonate the service), so -b of them is refused with or without
+    the opt-in; plain directories do mount rw (see check_bind_paths).
+    Known control sockets and protected paths are never overridable.
+    -b $HOME itself is only acceptable together with --home (which binds
+    it anyway).
+    """
+    real_home = os.path.realpath(home)
+    rp = os.path.realpath(p)
+    # -b $HOME together with --home re-binds what --home binds anyway:
+    # exempt from ALL socket checks (but surface the risk in the --home
+    # note, so it is never silent).
+    exempt = label == "--bind" and getattr(opts, "home", False) and rp == real_home
+    # String-only rules FIRST (pure prefix matching, no filesystem
+    # access): a path that is refused on its shape must report the
+    # refusal, not a pin error from an unsearchable component.
+    if not exempt:
+        hits = [q for q in sorted(protected_paths(home)) if covers(rp, q)]
+        if hits:
+            reason = f"{label} {p} covers protected path(s): {', '.join(hits)}"
+            if label == "--bind" and rp == real_home:
+                reason += "; use --home to bind $HOME itself"
+            return reason, None, rp, None
+        # Kernel/pseudo-fs ground: /proc/<pid>/root, /proc/<pid>/fd/*,
+        # /dev/pts, /dev/shm, ... resolve in the HOST task's context even
+        # after a plain bind (magic links; the ptrace_may_access gate is a
+        # kuid comparison, so the same uid passes from a child userns).
+        # Never bindable, --bind-socket is NOT an opt-in here (see
+        # NO_DESCEND_ROOTS above for the full story).
+        desc_hits = [r for r in NO_DESCEND_ROOTS if covers(r, rp)]
+        if desc_hits:
+            return (f"{label} {p}: {rp} is inside {desc_hits[0]} — kernel/"
+                    "pseudo-fs ground (/proc/<pid>/root, /proc/<pid>/fd, "
+                    "/dev/pts, ... are host escapes; the sandbox already "
+                    "gets a fresh, safe /proc and /dev)", None, rp, None)
+        # Bidirectional: neither an ancestor of a listed socket
+        # (-b /run/docker) nor a descendant of a listed directory
+        # (--bind-socket .../keyring/ssh) may pass.
+        sock_hits = sorted(s for s in _control_sockets()
+                           if covers(rp, s) or covers(s, rp))
+        if sock_hits:
+            return (f"{label} {p} overlaps host control socket(s): {', '.join(sock_hits)}"
+                    " — that hands the sandbox full control of the host (container"
+                    " runtime, D-Bus/systemd, keyring, X11, ...)", None, rp, None)
+    explicit = {os.path.realpath(x) for x in getattr(opts, "bind_socket", [])}
+    runtime_roots = _runtime_roots()
+    # fd-first for every filesystem-backed check. allow_missing only for
+    # --bind-socket (not-yet-created runtime paths): a missing -b/-r
+    # source must die, not fall back to the racy path form.
+    fd = pinner.pin(rp, allow_missing=label == "--bind-socket") \
+        if pinner is not None else None
+    st = os.fstat(fd) if fd is not None else None
+    if exempt:
+        return None, None, rp, fd
+    is_socket = stat.S_ISSOCK(st.st_mode) if st is not None else _is_socket(rp)
+    if is_socket or any(covers(root, rp) for root in runtime_roots):
+        # Read-write never opts in: a rw mount of a socket file or a
+        # runtime-dir path lets the sandbox unlink and replace the socket,
+        # impersonating the host service to host clients — `-b P
+        # --bind-socket P` used to smuggle exactly that past the shape
+        # rule (explicit exempted the -b entry too, and the --bind-socket
+        # entry then saw the path as already bound). Socket files and
+        # runtime-dir paths are connect-only: read-only, full stop.
+        if label == "--bind" or (label == "cwd"
+                                 and not getattr(opts, "ro_cwd", False)):
+            how = ("-r PATH --bind-socket PATH" if label == "--bind"
+                   else '--ro-cwd --bind-socket "$PWD"')
+            return (f"{label} {p}: {rp} is a socket or lives under a runtime "
+                    "dir — connect-only ground never mounts read-write (rw "
+                    "would let the sandbox replace the socket and impersonate "
+                    f"the host service); read-only works: {how}", None, rp, fd)
+        if rp not in explicit:
+            return (f"{label} {p}: {rp} is a socket or lives under a runtime dir — "
+                    "control-socket territory (a full host escape waiting for a "
+                    "name we forgot); pass --bind-socket to bind it anyway",
+                    None, rp, fd)
+    is_dir = stat.S_ISDIR(st.st_mode) if st is not None else os.path.isdir(rp)
+    if rp not in explicit and is_dir:
+        # Scan the PINNED object when there is one: the directory whose
+        # contents were checked is the directory that gets mounted. What
+        # stays racy is a socket appearing after the scan — a sandbox
+        # cannot create a host control socket, so that residual is
+        # accepted (a path-rooted scan could be steered to a different
+        # directory entirely; /proc/self/fd cannot).
+        scan_root = f"/proc/self/fd/{fd}" if fd is not None else rp
+        found = _contains_socket(scan_root, shown=rp,
+                                 verbose=getattr(opts, "verbose", False))
+        if found:
+            # name the HOST path, not the /proc/self/fd/N spelling
+            shown = rp + found[len(scan_root):] if found.startswith(scan_root) else found
+            return (f"{label} {p}: contains a Unix socket ({shown}) — "
+                    "control-socket territory; pass --bind-socket to bind it "
+                    "anyway", None, rp, fd)
+    warning = None
+    if label == "--bind":
+        # Persistence, not escape: code planted through these rw binds
+        # executes AS THE HOST USER at the next login/session. (The cwd
+        # mount deliberately does not warn here — the epilog documents the
+        # rw-cwd trade-off once; --bind-socket directories that resolve to
+        # rw warn in check_bind_paths, where the final flag is known.)
+        warning = _persistence_warning(label, p, rp, home)
+    return None, warning, rp, fd
+
+
+def check_bind_paths(opts, home: str,
+                     pinner: BindPinner | None = None) -> list[tuple[str, str, int | None]]:
+    """Validate -b/--ro-bind/--bind-socket before anything is started;
+    return the resolved (bwrap-flag, realpath, pinned-fd) triples that
+    build_bwrap mounts. fd-first: each source is pinned (open_path_pinned
+    refuses every symlink — validation and mount use the SAME object), so
+    symlink swaps and relative paths can't make bwrap mount something that
+    was never checked; fd is None when the source does not exist yet or
+    fd pinning is unavailable (old bwrap: path-based mounts and checks,
+    with a note). See validate_bind_source for the rules themselves.
+    """
+    binds: list[tuple[str, str, int | None]] = []
+    bound: set[str] = set()  # resolved paths already emitting a mount
+    for label, flag, paths in (
+        ("--bind", "--bind", opts.bind),
+        ("--ro-bind", "--ro-bind", opts.ro_bind),
+        # --bind-socket's mount flag is decided per path below: read-only
+        # for connect-only ground, read-write for plain directories.
+        ("--bind-socket", "--ro-bind", opts.bind_socket),
+    ):
         for p in paths:
-            rp = os.path.realpath(p)
-            # -b $HOME together with --home re-binds what --home binds
-            # anyway: exempt from ALL socket checks (but surface the risk
-            # in the --home note below, so it is never silent).
-            exempt = flag == "--bind" and opts.home and rp == real_home
-            hits = [] if exempt else [q for q in protected if covers(rp, q)]
-            if hits:
-                die(f"{flag} {p} covers protected path(s): {', '.join(hits)}"
-                    + ("; use --home to bind $HOME itself"
-                       if flag == "--bind" and rp == real_home else ""))
-            if not exempt:
-                # Bidirectional: neither an ancestor of a listed socket
-                # (-b /run/docker) nor a descendant of a listed directory
-                # (--bind-socket .../keyring/ssh) may pass.
-                sock_hits = sorted(s for s in CONTROL_SOCKETS
-                                   if covers(rp, s) or covers(s, rp))
-                if sock_hits:
-                    die(f"{flag} {p} overlaps host control socket(s): "
-                        f"{', '.join(sock_hits)} — that hands the sandbox "
-                        "full control of the host (container runtime, D-Bus/"
-                        "systemd, keyring, X11, ...); refusing")
-                if rp not in explicit and (
-                        any(covers(root, rp) for root in runtime_roots)
-                        or _is_socket(rp)):
-                    die(f"{flag} {p}: {rp} is a socket or lives under a runtime "
-                        "dir — control-socket territory (a full host escape "
-                        "waiting for a name we forgot); pass "
-                        "--bind-socket to bind it anyway")
-                if rp not in explicit and os.path.isdir(rp):
-                    found = _contains_socket(rp)
-                    if found:
-                        die(f"{flag} {p}: contains a Unix socket ({found}) — "
-                            "control-socket territory; pass --bind-socket to "
-                            "bind it anyway")
-            if flag == "--bind" and not exempt:
-                # Persistence, not escape: code planted through these rw
-                # binds executes AS THE HOST USER at next login/session
-                # (the --home notes cover the exempt whole-home case).
-                hits = sorted(q for q in persistence_paths(home) if covers(rp, q))
-                if hits:
-                    err(f"note: {flag} {p} covers host persistence path(s): "
-                        + ", ".join(hits)
-                        + " — sandboxed code can plant things there that run "
-                        "as you at next login/session; prefer -r or a "
-                        "narrower bind")
-            binds.append((flag, rp, _path_ident(rp)))
+            refusal, warning, rp, fd = validate_bind_source(pinner, label, p, opts, home)
+            if refusal:
+                die(f"{refusal}; refusing")
+            if warning:
+                err(warning)
+            if label == "--bind-socket":
+                if rp in bound:
+                    # -b/-r of the same path already mounts it with the
+                    # mode the user asked for; --bind-socket acted as the
+                    # shape/scan opt-in only — emitting its own mount would
+                    # shadow an -r back to read-only or worse.
+                    continue
+                # Socket files and runtime-dir paths are connect-only
+                # ground: read-only (rw would let the sandbox replace the
+                # socket file). Plain DIRECTORIES mount READ-WRITE — the
+                # opt-in for socket-bearing project dirs (puma.sock,
+                # .s.PGSQL.5432, .git/fsmonitor--daemon.ipc) that the
+                # contains-socket scan refuses; `-r P --bind-socket P`
+                # keeps them read-only. (-b P --bind-socket P never gets
+                # here for sockets/runtime paths — validate_bind_source
+                # refuses rw on connect-only ground outright.)
+                st_mode = os.fstat(fd).st_mode if fd is not None else None
+                is_dir = (stat.S_ISDIR(st_mode) if st_mode is not None
+                          else os.path.isdir(rp))
+                if is_dir and not any(covers(r, rp) for r in _runtime_roots()):
+                    flag = "--bind"
+                    # rw is rw, whatever the flag was spelled as: the
+                    # persistence note must fire for --bind-socket dirs
+                    # too (it used to be gated on the label and stayed
+                    # silent for exactly these).
+                    warning = _persistence_warning(label, p, rp, home)
+                    if warning:
+                        err(warning)
+            binds.append((flag, rp, fd))
+            bound.add(rp)
     if opts.home:
-        home_socks = sorted(s for s in CONTROL_SOCKETS
-                            if covers(real_home, s) and os.path.exists(s))
+        home_socks = sorted(s for s in _control_sockets()
+                            if covers(os.path.realpath(home), s) and os.path.exists(s))
         if home_socks:
             err("note: --home carries known control socket(s) inside $HOME: "
                 + ", ".join(home_socks)
@@ -1986,23 +2509,35 @@ def agent_socket_path() -> str:
 
 
 def build_bwrap(opts, sand: str, sock: str, home: str,
-                user_binds: list[tuple[str, str, tuple[int, int] | None]],
+                user_binds: list[tuple[str, str, int | None]],
                 agent: str | None, ssh_cfg: str | None,
-                pinner: BindPinner | None = None) -> tuple[list[str], str]:
+                pinner: BindPinner | None = None) -> tuple[list[str], str, list[int]]:
     import pwd  # POSIX only; we require Linux anyway (bwrap)
 
-    def mount_args(flag: str, src: str, dest: str,
-                   ident: tuple[int, int] | None = None) -> list[str]:
-        """One bind, TOCTOU-free where possible: with a pinner (bwrap
-        >= 0.10) the validated source is handed over as an O_PATH fd
-        (mount-by-inode, no re-resolution at mount time); without one
-        this is the classic path-based flag. Used for sources another
-        sandbox could race — user binds, the cwd mount, $HOME. System
-        trees (/usr, /etc/ssl, ...), the 0700 $WORK dir and the runtime
-        sockets below stay path-based on purpose: they are not writable
-        by sandboxed processes, so there is nothing to race."""
-        fd = pinner.pin(src, ident) if pinner is not None else None
+    # A pin can be NAMED twice in one argv (the cwd mount plus a -b of the
+    # same path, -b $HOME --home): emit a DISTINCT fd number per use —
+    # bwrap consumes setup-op fds itself, and whether a later --bind-fd N
+    # still resolves after an earlier op attached to N must not depend on
+    # bwrap's close ordering. The dups travel back to the caller (third
+    # return value) for parent-side closing after the spawn.
+    duped: list[int] = []
+    named: set[int] = set()
+
+    def mount_args(flag: str, src: str, dest: str, fd: int | None = None) -> list[str]:
+        """One bind, TOCTOU-free where possible: with a pinned fd (bwrap
+        >= 0.10) the VALIDATED object is handed over as an O_PATH fd —
+        never re-resolved, the fd check_bind_paths/validate_bind_source
+        pinned and checked IS the fd that gets mounted. fd is None for
+        path-based binds: sources another sandbox could race when fd
+        pinning is unavailable (old bwrap; loud note), plus the
+        deliberately path-based system trees (/usr, /etc/ssl, ...), the
+        0700 $WORK dir and the runtime sockets — not writable by
+        sandboxed processes, nothing to race."""
         if fd is not None:
+            if fd in named:
+                fd = os.dup(fd)
+                duped.append(fd)
+            named.add(fd)
             return [flag + "-fd", str(fd), dest]
         return [flag, src, dest]
 
@@ -2075,11 +2610,13 @@ def build_bwrap(opts, sand: str, sock: str, home: str,
         inner = INNER_DIRECT
 
     if opts.home:
-        # NOTE: the identity must be of the RESOLVED path — $HOME itself is
-        # often a symlink, and its lstat inode is the link's, never the
-        # target's (a false "swapped" refusal otherwise).
+        # Pin the RESOLVED $HOME — realpath already removed any symlink
+        # ($HOME is often one) and the pin walk refuses symlinks, so a
+        # swap of the link's target between realpath and mount dies in
+        # pin() instead of redirecting the bind.
         real_home_src = os.path.realpath(home)
-        bw += mount_args("--bind", real_home_src, home, _path_ident(real_home_src))
+        fd = pinner.pin(real_home_src) if pinner is not None else None
+        bw += mount_args("--bind", real_home_src, home, fd)
     else:
         bw += ["--perms", "0700", "--tmpfs", home]
 
@@ -2111,29 +2648,54 @@ def build_bwrap(opts, sand: str, sock: str, home: str,
             "--setenv", "SSH_AUTH_SOCK", "/run/ssh-agent.sock",
         ]
 
-    # Current directory: bind it (rw unless --ro-cwd) unless it covers a
-    # protected path (system dir, $HOME or an ancestor of it — a recursive
-    # bind of e.g. /home would cover the tmpfs $HOME and expose the real
-    # ~/.ssh etc.) or sits under a tmpfs $HOME. A cwd at or below an
-    # explicitly bound path still exists inside the sandbox, so chdir works.
-    # Children of /dev, /proc, /sys and /run (incl. XDG_RUNTIME_DIR) are not
-    # auto-mounted either: `cd` alone should never hand over runtime state —
-    # use an explicit -b for the rare legitimate case (e.g. -b /dev/dri).
+    # Current directory: bind it (rw unless --ro-cwd) through the SAME
+    # fd-first validator as -b/-r (validate_bind_source): protected paths,
+    # CONTROL_SOCKETS, the socket-shape rules and the contains-socket scan
+    # all apply — `cd` alone must never hand over runtime state
+    # (cd /tmp/.X11-unix, an LXD or tmux socket dir). A refusal is a LOUD
+    # warning and the command keeps running with the sandbox's /tmp as
+    # its cwd — silent continuation elsewhere is how `make`/`npm install`
+    # "succeed" somewhere you did not intend (--bind-socket "$PWD" opts a
+    # socket-bearing dir back in, read-write). A cwd at or below an
+    # explicitly bound path still exists inside the sandbox, so chdir
+    # works.
     real_home = os.path.realpath(home)
-    protected = sorted(protected_paths(home))
-    runtime_roots = ("/dev", "/proc", "/sys", "/run")
     project = os.path.realpath(os.getcwd())
+    user_bound = {rp for _, rp, _ in user_binds}
     bind = True
+    cwd_fd: int | None = None
     if project == real_home or project.startswith(real_home + "/"):
         if not opts.home:
             err("note: cwd is inside $HOME and $HOME is a tmpfs — using /tmp instead (--home to bind)")
             bind = False
+        else:
+            # --home binds the whole tree anyway; its notes cover the
+            # persistence and control-socket exposure (mirrors the
+            # -b $HOME --home exemption in validate_bind_source). Still
+            # pin the cwd itself so its mount is fd-based like the rest.
+            cwd_fd = pinner.pin(project) if pinner is not None else None
     else:
-        hits = [q for q in protected if covers(project, q)]
-        hits += [q for q in runtime_roots if covers(q, project)]
-        if hits:
-            err(f"note: cwd {project} overlaps protected path(s) {', '.join(sorted(set(hits)))} — not mounting it")
+        refusal, warning, _rp, cwd_fd = validate_bind_source(pinner, "cwd", project, opts, home)
+        if refusal:
+            # Never keep the pin of a REFUSED cwd: an O_PATH fd for host
+            # ground reaching the payload is an escape (the runc
+            # CVE-2024-21626 class — /proc/self/fd/N/.. walks the HOST
+            # mount tree), so release it unless a user bind of the same
+            # path still mounts it.
+            if pinner is not None and project not in user_bound:
+                pinner.release(project)
+            cwd_fd = None
+            if not any(covers(b, project) for b in user_bound):
+                err(f"warning: {refusal} — NOT mounting the cwd; the command "
+                    "runs with the sandbox's /tmp as its working directory")
+            # else: an explicit user bind covers the cwd, --chdir lands
+            # exactly where the user asked — the refusal only means the
+            # AUTOMATIC mount is skipped, and a "runs with /tmp" note
+            # would be wrong (the --chdir below keys on the same covers
+            # test). Silent, like every other explicit bind.
             bind = False
+        elif warning:
+            err(warning)
 
     # Emit the cwd bind BEFORE the user binds: a later bind shadows earlier
     # mounts at or below its target, so the automatic (rw by default) cwd
@@ -2141,14 +2703,14 @@ def build_bwrap(opts, sand: str, sock: str, home: str,
     # would otherwise silently end up read-write.
     if bind:
         bw += mount_args("--ro-bind" if opts.ro_cwd else "--bind", project, project,
-                         _path_ident(project))
+                         cwd_fd)
 
-    for flag, rp, ident in user_binds:
-        # mount exactly the validated (resolved) object, ideally by fd
-        bw += mount_args(flag, rp, rp, ident)
+    for flag, rp, fd in user_binds:
+        # mount exactly the validated (pinned) object — the fd
+        # check_bind_paths checked, never a re-resolved path
+        bw += mount_args(flag, rp, rp, fd)
 
     # bwrap applies --chdir after all mounts, wherever it sits in argv.
-    user_bound = {rp for _, rp, _ in user_binds}
     if bind or any(covers(b, project) for b in user_bound):
         bw += ["--chdir", project]
     else:
@@ -2166,7 +2728,7 @@ def build_bwrap(opts, sand: str, sock: str, home: str,
     # process_vm_* are denied outright as defense in depth.
     inner += 'exec "$@"\n'
 
-    return bw, inner
+    return bw, inner, duped
 
 
 def wait_for_socket(sock_path: str, proc: subprocess.Popen, timeout: float = 5.0) -> None:
@@ -2191,18 +2753,34 @@ def wait_for_socket(sock_path: str, proc: subprocess.Popen, timeout: float = 5.0
 
 
 def rm_tree_writable(path: str) -> None:
-    # The sandbox may have created 0555 directories; make them removable.
-    # lstat everywhere: /tmp inside the sandbox is attacker-controlled, and
-    # a symlink like x -> ~/.ssh/config must never be chmod'ed through.
+    # The sandbox may have created 0555 (or 0000/0300) directories; make
+    # them removable. chmod goes through an O_PATH|O_NOFOLLOW fd, never
+    # through the path: /tmp inside the sandbox is attacker-controlled,
+    # and a symlink like x -> ~/.ssh/config swapped in between the stat
+    # and a path-based chmod would chmod the HOST target. O_PATH (not
+    # O_RDONLY: opening a directory O_RDONLY needs read permission, which
+    # the owner lacks on a 0000 dir — the open used to fail EACCES, the
+    # entry was skipped, and rmtree then failed underneath, LEAKING the
+    # whole $WORK). The chmod itself goes through the /proc/self/fd/N
+    # magic link: O_NOFOLLOW pinned the link ITSELF, so a planted symlink
+    # shows up as S_ISLNK and is skipped (rmtree removes it unfollowed) —
+    # the magic link only ever resolves to the pinned object. Sockets,
+    # FIFOs and vanished entries are skipped too (nothing to chmod).
     for dirpath, dirnames, filenames in os.walk(path):
         for name in dirnames + filenames:
             p = os.path.join(dirpath, name)
             try:
-                st = os.lstat(p)
-                if not stat.S_ISLNK(st.st_mode):
-                    os.chmod(p, st.st_mode | 0o700)
+                fd = os.open(p, _O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                st = os.fstat(fd)
+                if stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode):
+                    os.chmod(f"/proc/self/fd/{fd}", st.st_mode | 0o700)
             except OSError:
                 pass
+            finally:
+                os.close(fd)
     shutil.rmtree(path, ignore_errors=True)
 
 
@@ -2217,20 +2795,29 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, early_signal)
 
+    # Fail fast, before anything spawns: an unrawable terminal stdin under
+    # --filter-output is a hard error (see _filter_child_stdin), and the
+    # cheap tcgetattr half of that check depends on nothing below.
+    if getattr(opts, "filter_output", False):
+        _check_filter_stdin_early()
+
     work: str | None = None
     procs: list[subprocess.Popen] = []
     sandbox: subprocess.Popen | None = None
     proxy: subprocess.Popen | None = None
     pinner = BindPinner(enabled=False)  # O_PATH bind pins (opened below)
     seccomp_fd: int | None = None       # read end bwrap loads the filter from
+    pin_dups: list[int] = []            # os.dup()s for pins named twice in argv
     # --filter-output state (set up below, just before bwrap starts).
     master: int | None = None        # pty master: host-side, never sandboxed
     slave: int | None = None         # pty slave: bwrap's only stdio
     raw_stdin: int | None = None     # host tty fd we set raw (to restore)
     saved_termios = None
     tty_fd: int | None = None        # winsize source for SIGWINCH forwards
-    stdin_fd: int | None = None      # host stdin forwarded into the master
-    prev_winch = None                # previous SIGWINCH handler
+    stdin_fd: int | None = None      # host TTY forwarded into the master
+    winch_installed = False          # on_winch is installed (prev may be None)
+    prev_winch = None                # ... and what was there before (None can
+                                     # ALSO mean a C handler — hence the flag)
     winch = {"hit": False}           # mutable: the signal handler flips it
     sanitizer: OutputSanitizer | None = None
     try:
@@ -2244,20 +2831,21 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         cfg_path = os.path.join(work, "proxy.json")
         os.mkdir(sand)
         os.chmod(work, 0o700)
-        # Validate user binds (resolved paths) before starting anything.
-        user_binds = check_bind_paths(opts, os.environ["HOME"])
-        agent = agent_socket_path() if opts.ssh_agent else None
-        ssh_cfg = None
         # bwrap capabilities (probed once in main(); deliberately NOT
         # probed here — a test shim on $PATH must not be asked). Missing
         # means unknown: only the conservative path-based forms are used,
         # and seccomp (which cannot degrade) fails closed in that case.
         caps = getattr(opts, "_bwrap_caps", None) or {}
-        # TOCTOU-free binds: pin every source another sandbox could race
-        # (user binds, the cwd mount, $HOME) as O_PATH fds for bwrap
-        # --[ro-]bind-fd. Old bwrap keeps the path-based flags instead —
-        # loud, not silent (a pinned bind is strictly stronger).
+        # TOCTOU-free binds, fd-FIRST: check_bind_paths pins every source
+        # another sandbox could race (user binds; the cwd mount and $HOME
+        # follow inside build_bwrap) and validates the pinned object;
+        # bwrap >= 0.10 then mounts exactly those fds. Old bwrap keeps the
+        # path-based flags and checks instead — loud, not silent.
         pinner.enabled = bool(caps.get("bind_fd"))
+        # Validate user binds (resolved, pinned) before starting anything.
+        user_binds = check_bind_paths(opts, os.environ["HOME"], pinner)
+        agent = agent_socket_path() if opts.ssh_agent else None
+        ssh_cfg = None
         if user_binds and not pinner.enabled:
             err("note: this bwrap lacks --bind-fd — binds re-resolve their "
                 "source path at mount time (TOCTOU window if another sandbox "
@@ -2265,7 +2853,8 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         hardening: list[str] = []
         if not opts.no_seccomp:
             # Fail-closed: seccomp_fd_args dies when bwrap cannot install
-            # the filter (--no-seccomp is the explicit opt-out).
+            # the filter, and self-probes it first (--no-seccomp is the
+            # explicit opt-out).
             opt, seccomp_fd = seccomp_fd_args(caps, opts.verbose)
             hardening += [opt, str(seccomp_fd)]
         if caps.get("disable_userns"):
@@ -2277,11 +2866,26 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             # --unshare-user is required: --unshare-all only sets
             # --unshare-user-try, and bwrap checks the combination before
             # its non-root "just DWIM" fallback gets a chance to run.
-            hardening += ["--unshare-user",
-                          "--disable-userns", "--assert-userns-disabled"]
-            if opts.verbose:
-                err("userns: nested user namespaces disabled at the kernel level "
-                    "(--disable-userns --assert-userns-disabled)")
+            # Probed once (userns_probe_ok, with the same namespace/pid/
+            # session flags as the real argv): hosts where the combination
+            # cannot work at all (setuid bwrap, unprivileged_userns_
+            # clone=0, max_user_namespaces=0) used to hard-fail here
+            # before this revision — they keep working, on the deny rules
+            # alone. The fallback note is shown at most once a day (on
+            # hosts without user namespaces it would print on EVERY
+            # launch and get lost in the noise).
+            if userns_probe_ok(share_net=bool(getattr(opts, "net", False))):
+                hardening += ["--unshare-user",
+                              "--disable-userns", "--assert-userns-disabled"]
+                if opts.verbose:
+                    err("userns: nested user namespaces disabled at the kernel level "
+                        "(--disable-userns --assert-userns-disabled)")
+            elif not note_recently_shown("userns-fallback.note"):
+                mark_note_shown("userns-fallback.note")
+                err("note: this bwrap/kernel cannot run --disable-userns "
+                    "(probed once; e.g. setuid bwrap or user namespaces "
+                    "disabled system-wide) — relying on the seccomp "
+                    "unshare/setns/clone deny rules only")
 
         if not opts.net:
             # Created 0600 from the start — it may carry upstream credentials.
@@ -2309,8 +2913,9 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             with open(ssh_cfg, "w", encoding="utf-8") as fh:
                 fh.write(SSH_CLIENT_CONFIG)
 
-        bw, inner = build_bwrap(opts, sand, sock, os.environ["HOME"], user_binds, agent, ssh_cfg,
-                                pinner)
+        bw, inner, dups = build_bwrap(opts, sand, sock, os.environ["HOME"], user_binds, agent, ssh_cfg,
+                                      pinner)
+        pin_dups.extend(dups)
         if opts.filter_output:
             # Fail closed: without a pty there is no host-side filtering,
             # so refuse to run rather than pass output through raw.
@@ -2323,17 +2928,17 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             if tty_fd is not None:
                 _copy_winsize(tty_fd, master)  # initial size for the pair
             raw_stdin, saved_termios = _enter_raw_mode()
-            stdin_fd = raw_stdin if raw_stdin is not None else _forwardable_stdin_fd()
-            if raw_stdin is None and stdin_fd is not None:
-                # Piped/closed stdin: no interactive echo through the pty
-                # (the slave echoes by default — script(1) behavior — which
-                # would duplicate piped data in the output).
-                try:
-                    attrs = termios.tcgetattr(slave)
-                    attrs[3] &= ~termios.ECHO
-                    termios.tcsetattr(slave, termios.TCSANOW, attrs)
-                except (OSError, termios.error):
-                    pass
+            # Forward ONLY a real (raw-mode) tty through the pty — the pump
+            # reads exactly that fd. Every other stdin shape is resolved by
+            # _filter_child_stdin: the exact non-tty fd sys.stdin wraps
+            # (byte-exact inherit — routing it through the pty would feed it
+            # to the slave's CANONICAL line discipline: 4095-byte line
+            # truncation, ^D/^U/^W/^V/^R editing, ICRNL, ISIG), /dev/null
+            # when there is none, and a LOUD REFUSAL for a tty raw mode
+            # could not tame (never hand the host terminal fd over
+            # unfiltered — see _filter_child_stdin).
+            stdin_fd = raw_stdin
+            child_stdin = _filter_child_stdin(slave, raw_stdin)
 
         # bwrap installs the seccomp filter (hardening, above) as the very
         # last step before exec'ing /bin/sh, so the shell, the socat bridge
@@ -2342,14 +2947,33 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         # enters bwrap — close_fds stays on for everything else).
         argv = ["bwrap"] + hardening + bw + ["--"]
         argv += ["/bin/sh", "-c", inner, "sbox-sh"] + command
+        # ONLY the fds the argv actually names may reach bwrap: bwrap
+        # closes the fds attached to setup ops (--bind-fd, the seccomp
+        # fd), but an fd attached to NOTHING — e.g. the pin of a REFUSED
+        # cwd — would survive into the payload with CLOEXEC cleared by
+        # pass_fds, and an O_PATH fd to host filesystem ground makes
+        # /proc/self/fd/N/.. walk the HOST mount tree: the runc
+        # CVE-2024-21626 ("Leaky Vessels") class of escape. Derive
+        # pass_fds from the emitted argv, not from the pinner cache, and
+        # close every unused pin right now.
+        used = {int(bw[i + 1]) for i in range(len(bw) - 1)
+                if bw[i] in ("--bind-fd", "--ro-bind-fd")}
+        for src in list(pinner.fds):
+            if pinner.fds[src] not in used:
+                pinner.release(src)
         pass_fds = tuple(([seccomp_fd] if seccomp_fd is not None else [])
-                         + list(pinner.fds.values()))
+                         + sorted(used))
         if opts.filter_output:
-            # The sandbox's ONLY terminal is the pty slave: fds 0/1/2 are
-            # it, and close_fds (the Popen default) hands over nothing
-            # else — the host's real terminal fd never enters bwrap. The
-            # master stays host-side and feeds the sanitizer.
-            sandbox = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
+            # The sandbox's ONLY terminal is the pty slave: fds 1/2 are it
+            # always (close_fds — the Popen default — hands over nothing
+            # else, so the host's real terminal fd never enters bwrap; the
+            # master stays host-side and feeds the sanitizer), and fd 0 is
+            # the slave ONLY for a real host tty. Anything else is the fd
+            # _filter_child_stdin picked — decided on that very fd, never
+            # a blind inherit of fd 0 (stdin=None), which could be a tty
+            # the pump never agreed to hand over.
+            sandbox = subprocess.Popen(argv, stdin=child_stdin,
+                                       stdout=slave, stderr=slave,
                                        pass_fds=pass_fds)
             os.close(slave)  # else the host holds EOF away from us
             slave = None
@@ -2365,6 +2989,12 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             os.close(seccomp_fd)
             seccomp_fd = None
         pinner.close()
+        for fd in pin_dups:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        del pin_dups[:]
         procs.append(sandbox)
 
         seen_signals: set[int] = set()
@@ -2397,7 +3027,13 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         if opts.filter_output:
             def on_winch(_signum, _frame):
                 winch["hit"] = True
+            # signal.signal() returns None when the previous handler was
+            # installed from C — the winch_installed flag keeps that case
+            # (restore to SIG_DFL: a C handler cannot be reinstalled from
+            # Python) distinct from "we never touched SIGWINCH", which
+            # used to leak on_winch for the whole process.
             prev_winch = signal.signal(signal.SIGWINCH, on_winch)
+            winch_installed = True
 
         pending = bytearray()   # stdin bytes the sandbox has not read yet
         master_eof = False
@@ -2424,7 +3060,11 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
                 if tty_fd is not None:
                     _copy_winsize(tty_fd, master)
             fds = [] if master_eof else [master]
-            if stdin_fd is not None and not stdin_eof:
+            # Backpressure, not drops: stop SELECTING on stdin while the
+            # backlog is at the cap — the tty stays readable, we just read
+            # again once the sandbox drained some of it.
+            if stdin_fd is not None and not stdin_eof \
+                    and len(pending) < MAX_PENDING_INPUT:
                 fds.append(stdin_fd)
             if not fds:
                 time.sleep(0.1)
@@ -2442,14 +3082,14 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             if stdin_fd is not None and not stdin_eof and stdin_fd in ready:
                 idata = _read_maybe(stdin_fd, 4096)
                 if idata == b"":
-                    # Host stdin closed. A pty has no EOF to inherit, so
-                    # deliver the line discipline's VEOF (^D) instead —
-                    # twice: once to flush a pending partial line, once
-                    # to signal EOF to the reader.
+                    # Host tty closed. Only a real tty is forwarded (see
+                    # stdin_fd above), and a raw-mode tty read does not
+                    # EOF — this is the dead/detached-terminal corner; just
+                    # stop forwarding. (Piped stdin EOFs directly on the
+                    # inherited fd — no VEOF hack needed anymore.)
                     stdin_eof = True
-                    pending += b"\x04\x04"
-                elif idata and len(pending) < MAX_PENDING_INPUT:
-                    pending += idata  # past the cap: input is dropped
+                elif idata:
+                    pending += idata
             if not master_eof and pending:
                 try:
                     n = os.write(master, bytes(pending))
@@ -2477,8 +3117,11 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         if raw_stdin is not None and saved_termios is not None:
             _restore_termios(raw_stdin, saved_termios)
         _raw_term = False
-        if prev_winch is not None:
-            signal.signal(signal.SIGWINCH, prev_winch or signal.SIG_DFL)
+        if winch_installed:
+            # prev_winch is None for a C-installed handler: unrecoverable
+            # from Python, restore SIG_DFL rather than leaving on_winch.
+            signal.signal(signal.SIGWINCH,
+                          prev_winch if prev_winch is not None else signal.SIG_DFL)
         for fd in (master, slave):
             if fd is not None:
                 try:
@@ -2491,6 +3134,11 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             except OSError:
                 pass
         pinner.close()
+        for fd in pin_dups:  # dups of shared pins (bwrap died before spawn)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         for p in procs:
             if p.poll() is None:
                 p.terminate()
@@ -2511,10 +3159,22 @@ OPTS_WITH_VALUE = {
     "--bind-socket", "--upstream", "--_proxy",
 }
 
+# The short members of OPTS_WITH_VALUE — derived, not hand-maintained, so
+# the trap list stays the single source of truth. Their ATTACHED forms
+# (-b/some/path, -aexample.com) are one argv token, exactly like argparse
+# parses them.
+SHORT_WITH_VALUE = {o for o in OPTS_WITH_VALUE if not o.startswith("--")}
+
 
 def split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
     """Split argv at the first positional: everything after it belongs to the
-    sandboxed command (so `sbox.py -- cmd -v` works), like the shell version."""
+    sandboxed command (so `sbox.py -- cmd -v` works), like the shell version.
+    Clustered short FLAGS (-va) are REJECTED loudly: expanding clusters here
+    would duplicate argparse, and the naive single-token skip made the token
+    after a cluster (usually an option value, e.g. the host of -va HOST)
+    parse as the sandboxed command instead. Attached short values
+    (-b/some/path, -aexample.com) are valid argparse and consume one token,
+    like the = forms."""
     i = 0
     while i < len(argv):
         tok = argv[i]
@@ -2522,7 +3182,19 @@ def split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
             return argv[:i], argv[i + 1:]
         if tok.startswith("-") and tok != "-":
             # "--allow x" consumes two tokens; "--allow=x" (or a flag) one.
-            i += 2 if "=" not in tok and tok in OPTS_WITH_VALUE else 1
+            if "=" not in tok and tok in OPTS_WITH_VALUE:
+                i += 2
+                continue
+            base = tok.split("=", 1)[0]
+            if not tok.startswith("--") and len(base) > 2 \
+                    and base not in OPTS_WITH_VALUE:
+                if tok[:2] in SHORT_WITH_VALUE:
+                    i += 1  # -b/path, -aexample.com: the value is attached
+                    continue
+                die(f"clustered short options are not supported: {tok!r} — "
+                    "pass options separately (e.g. -v -a example.com; "
+                    "attached values like -bPATH are fine)")
+            i += 1
             continue
         return argv[:i], argv[i:]
     return argv, []
@@ -2556,8 +3228,17 @@ Notes:
   - -b/-r of host control sockets (docker.sock, containerd, D-Bus, systemd,
     libvirt, X11, keyring, gpg-agent, ...) is refused, and so is anything
     socket-shaped by rule: any socket file, and anything under /run,
-    /var/run or $XDG_RUNTIME_DIR — each is a trivial full escape.
-    --bind-socket PATH is the explicit opt-in when you really mean it.
+    /var/run or $XDG_RUNTIME_DIR — each is a trivial full escape. Paths
+    inside /proc, /sys and /dev are refused too (host pseudo-fs ground:
+    /proc/<pid>/root, /proc/<pid>/fd, /dev/pts, ... are host escapes; the
+    sandbox gets a fresh, safe /proc and /dev anyway).
+    --bind-socket PATH is the explicit opt-in when you really mean it:
+    read-only for socket files and runtime-dir paths (connect-only — NEVER
+    read-write, -b PATH --bind-socket PATH is refused like plain -b), and
+    READ-WRITE for a plain directory (socket-bearing project dirs —
+    puma.sock, .s.PGSQL.5432, .git/fsmonitor--daemon.ipc; combine with
+    -r PATH for read-only; rw does let the sandbox replace the sockets
+    inside it — the intended trade-off, since such dirs need writes).
   - With --as-pid-1 your command IS pid 1 of the sandbox: long-lived
     commands that spawn and abandon children will see zombies (nothing
     reaps orphans), and signals sent to pid 1 from inside (kill -TERM 1)
@@ -2584,17 +3265,30 @@ Notes:
     build-output dir); -r "$PWD" does the same ad hoc. EXCEPTIONS: a cwd
     inside $HOME is NOT mounted at all unless --home is given (the sandbox
     $HOME is a tmpfs — sbox falls back to /tmp with a note; use --home or
-    an explicit -b "$PWD"/-r "$PWD" to have it), and cwds covering
-    protected paths (/etc, /usr, /run, ...) are never auto-mounted either.
+    an explicit -b "$PWD"/-r "$PWD" to have it), and cwds are never
+    auto-mounted when they cover protected paths (/etc, /usr, /run, ...),
+    lie inside /proc, /sys or /dev, or hit the same control-socket rules
+    as -b (cd /tmp/.X11-unix, an LXD
+    or tmux socket dir, or a directory containing a Unix socket): a
+    WARNING fires and the command runs with the sandbox's /tmp as its
+    working directory — not silently somewhere you did not intend.
+    --bind-socket "$PWD" opts a socket-bearing cwd back in READ-WRITE
+    when it is a plain directory (connect-only ground opts back in
+    read-only; -r "$PWD" --bind-socket "$PWD" forces read-only).
   - Explicit -b/-r binds overlay the automatic cwd mount when they cover
     it: -r "$PWD" from inside the directory gives a read-only cwd, and
     likewise -b over --ro-cwd gives read-write (the explicit flag wins).
-    Read-write binds covering $HOME persistence paths (shell rc files,
-    ~/.ssh/authorized_keys, systemd user units, XDG autostart,
-    ~/.local/bin) are warned about: each means host code execution at the
-    next login/session. Validated bind sources are handed to bwrap
-    (>= 0.10) as pinned fds, so a concurrent sandbox cannot swap a path
-    component between check and mount.
+    Read-write binds covering $HOME persistence paths (shell rc/session
+    files, ~/.ssh/authorized_keys, systemd user units, XDG autostart,
+    environment.d, ~/.local/bin, ~/.cargo/bin, ~/go/bin, ...) are warned
+    about — in BOTH directions, so -b ~/.local/bin/mytool warns just like
+    -b ~/.local/bin: each means host code execution at the next
+    login/session (a --bind-socket directory that mounts read-write warns
+    the same way). Validated bind sources are handed to bwrap
+    (>= 0.10) as pinned fds — validation pins first and checks the pinned
+    object, so a concurrent sandbox cannot swap a path component between
+    check and mount; only the fds the argv names reach the sandbox, and
+    a missing -b/-r source is a hard error (no path-form fallback).
   - The sandbox runs in a new session (TIOCSTI protection): Ctrl-C reaches
     sbox.py, which then tears the whole sandbox down — a hard kill: bwrap
     does not relay signals, so the command itself never sees a catchable
@@ -2603,19 +3297,30 @@ Notes:
     keyring, namespace (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
     admin (mount/pivot_root/chroot/kexec/module loading/open_by_handle_at/
     name_to_handle_at/quotactl/syslog and the new mount API fsopen/fsmount/
-    move_mount/...), process-inspection/injection (ptrace, process_vm_*/
+    fspick/move_mount/...), process-inspection/injection (ptrace, process_vm_*/
     kcmp/pidfd_getfd/personality, vmsplice), fanotify_init and
     ioctl(TIOCSTI/TIOCLINUX) are refused inside the sandbox; socket() is
     limited to AF_UNIX/AF_INET/AF_INET6/AF_NETLINK (AF_VSOCK bypasses
     netns isolation in VM guests on older kernels) — ENOSYS where runtimes
     have fallbacks, EPERM otherwise; foreign-ABI binaries (e.g. 32-bit
-    compat, x32) are killed. bwrap itself installs the filter right before
+    compat, x32) are killed. Every launch self-probes the compiled filter
+    host-side first (install it in a forked child; the libc unshare(),
+    ioctl(TIOCSTI), socket(AF_VSOCK), personality and ptrace wrappers
+    must all come back EPERM — the hand-typed numbers are verified on
+    THIS machine; the probe samples five entries, the full table is
+    pinned by tests/test_seccomp.py — run it after editing the tables).
+    bwrap itself installs the filter right before
     exec'ing the payload (no python3 needed inside the sandbox), so
     everything inside is covered from the first process (the socat bridge
     included; the payload runs as pid 1, so no unfiltered bwrap reaper
     init remains). bwrap >= 0.8 additionally gets --disable-userns:
     nested user namespaces die at the kernel level, not just by syscall
-    number. FAILS CLOSED: without seccomp support (bwrap < 0.4.1) or on an
+    number (probed once per launch with the same namespace/pid flags as
+    the real argv; hosts where that combination cannot run — e.g. setuid
+    bwrap without unprivileged user namespaces — keep working on the
+    deny rules alone, with a note shown at most once a day). FAILS
+    CLOSED: without
+    seccomp support (bwrap < 0.4.1) or on an
     unsupported architecture the launcher refuses to run — --no-seccomp is
     the explicit opt-out (needed for perf, io_uring runtimes, unshare-
     based builders, keyring-using kerberos, debuggers (gdb/strace), setarch
@@ -2629,7 +3334,14 @@ Notes:
     and bidi/zero-width characters are dropped. WITHOUT it, raw sandbox
     bytes reach your terminal unchanged — use it for untrusted work. The
     host tty goes raw (stdin and SIGWINCH forwarded, termios restored on
-    exit). --strict-crlf (implies --filter-output) additionally drops \r
+    exit); NON-tty stdin (a pipe, file, /dev/null) is inherited by the
+    sandbox directly, so binary data and long lines round-trip byte-exact
+    (tar c . | sbox.py --filter-output -- tar x). A stdin that IS a
+    terminal but raw mode failed for is refused outright — the host tty
+    fd is never handed to the sandbox unfiltered. Note the pty merges
+    stdout and stderr (2>/dev/null inside the sandbox stops working) and
+    ONLCR translates \n to \r\n (also in redirected output).
+    --strict-crlf (implies --filter-output) additionally drops \r
     not followed by \n: a bare \r lets payload output visually overwrite
     the current line after you read it (progress bars break). Known
     limits: Ctrl-C reaches the sandbox as a byte — a command that never
@@ -2657,8 +3369,13 @@ Examples:
     parser.add_argument("--bind-socket", action="append", default=[], metavar="PATH",
                         help="Bind PATH even though it is a socket or lives under /run, /var/run or "
                              "$XDG_RUNTIME_DIR (refused by default: control sockets there are full "
-                             "host escapes). Explicit per-path opt-in; repeatable. Known control "
-                             "sockets and protected paths are still refused.")
+                             "host escapes). Read-only for socket files and runtime-dir paths (connect-only "
+                             "ground — never read-write, so -b PATH --bind-socket PATH is refused too); "
+                             "a plain DIRECTORY opts in READ-WRITE — for socket-bearing project "
+                             "dirs (puma.sock, .s.PGSQL.5432, .git/fsmonitor--daemon.ipc) whose cwd the "
+                             "scan refuses; combine with -r PATH for read-only. Known control sockets, "
+                             "protected paths and anything inside /proc, /sys or /dev are still refused. "
+                             "Repeatable.")
     parser.add_argument("--ro-cwd", action="store_true", help="Mount the current directory read-only (default: rw).")
     parser.add_argument("--home", action="store_true", help="Bind the real $HOME (default: private tmpfs home).")
     parser.add_argument("--gui", action="store_true",
@@ -2701,7 +3418,8 @@ Examples:
                              "mount/kexec/module-loading, ptrace/process_vm_* and friends are blocked with "
                              "ENOSYS/EPERM inside the sandbox). Note the launcher FAILS CLOSED without it: "
                              "when the filter cannot be installed (bwrap < 0.4.1, unsupported architecture) "
-                             "it refuses to run instead of running unfiltered.")
+                             "or fails its startup self-probe (unshare(0) not denied) it refuses to run "
+                             "instead of running unfiltered.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log allow/deny decisions to stderr.")
     parser.add_argument("--shell", action="store_true", help="Run an interactive shell ($SHELL if available).")
     parser.add_argument("--_proxy", nargs=3, metavar=("SOCK", "CFG", "PPID"), help=argparse.SUPPRESS)
