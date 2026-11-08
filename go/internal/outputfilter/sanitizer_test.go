@@ -1,14 +1,9 @@
 package outputfilter
 
-// The sanitizer behavior table — the ported essence of the
-// test_sandbox.py sanitizer suite (the module docstring, the
-// OutputSanitizer docstring and the epilog are the spec): allowlist
-// semantics in both strict_cr modes, the SGR grammar, conceal
-// detection, C0 interleaving, the string/escape states, the pending
-// cap, stateful UTF-8 replacement, and the chunk-boundary equivalence
-// property (filter identically no matter how the stream is split).
-// Every expectation that looked surprising was verified byte-exact
-// against the repo's sbox.py before being pinned here.
+// Behavior tables pin allowlist semantics in both strict CR modes,
+// SGR grammar and conceal detection, control interleaving, escape
+// states, sequence limits and stateful UTF-8 replacement. Chunk-boundary
+// properties require identical output however the stream is split.
 
 import (
 	"math/rand"
@@ -177,14 +172,14 @@ func TestSanitizerStringsAndEscapes(t *testing.T) {
 		{"\x1b[3\x001m", "\x1b[31m"}, // NUL executed (dropped), sequence survives
 		// a stray ESC before \n must not eat the newline — but the
 		// character AFTER the newline is a legitimate 2-byte-escape
-		// final byte and goes with it (python-verified)
+		// final byte and goes with it
 		{"\x1b\nx", "\n"},
 		{"\x1b[\n", "\n"},
 		// C0 inside an ESC-intermediate waits too
 		{"\x1b(\nBok", "\nok"},
 		// C1 swallowed inside a sequence body (never an initiator): the
 		// sequence keeps waiting and the following bytes complete it
-		// (python-verified)
+		//
 		{"\x1b[31m", "\x1b[31m"},
 		// non-ASCII swallowed in the ESC state, then a fresh CSI builds
 		{"\x1bä[31m", "\x1b[31m"},
@@ -207,7 +202,7 @@ func TestSanitizerPendingCapASCII(t *testing.T) {
 	// wholesale — the drop lands mid-pair ('1' of pair 2048 pushes the
 	// byte counter to 4097) — and everything after the drop point is
 	// plain text: ';' plus the remaining pairs, then "after"
-	// (python-verified: len 110).
+	// (110 bytes remain).
 	in := "\x1b[" + strings.Repeat("1;", 2100) + "after"
 	want := ";" + strings.Repeat("1;", 52) + "after"
 	if got := feedAll(t, false, []byte(in)); got != want {
@@ -221,7 +216,7 @@ func TestSanitizerPendingCapCountsBytes(t *testing.T) {
 	// a STRING body (OSC content accepts any character; CSI bodies
 	// only take 0x20..0x3F ASCII). 2048 é (2 bytes each) + "ESC ]"
 	// crosses 4096 at é #2048; the remaining 952 é are plain text
-	// (python-verified: 957 chars).
+	// (957 characters remain).
 	in := "\x1b]" + strings.Repeat("é", 3000) + "\x07" + "after"
 	want := strings.Repeat("é", 952) + "after" // BEL dropped as C0
 	if got := feedAll(t, false, []byte(in)); got != want {
@@ -234,7 +229,7 @@ func TestSanitizerNonASCIIInCSIBodyNeverCaps(t *testing.T) {
 	// bytes grow the sequence), so a thousand of them never reach the
 	// cap; the 3000 semicolons do grow it, 'm' completes a >64-char
 	// parameter string and the grammar drops it. Output: just the tail
-	// (python-verified: " ok").
+	// (only " ok" remains).
 	in := "\x1b[" + strings.Repeat("é;", 3000) + "m ok"
 	if got := feedAll(t, false, []byte(in)); got != " ok" {
 		t.Errorf("csi body: got %q, want %q", firstN(got, 30), " ok")
@@ -287,14 +282,11 @@ func TestSanitizerStrictCr(t *testing.T) {
 	}
 }
 
-// The UTF-8 replacement table — byte-exact against CPython's
-// incremental decoder with errors='replace' (pinned live by the
-// differential test): one U+FFFD per invalid start byte, one per
+// The UTF-8 replacement table: one U+FFFD per invalid start byte, one per
 // maximal subpart elsewhere, surrogates/overlongs/out-of-range one per
 // byte, truncation one per maximal subpart at flush. NOTE these wants
 // are SANITIZER-level: a decoded-but-nonprintable rune (U+FFFE, the
-// U+10FFFF roof — both Cn) is then dropped by the character allowlist,
-// exactly like Python.
+// U+10FFFF roof — both Cn) is then dropped by the character allowlist.
 func TestSanitizerUTF8Replacement(t *testing.T) {
 	cases := []struct {
 		in   []byte
@@ -408,7 +400,7 @@ func TestSanitizerChunkEquivalence(t *testing.T) {
 // A heavier randomized equivalence pass: arbitrary bytes through the
 // full state machine (both modes), whole vs random splits. The
 // expected value is the implementation against itself across chunking
-// — the Python-exact values are pinned by the differential test.
+// — fixed expected outputs are pinned by the golden corpus.
 func TestSanitizerRandomChunkEquivalence(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	interesting := []byte("\x1b[]P_^X\\07\x18\x1a\n\r\tm;?0123456789abÄé😀\xff\x80\xc0\xf0\x9f\xed")
@@ -469,6 +461,19 @@ func TestSGRConceals(t *testing.T) {
 		{"48", false},
 		{"1;38;5;8;0", false},     // conceal-free with 38;5;8 inside
 		{"1;38;2;8;8;8;0", false}, // 38;2;8;8;8: the 8s are RGB args
+		{"38;5;8;1;8", true},
+		{"48;2;0;0;0;48;5;8", false},
+		{";;;", false},
+		{"0;0;0;8", true},
+		{"8;8;8", true},
+		{"38;2", false},
+		{"38;2;1", false},
+		{"38;2;1;2", false},
+		{"38;5", false},
+		{"38;5;", false},
+		{"48;5;8", false},
+		{"00038;5;8", true},
+		{"38;5;0008", false},
 	}
 	for _, c := range cases {
 		if got := sgrConceals(c.params); got != c.want {
@@ -514,9 +519,8 @@ func TestSanitizerFlushIsTerminal(t *testing.T) {
 	}
 }
 
-func TestDecoderByteForByteCPython(t *testing.T) {
-	// The exact inputs probed against the live CPython 3.15 decoder
-	// while writing the port — the algorithm's contract in one table.
+func TestDecoderReplacementCases(t *testing.T) {
+	// The malformed-input replacement contract in one table.
 	cases := []struct {
 		in   []byte
 		want string
@@ -550,7 +554,7 @@ func TestDecoderByteForByteCPython(t *testing.T) {
 		if got != c.want {
 			t.Errorf("decode(% X) = % X, want % X", c.in, got, c.want)
 		}
-		// 1-byte-at-a-time must agree (python's incremental contract)
+		// 1-byte-at-a-time must agree (the incremental contract)
 		var d2 incDecoder
 		var acc string
 		for i := range c.in {
@@ -576,7 +580,7 @@ func TestDecoderByteForByteCPython(t *testing.T) {
 
 func TestCharAllowedBoundaries(t *testing.T) {
 	// Each range edge of the drop list and the isprintable floor,
-	// both sides (all python-verified).
+	// both sides.
 	keep := []rune{
 		0x20,   // space: the one allowed separator
 		0x7E,   // '~' — top of printable ASCII, DEL starts at 0x7F

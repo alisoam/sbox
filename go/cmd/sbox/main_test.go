@@ -190,7 +190,7 @@ exit 0`)
 
 	// The caps warning fires only when the PROBE FAILED. A bwrap whose
 	// --help succeeds but lists none of our options stays quiet here
-	// (python's parse_bwrap_caps returns a truthy dict); the seccomp
+	// (the probe itself succeeded); the seccomp
 	// gate then dies with its dedicated message.
 	t.Run("failed probe warns, optionless bwrap does not", func(t *testing.T) {
 		dir := t.TempDir()

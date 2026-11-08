@@ -25,8 +25,7 @@ func mustSocketAt(t *testing.T, path string) {
 	t.Cleanup(func() { l.Close() })
 }
 
-// mustCwd is the working directory (-b ” resolves to it, like Python's
-// realpath("") on CPython >= 3.13).
+// mustCwd returns the current directory, also the target of -b "".
 func mustCwd(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()
@@ -56,7 +55,7 @@ func TestOpenPathPinned(t *testing.T) {
 		f.Close()
 	}
 
-	// dot-dot components pop the stack like Python's walk
+	// dot-dot components pop the stack
 	f, err := OpenPathPinned(filepath.Join(dir, "a", "..", "a", "b"))
 	if err != nil {
 		t.Fatal(err)

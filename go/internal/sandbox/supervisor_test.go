@@ -14,13 +14,92 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"sbox/internal/cliutil"
+	"sbox/internal/outputfilter"
 	"sbox/internal/seccomp"
 )
+
+func TestFilteredProxyLogConcurrentClose(t *testing.T) {
+	var output strings.Builder
+	log := &filteredProxyLog{
+		sanitizer: outputfilter.NewSanitizer(false),
+		emit:      func(s string) { output.WriteString(s) },
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 100; j++ {
+				log.write("allowed\x1b]52;c:clipboard\x07")
+			}
+		}()
+	}
+	log.write("first\x1b]52;c:clipboard\x07")
+	close(start)
+	log.close()
+	wg.Wait()
+	before := output.String()
+	log.write("late")
+	log.close()
+	if got := output.String(); got != before {
+		t.Fatal("closed proxy log emitted more output")
+	}
+	if !strings.HasPrefix(before, "sbox-proxy: first\n") || strings.ContainsAny(before, "\x1b\x07") {
+		t.Fatalf("unsafe or missing proxy log: %q", before)
+	}
+}
+
+func TestFilteredProxyLogCloseWithBlockedSink(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var output strings.Builder
+	log := &filteredProxyLog{
+		sanitizer: outputfilter.NewSanitizer(false),
+		emit: func(s string) {
+			close(entered)
+			<-release
+			output.WriteString(s)
+		},
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		log.write("first")
+	}()
+	<-entered // The sink is blocked, with a write definitely in progress.
+	closed := make(chan struct{})
+	go func() {
+		log.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		close(release)
+		<-writerDone
+		<-closed
+		t.Fatal("closing the proxy log waited for its blocked sink")
+	}
+	lateDone := make(chan struct{})
+	go func() {
+		defer close(lateDone)
+		log.write("late")
+	}()
+	close(release)
+	<-writerDone
+	<-lateDone
+	if got := output.String(); got != "sbox-proxy: first\n" {
+		t.Fatalf("closed proxy log emitted a late record: %q", got)
+	}
+}
 
 // fakeProvider stands in for the bwrap backend: preset caps, a possibly
 // recording userns probe, and Build returning a Launch for a shim
@@ -389,7 +468,7 @@ func TestSupervisorEarlySignalKillsNothingAndCleansUp(t *testing.T) {
 
 	select {
 	case rc := <-done:
-		if rc != 143 { // 128 + SIGTERM(15), python's SystemExit(128+signum)
+		if rc != 143 { // 128 + SIGTERM(15)
 			t.Fatalf("rc = %d, want 143", rc)
 		}
 	case <-time.After(10 * time.Second):

@@ -13,7 +13,7 @@ func itoa(fd uintptr) string { return strconv.Itoa(int(fd)) }
 func TestScanFindsSocketsByDepth(t *testing.T) {
 	dir := t.TempDir()
 	// depth 1: puma.sock; depth 2: .git/fsmonitor--daemon.ipc. The prune
-	// semantics mirror os.walk with max_depth 3: directories three levels
+	// with a depth cap of 3, directories three levels
 	// below the root are still LISTED (their files checked), only their
 	// subdirectories are not — so a depth-4 file is found, a depth-5
 	// file is not.
@@ -57,7 +57,7 @@ func TestScanSymlinkSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	// a symlink TO a socket counts (stat follows — the name connects);
-	// a symlinked DIRECTORY is not descended into (os.walk default)
+	// a symlinked DIRECTORY is not descended into
 	if err := os.Symlink(filepath.Join(realDir, "s.sock"), filepath.Join(scanDir, "socklink")); err != nil {
 		t.Fatal(err)
 	}

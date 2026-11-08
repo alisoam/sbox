@@ -1,16 +1,6 @@
-// Command sbox is the launcher: the CLI front end (cliutil), the
-// dependency/capability probes, the --shell resolution, the allowlist
-// and upstream parsing, and the driver for sandbox.Supervisor — plus,
-// via the hidden --_selfprobe re-exec, the seccomp probe child
-// (internal/seccomp.ProbeChild, the Go analog of sbox.py's fork-based
-// seccomp_selfprobe). A faithful port of sbox.py's main(); the
-// supervisor (internal/sandbox) owns everything from $WORK creation to
-// teardown.
-//
-// The ONLY other argv this binary honors specially is --_selfprobe as
-// argv[0]: like python's --_proxy re-exec, a --_selfprobe seen anywhere
-// else is just a hidden, inert option (the tokenizer stays correct for
-// any placement).
+// Command sbox validates CLI options and dependencies, probes the sandbox
+// backend, and starts the supervisor. The hidden --_selfprobe entry re-executes
+// the binary to verify seccomp in an isolated child before launching a payload.
 package main
 
 import (
@@ -52,9 +42,7 @@ func run(argv []string) int {
 		return 0
 	}
 
-	// Armed before anything slow (python relies on KeyboardInterrupt →
-	// 130 for the pre-sandbox window; here the supervisor's early path
-	// owns the same window — cleanup included — from Run() on).
+	// Queue startup signals before slow probes; the supervisor owns cleanup.
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
@@ -66,11 +54,8 @@ func run(argv []string) int {
 	// `bwrap --help`); the provider carries the cached result.
 	backend := bwrap.New("")
 	_, probeErr := backend.Probe()
-	// Python warns only when the PROBE FAILED (`not opts._bwrap_caps`
-	// is true only for the {} the failure path returns — a bwrap whose
-	// --help simply lacks every option still yields a truthy dict and
-	// stays quiet here; the seccomp gate below then speaks with the
-	// dedicated fail-closed message).
+	// Warn when capability probing fails. A successful probe lacking seccomp
+	// gets the dedicated fail-closed error when the supervisor checks it.
 	if probeErr != nil && !opts.NoSeccomp {
 		errf("warning: cannot determine this bwrap's capabilities (bwrap --help failed)")
 	}
@@ -140,7 +125,7 @@ func run(argv []string) int {
 
 // pickShell resolves --shell: $SHELL when it will exist inside the
 // sandbox (a /usr//bin/ path, or anywhere under a --home-bound $HOME),
-// else a loud fallback (python's note names the fallback shell).
+// else a loud fallback naming the replacement shell.
 func pickShell(homeBound bool, home string, errf func(string)) string {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -160,7 +145,7 @@ func pickShell(homeBound bool, home string, errf func(string)) string {
 }
 
 func isRegularFile(p string) bool {
-	st, err := os.Stat(p) // like python's os.path.isfile: symlinks resolve
+	st, err := os.Stat(p) // symlinks resolve
 	return err == nil && st.Mode().IsRegular()
 }
 
@@ -185,29 +170,25 @@ func firstNonEmpty(vs ...string) string {
 	return ""
 }
 
-// errf is python's err(): host-side diagnostic on stderr, best-effort
-// (a closed stderr must not crash the launcher). Routed through
-// outputfilter.EmitDiag so --filter-output's raw-mode phase CRs every
-// newline (OPOST is off — sbox.py's _emit_diag/_raw_term).
+// errf emits a best-effort diagnostic, adding CR before newlines on a raw tty.
 func errf(msg string) {
 	outputfilter.EmitDiag(fmt.Sprintf("%s: %s\n", cliutil.Prog, msg))
 }
 
-// die is python's die(): the message, then exit status 1.
+// die reports a launch failure and returns exit status 1.
 func die(msg string) int {
 	errf(msg)
 	return 1
 }
 
-// parserError mirrors argparse's parser.error(): the usage block and
+// parserError prints the usage block and
 // "prog: error: msg" on stderr, exit status 2.
 func parserError(msg string) int {
 	fmt.Fprintf(os.Stderr, "%s\n%s: error: %s\n", usageBlock(), cliutil.Prog, msg)
 	return 2
 }
 
-// usageBlock is the usage portion of the help text (argparse's
-// print_usage prints just this part).
+// usageBlock extracts the usage portion of the help text.
 func usageBlock() string {
 	if i := strings.Index(cliutil.Usage, "\n\n"); i >= 0 {
 		return cliutil.Usage[:i]

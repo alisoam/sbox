@@ -18,16 +18,14 @@ const (
 	syscallENOSYS uint32 = uint32(syscall.ENOSYS)
 )
 
-// prctl constants (linux/prctl.h), like sbox.py's module-level defines.
+// prctl constants from linux/prctl.h.
 const (
 	prSetNoNewPrivs   = 38
 	prSetSeccomp      = 22
 	seccompModeFilter = 2
 )
 
-// probeExit is the exit-code vocabulary of seccomp_selfprobe's child
-// (Python reports through the exit status only; the launcher maps the
-// codes to the die() messages).
+// Probe exit codes map child failures to diagnostics in the launcher.
 const (
 	probeOK           = 0
 	probeUnshare      = 3  // unshare(0) not denied (the number that once shipped wrong)
@@ -57,14 +55,13 @@ type sockFprog struct {
 // SelfProbe verifies on THIS machine, before anything starts, that the
 // compiled filter denies what it claims — a wrong table entry fails
 // silently otherwise (the filter loads and denies the WRONG syscall;
-// unshare once shipped with ioctl's number). The Python forks; Go cannot
-// safely return from a raw fork and PR_SET_SECCOMP is per-thread, so the
+// unshare once shipped with ioctl's number). Go cannot safely return
+// from a raw fork and PR_SET_SECCOMP is per-thread, so the
 // binary re-executes itself as the probe child (sbox --_selfprobe): exe
 // is the launcher (os.Executable()), argv the hidden flag spelling. The
 // probe child receives the filter bytes on stdin and uses Go's
 // syscall.SYS_* numbers — kernel-header-derived ground truth the
-// hand-typed table cannot fool, the exact analog of the libc-wrapper
-// guarantee. Returns nil when every probe came back as expected, else
+// hand-typed table cannot fool. Returns nil when every probe came back as expected, else
 // the die()-equivalent error. Cost: one exec, about a millisecond.
 func SelfProbe(exe string, argv []string, bpf []byte) error {
 	cmd := exec.Command(exe, argv...)

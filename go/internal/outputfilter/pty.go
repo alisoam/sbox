@@ -1,8 +1,7 @@
 // The pty pair and the host-terminal shims: openpty, isatty, raw mode,
 // winsize forwarding, the --filter-output child-stdin decision and its
 // fail-closed refusals, and the diagnostic emitters (CR-safe while the
-// host tty is raw). Direct ports of sbox.py's pty/termios helpers;
-// syscall-only (no golang.org/x/sys).
+// host tty is raw). These helpers use the standard syscall package.
 
 package outputfilter
 
@@ -109,13 +108,9 @@ func HostTTY() *os.File {
 	return nil
 }
 
-// makeRaw is CPython's tty.cfmakeraw — what this interpreter's
-// tty.setraw applies (a pure-Python POSIX.1-2017 implementation in
-// tty.py, NOT glibc's cfmakeraw, which leaves IGNPAR/INPCK/IXANY/IXOFF
-// and ECHOE/ECHOK/NOFLSH/TOSTOP set; CPython ≥3.13 switched setraw to
-// this one — pinned by the differential test): all input mode flags
-// off, no output post-processing, 8-bit raw bytes with parity off,
-// every local mode flag off, MIN=1/TIME=0 byte-wise reads.
+// makeRaw applies POSIX.1-2017 raw mode, including the input-flow and
+// local flags glibc cfmakeraw leaves unchanged. No output processing,
+// 8-bit bytes with parity off, and MIN=1/TIME=0 byte-wise reads.
 func makeRaw(t *syscall.Termios) {
 	t.Iflag &^= syscall.IGNBRK | syscall.BRKINT | syscall.IGNPAR |
 		syscall.PARMRK | syscall.INPCK | syscall.ISTRIP | syscall.INLCR |
@@ -149,7 +144,7 @@ func EnterRawMode() (*os.File, *syscall.Termios) {
 	}
 	raw := saved
 	makeRaw(&raw)
-	// TCSAFLUSH, tty.setraw's mode: pending input is dropped at the
+	// TCSAFLUSH: pending input is dropped at the
 	// switch (a half-typed line must not leak into the sandbox).
 	if err := tcsetattr(fd, tcsetsf, &raw); err != nil {
 		return nil, nil
@@ -159,7 +154,7 @@ func EnterRawMode() (*os.File, *syscall.Termios) {
 }
 
 // RestoreTermios restores a saved termios (_restore_termios), with
-// TCSADRAIN like sbox.py. Best-effort: a dead tty cannot be restored.
+// TCSADRAIN. Best-effort: a dead tty cannot be restored.
 func RestoreTermios(f *os.File, saved *syscall.Termios) {
 	if f == nil || saved == nil {
 		return
@@ -196,13 +191,8 @@ func CheckStdinEarly() error {
 // mode: inheriting it would give the sandbox the host terminal fd
 // itself, and a shell-launched process's tty fd 0 is O_RDWR —
 // write(0, "\x1b]52;...") reaches the terminal emulator UNFILTERED, and
-// keystrokes become readable. (sbox.py also has a /dev/null arm for a
-// sys.stdin without a usable fd; os.Stdin always carries fd 0, so the
-// Go port has no equivalent corner — the exact fd is always inherited.)
-//
-// The decision is made on the very fd that is returned (python:
-// sys.stdin and fd 0 can disagree; a blind inherit would follow fd 0,
-// not the object the pump reasoned about).
+// keystrokes become readable. The decision is made on the very fd
+// returned, never a different descriptor inherited blindly.
 func FilterChildStdin(slave, rawStdin *os.File) (*os.File, error) {
 	if rawStdin != nil {
 		return slave, nil
@@ -214,10 +204,8 @@ func FilterChildStdin(slave, rawStdin *os.File) (*os.File, error) {
 	return os.Stdin, nil
 }
 
-// rawTerm is sbox.py's _raw_term: true while --filter-output holds the
-// host tty in raw mode — launcher diagnostics must CR their own
-// newlines then (OPOST is off). Package-global, like the module-level
-// flag in Python.
+// rawTerm is true while --filter-output holds the host tty in raw mode:
+// launcher diagnostics must CR their own newlines then (OPOST is off).
 var rawTerm atomic.Bool
 
 // SetRawTerm flips the raw-diagnostic flag (EnterRawMode sets it; the
@@ -230,10 +218,7 @@ func RawTerm() bool { return rawTerm.Load() }
 // EmitDiag writes host-side diagnostic text on stderr (_emit_diag),
 // CR-safe for a raw tty (the --filter-output pump and the sanitized
 // proxy log both go through here). Best-effort: a closed stderr must
-// not crash the launcher. (Python additionally catches
-// UnicodeEncodeError for non-UTF-8 host locales and re-encodes with
-// replace; Go strings are UTF-8 bytes already, so the write can only
-// fail on a closed stderr.)
+// not crash the launcher. Diagnostics are emitted as UTF-8.
 func EmitDiag(text string) {
 	if text == "" {
 		return
@@ -241,7 +226,7 @@ func EmitDiag(text string) {
 	if rawTerm.Load() {
 		text = strings.ReplaceAll(text, "\n", "\r\n")
 	}
-	fmt.Fprint(os.Stderr, text)
+	writeBestEffort(os.Stderr, text)
 }
 
 // EmitFiltered writes filtered sandbox output to the host terminal
@@ -251,5 +236,41 @@ func EmitFiltered(text string) {
 	if text == "" {
 		return
 	}
-	_, _ = os.Stdout.WriteString(text)
+	writeBestEffort(os.Stdout, text)
+}
+
+// Write through the descriptor's poller without os.File.Write's special
+// SIGPIPE re-raise for fd 1/2. A closed consumer must leave the launcher
+// alive to supervise its child and restore the terminal. This changes no
+// signal dispositions, including those inherited by sandboxed commands.
+func writeBestEffort(file *os.File, text string) {
+	if file == nil {
+		return
+	}
+	raw, err := file.SyscallConn()
+	if err != nil {
+		return
+	}
+	data := []byte(text)
+	_ = raw.Write(func(fd uintptr) bool {
+		for len(data) > 0 {
+			n, err := syscall.Write(int(fd), data)
+			if n > 0 {
+				data = data[n:]
+			}
+			switch err {
+			case syscall.EINTR:
+				continue
+			case syscall.EAGAIN:
+				return false // wait for the descriptor to become writable
+			case nil:
+				if n == 0 {
+					return true
+				}
+			default:
+				return true // EPIPE, a closed fd, or another permanent error
+			}
+		}
+		return true
+	})
 }

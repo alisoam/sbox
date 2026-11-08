@@ -10,8 +10,8 @@ import (
 	"sbox/internal/cliutil"
 )
 
-// Bind is one validated (bwrap-flag, realpath, pinned-fd) triple that
-// build_bwrap mounts — exactly what check_bind_paths returns. Flag is
+// Bind is one validated (bwrap-flag, realpath, pinned-fd) triple returned
+// by CheckBindPaths for mounting. Flag is
 // spelled as the bwrap mount option ("--bind" / "--ro-bind": the
 // --bind-socket MOUNT MODE is decided here — read-only for connect-only
 // ground, read-write for plain directories). FD is the pinned O_PATH fd
@@ -26,14 +26,14 @@ type Bind struct {
 // ValidateBindSource validates one bind source for -b/-r/--bind-socket
 // AND the automatic cwd mount (label "cwd"): pin FIRST (after the
 // string-only rules), then validate the pinned object — the fd you
-// validated is the fd you mount (sbox.py's validate_bind_source).
+// validated is the fd you mount.
 //
 // Returns the refusal reason when the bind must not happen
 // (CheckBindPaths dies on it; the cwd path downgrades it to the
 // "not mounting it" warning and releases the pin), the persistence
 // warning (or ""), the resolved path, the pinned fd (nil in path mode),
 // and a fatal error for pin failures (a missing -b/-r source, an
-// actively raced path — Python die()s there).
+// actively raced path).
 //
 // opts is the parsed CLI (Home, RoCwd, Verbose, BindSocket are read);
 // home is the $HOME the launcher resolved; warn receives the scan's

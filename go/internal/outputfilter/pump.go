@@ -1,5 +1,4 @@
-// The --filter-output pump: goroutines + channels where sbox.py drives
-// a select() loop. Master→sanitizer→stdout, the (raw) host tty→master
+// The --filter-output pump: master→sanitizer→stdout, the raw host tty→master
 // with backpressure instead of drops, SIGWINCH→TIOCSWINSZ, and the
 // bounded post-exit drain. Teardown order is load-bearing: termios
 // restore FIRST (the rest can block for seconds and a raw terminal is
@@ -22,7 +21,7 @@ import (
 // reading: the pty buffer is small, the pump never blocks the OUTPUT
 // direction, so the host-side buffer must stay bounded. At the cap the
 // pump backpressures (stops reading the tty until the sandbox drains
-// some) instead of dropping bytes. (sbox.py's MAX_PENDING_INPUT.)
+// some) instead of dropping bytes.
 const maxPendingInput = 262144
 
 // Pump drives one --filter-output run. Construct via Setup (which owns
@@ -53,9 +52,7 @@ type Pump struct {
 	TtySource *os.File
 	// Winch optionally supplies the resize signal channel; nil ⇒ the
 	// pump arms its own signal.Notify(SIGWINCH) at Start and Stops it
-	// at Close. (Go's signal.Stop fully restores the disposition — the
-	// C-installed-handler ambiguity that forced sbox.py's
-	// winch_installed flag cannot arise here.)
+	// at Close, restoring the previous disposition.
 	Winch <-chan os.Signal
 	// Out receives the filtered output; nil ⇒ EmitFiltered (stdout).
 
@@ -120,7 +117,7 @@ func Setup(strictCr bool) (p *Pump, childStdin *os.File, err error) {
 }
 
 // Start spawns the pump goroutines. Call once, right after the spawn
-// (sbox.py arms SIGWINCH only once the sandbox exists).
+// (SIGWINCH is armed only once the sandbox exists).
 func (p *Pump) Start() {
 	if p.started {
 		return
@@ -193,15 +190,14 @@ func (p *Pump) Start() {
 	}()
 }
 
-// Stop ends the run phase and drains the master like sbox.py's
-// _drain_master: after the sandbox exited, final output may still be
+// Stop ends the run phase and drains the master: after the sandbox
+// exited, final output may still be
 // in flight (--die-with-parent runs the payload a beat later), but a
 // daemonized child can hold the slave open forever — so the drain is
 // bounded. The deadline evicts the parked master read (poller
 // deadline); the reader then flushes the sanitizer on its way out.
-// An EOF that already happened DURING the run is sbox.py's master_eof
-// corner: the drain (and with it the flush) is skipped entirely — the
-// port keeps that quirk byte-faithfully.
+// If EOF already happened during the run, the drain and its flush
+// are skipped; an incomplete tail is dropped.
 func (p *Pump) Stop(drain time.Duration) {
 	if !p.started {
 		return
@@ -215,8 +211,7 @@ func (p *Pump) Stop(drain time.Duration) {
 	timer.Stop()
 }
 
-// Close is the --filter-output teardown (sbox.py's finally block, in
-// its exact order): restore the host terminal FIRST, clear the raw
+// Close tears down --filter-output: restore the host terminal FIRST, clear the raw
 // diagnostic flag, release SIGWINCH, wake and drop the pending stdin
 // backlog, then close the fds (closing the master evicts the parked
 // reader/writer through the runtime poller). Idempotent.
@@ -324,7 +319,7 @@ func (p *Pump) push(chunk []byte) bool {
 // drainPending writes the backlog into the pty master. A full pty
 // buffer parks the write in the runtime poller — the backpressure the
 // forwarder sees — and a dead master (EIO: every slave fd closed)
-// drops the backlog, exactly like sbox.py's OSError branch.
+// drops the backlog.
 func (p *Pump) drainPending() {
 	for {
 		p.mu.Lock()
@@ -341,6 +336,12 @@ func (p *Pump) drainPending() {
 		n, err := p.Master.Write(head)
 
 		p.mu.Lock()
+		// Stop may have discarded the queue while Write was blocked on
+		// the slave. Its in-flight bytes need no further bookkeeping.
+		if p.stopped {
+			p.mu.Unlock()
+			return
+		}
 		if n > 0 {
 			p.chunks[0] = head[n:]
 			p.total -= n

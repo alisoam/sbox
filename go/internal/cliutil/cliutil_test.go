@@ -18,7 +18,7 @@ func sliceEq(a, b []string) bool {
 	return true
 }
 
-// TestSplitArgv pins sbox.py's split_argv behavior, including the quirky
+// TestSplitArgv pins the option/command boundary, including the tricky
 // bits: a value token may swallow a "--", and only exact OPTS_WITH_VALUE
 // spellings consume two tokens (attached values and "=" forms are single
 // tokens by construction).
@@ -190,7 +190,7 @@ func TestParseCLIValues(t *testing.T) {
 
 func TestParseCLIShortEquals(t *testing.T) {
 	// argparse splits an attached short value at the FIRST '=': "-a=x" is
-	// "x", "-a==x" is "=x", "-b=" is "" (verified against Python argparse).
+	// "x", "-a==x" is "=x", "-b=" is "".
 	opts, _ := parseOK(t, []string{"-a=x", "-a==y", "-b=", "-b=/p", "--", "sh"})
 	if want := []string{"x", "=y"}; !sliceEq(opts.Allow, want) {
 		t.Errorf("Allow = %q, want %q", opts.Allow, want)
@@ -203,7 +203,7 @@ func TestParseCLIShortEquals(t *testing.T) {
 func TestParseCLIOptionLikeValues(t *testing.T) {
 	// argparse never consumes an option-like token as an option's value —
 	// "-a -b x -- cmd" and "-a -- cmd" are "expected one argument" errors
-	// there (and in sbox.py, which inherits argparse).
+	// regardless of the command boundary.
 	for _, argv := range [][]string{
 		{"-a", "-b", "x", "--", "cmd"},
 		{"-a", "--", "cmd"},
@@ -237,8 +237,7 @@ func TestParseCLIOptionLikeValues(t *testing.T) {
 }
 
 func TestParseCLIStrictCrlfImpliesFilterOutput(t *testing.T) {
-	// --strict-crlf is a --filter-output MODE (sbox.py: main() sets
-	// opts.filter_output right after parse_cli).
+	// --strict-crlf is a --filter-output MODE.
 	opts, _ := parseOK(t, []string{"--strict-crlf", "--", "sh"})
 	if !opts.StrictCrlf || !opts.FilterOutput {
 		t.Errorf("StrictCrlf = %v FilterOutput = %v, want true/true", opts.StrictCrlf, opts.FilterOutput)
@@ -294,7 +293,7 @@ func TestUsage(t *testing.T) {
 	if strings.Contains(Usage, "--_selfprobe") {
 		t.Errorf("Usage must not document the hidden --_selfprobe flag")
 	}
-	if strings.Contains(Usage, "sbox.py") {
-		t.Errorf("Usage must say sbox, not sbox.py")
+	if strings.ContainsAny(Usage, "\r\x1b") {
+		t.Error("help must render control characters as printable escapes")
 	}
 }

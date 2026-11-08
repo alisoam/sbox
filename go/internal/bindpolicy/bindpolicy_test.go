@@ -149,7 +149,7 @@ func TestPersistencePathsAndWarning(t *testing.T) {
 }
 
 // TestCheckBindPaths pins the mount-mode promises: flags, refusals and
-// warnings of check_bind_paths, row for row.
+// warnings of CheckBindPaths, row for row.
 func TestCheckBindPaths(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
@@ -365,7 +365,7 @@ func TestCheckBindPaths(t *testing.T) {
 			fdWanted:  true,
 		},
 		{
-			// sbox.py's flag re-seed regression: a plain dir set the
+			// Mount-mode regression: a plain dir set the
 			// --bind-socket group's flag to rw, and the stale decision
 			// carried into the NEXT path — a runtime-dir socket then
 			// mounted READ-WRITE, exactly the impersonation the rules
@@ -376,8 +376,7 @@ func TestCheckBindPaths(t *testing.T) {
 			fdWanted:  true,
 		},
 		{
-			// realpath("") is the CURRENT DIRECTORY (CPython >= 3.13; the
-			// oracle pins it): -b '' validates the cwd like any path.
+			// An empty path validates the current directory like any path.
 			name:      "empty -b path resolves to the cwd",
 			opts:      &cliutil.Options{Bind: []string{""}},
 			wantFlags: []string{"--bind " + mustCwd(t)},

@@ -3,26 +3,22 @@ package allow
 import "net/netip"
 
 // BadIP reports whether addr must never be reached by RESOLVING an allowed
-// name (the SSRF guard of sbox.py's bad_ip): private, loopback, link-local,
+// name: private, loopback, link-local,
 // multicast, reserved, unspecified or CGNAT ranges — plus, for IPv6, the
 // address forms that embed an IPv4 address, judged by the EMBEDDED address:
 //
-//   - NAT64 (RFC 6052, 64:ff9b::/96): ipaddress marks the whole prefix
-//     reserved, but on DNS64 networks legitimate public IPv4-only hosts
+//   - NAT64 (RFC 6052, 64:ff9b::/96): on DNS64 networks public IPv4-only hosts
 //     come back this way — unwrap the low 32 bits and recurse.
 //   - 6to4 (RFC 3056, 2002::/16): the v6 form looks global, but relays
 //     decapsulate to the embedded IPv4 (bits 16..47), which may be
 //     loopback/LAN — SSRF via e.g. a 2002:7f00:1:: answer.
 //   - Teredo (RFC 4380, 2001:0::/32): deprecated — refuse the whole
-//     prefix instead of decoding it, and do not rely on is_private
-//     covering 2001::/23 on every Python version.
+//     prefix instead of decoding it.
 //
-// IPv4-mapped IPv6 addresses are judged as their embedded IPv4 (CPython's
-// predicate delegation semantics). The tables below mirror CPython 3.15's
-// ipaddress module (iana-ipv4/6-special-registry derived, including
-// exceptions like 192.0.0.9/.10 and 2001:1::1) so the Go port is pinned to
-// one deterministic ground truth instead of whichever Python happens to be
-// installed; the boundary tests in ip_test.go pin them.
+// IPv4-mapped IPv6 addresses receive the full embedded IPv4 policy,
+// including CGNAT. The fixed special-use address tables below include
+// globally reachable exceptions such as 192.0.0.9/.10 and 2001:1::1.
+// Boundary tests keep address classification independent of the host.
 func BadIP(addr netip.Addr) bool {
 	if !addr.IsValid() {
 		return true // unparseable answers are not usable answers
@@ -64,16 +60,13 @@ var (
 	teredoPrefix = netip.MustParsePrefix("2001::/32")
 )
 
-// badV4Nets: the union of CPython 3.15's IPv4 private networks, the
-// reserved network (240.0.0.0/4, which includes 255.255.255.255) and the
-// CGNAT range EXTRA_BAD_NETS from sbox.py (100.64.0.0/10 — not is_private
-// on older Pythons, listed explicitly). 192.0.0.170/31 and
-// 255.255.255.255/32 from the private list are subsumed by 192.0.0.0/24
-// and 240.0.0.0/4.
+// badV4Nets covers private, special-use, multicast and reserved IPv4
+// ranges. CGNAT is explicit: it must remain blocked even though it is
+// neither RFC 1918 private space nor globally reachable.
 var badV4Nets = mustParsePrefixes(
 	"0.0.0.0/8",       // "this network" + unspecified
 	"10.0.0.0/8",      // RFC 1918
-	"100.64.0.0/10",   // CGNAT (EXTRA_BAD_NETS)
+	"100.64.0.0/10",   // CGNAT
 	"127.0.0.0/8",     // loopback
 	"169.254.0.0/16",  // link-local (incl. 169.254.169.254)
 	"172.16.0.0/12",   // RFC 1918
@@ -94,9 +87,8 @@ var badV4Exceptions = mustParsePrefixes(
 	"192.0.0.10/32",
 )
 
-// badV6Nets: CPython 3.15's IPv6 private networks (with 4in6 delegation
-// handled in BadIP, so ::ffff:0:0/96 only matters for exactness), the
-// reserved unallocated-space list and multicast ff00::/8.
+// badV6Nets covers IPv6 special-use, unallocated and multicast ranges.
+// Embedded IPv4 forms are handled before these covering ranges.
 var badV6Nets = mustParsePrefixes(
 	// private (iana-ipv6-special-registry)
 	"::1/128",        // loopback
@@ -107,11 +99,11 @@ var badV6Nets = mustParsePrefixes(
 	"2001::/23",      // IETF protocol assignments / Teredo / ORCHID...
 	"2001:db8::/32",  // documentation
 	"2002::/16",      // 6to4 (judged by embedded v4 in BadIP; kept for
-	//                table fidelity with CPython's is_private)
+	//                completeness of the covering special-use ranges)
 	"3fff::/20", // benchmarking (new registries)
 	"fc00::/7",  // unique local
 	"fe80::/10", // link-local
-	// reserved (unallocated space, CPython _reserved_networks)
+	// reserved (unallocated space)
 	"::/8",
 	"100::/8",
 	"200::/7",

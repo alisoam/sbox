@@ -1,28 +1,27 @@
-# sbox.py
+# sbox
 
 Run a command in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox
 with an **allowlisted network** — untrusted code can compute, but it can only
 talk to the hosts you name, and everything else fails closed.
 
 ```console
-$ sbox.py -a pypi.org -a files.pythonhosted.org -- pip install requests
-$ sbox.py -a github.com -- git clone https://github.com/torvalds/linux
-$ sbox.py -a example.com -v -- curl -sI https://example.com
-$ sbox.py --ssh-agent -a github.com -- git clone git@github.com:me/repo.git
+$ sbox -a pypi.org -a files.pythonhosted.org -- pip install requests
+$ sbox -a github.com -- git clone https://github.com/torvalds/linux
+$ sbox -a example.com -v -- curl -sI https://example.com
+$ sbox --ssh-agent -a github.com -- git clone git@github.com:me/repo.git
 ```
 
 Why not just `bwrap` alone? Namespaces hide the network but give you no
-policy: it is all or nothing. `sbox.py` adds the missing piece — a
-default-deny egress allowlist — while keeping the tool a single stdlib-only
-Python file with no third-party proxy dependency.
+policy: it is all or nothing. `sbox` adds the missing piece — a
+default-deny egress allowlist — with a standalone Go binary using only the
+standard library.
 
 ## Requirements
 
 - Linux with unprivileged user namespaces (many containers block this —
   bwrap then fails with "No permissions to create a new namespace")
-- `bwrap` and `socat` on the host; `python3 >= 3.8` on the host (stdlib
-  only — the seccomp filter is installed by bwrap itself, no python3 is
-  needed inside the sandbox)
+- `bwrap` and `socat` on the host (`--net` needs only `bwrap`)
+- Go >= 1.22 to build; the installed binary needs no language runtime
 - seccomp deny-list: any `bwrap >= 0.4.1` (`--seccomp`) or newer
   (`--add-seccomp-fd`); `>= 0.8` additionally disables nested user
   namespaces at the kernel level (`--disable-userns` — probed once per
@@ -32,21 +31,25 @@ Python file with no third-party proxy dependency.
   `>= 0.10` mounts binds from pinned fds (no check-to-mount race). Older
   bwrap degrades with a loud note; without seccomp support the launcher
   refuses to run unless `--no-seccomp` is passed explicitly.
-- `--net` mode needs `bwrap` only
 
 ## Install
 
-Copy the file anywhere in `$PATH` and make it executable:
+Build and install from the repository root:
 
 ```sh
-install -m 755 sbox.py ~/.local/bin/sbox.py
+cd go
+CGO_ENABLED=0 go build -o sbox ./cmd/sbox
+install -Dm755 sbox ~/.local/bin/sbox
 ```
+
+The Go module lives in `go/`. The default static build uses Go's DNS
+resolver; custom NSS backends such as mDNS and myhostname are not supported.
 
 ## Usage
 
 ```
-sbox.py [options] [--] COMMAND [args...]
-sbox.py [options] --shell
+sbox [options] [--] COMMAND [args...]
+sbox [options] --shell
 ```
 
 Everything after the first positional (or `--`) is the sandboxed command.
@@ -75,8 +78,10 @@ Everything after the first positional (or `--`) is the sandboxed command.
 
 - **No network stack in the sandbox.** `bwrap --unshare-all` removes it; the
   only egress is a Unix socket passed in at `/run/proxy.sock`.
-- **The launcher is the proxy.** The same file re-executes itself as a small
-  asyncio SOCKS5 + HTTP-CONNECT server on the host, listening on that socket.
+- **The launcher hosts the proxy.** A goroutine serves SOCKS5 and HTTP CONNECT
+  on the Unix socket. Upstream credentials stay in memory; no proxy config
+  containing credentials is written to disk. Killing the launcher also stops
+  its proxy.
 - **Inside**, a `socat` loopback bridge makes the proxy available at
   `127.0.0.1:1080`, auto-detecting SOCKS5 vs HTTP per connection — so
   `http_proxy=http://127.0.0.1:1080` works for tools that do not understand
@@ -101,7 +106,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
   installed **by bwrap itself**, as the very last step before exec'ing the
   payload (`--add-seccomp-fd`, `--seccomp` on older bwrap): the shell, the
   socat bridge and the command inherit it from their first instruction —
-  no in-sandbox helper, no python3 dependency, no pre-filter window. The
+  no in-sandbox helper or pre-filter execution window. The
   command also runs as pid 1 (`--as-pid-1`), so no unfiltered bwrap
   reaper init remains inside (on Yama `ptrace_scope=0` systems that
   parent could otherwise be `/proc/1/mem`-injected, bypassing the filter).
@@ -119,9 +124,9 @@ Everything after the first positional (or `--`) is the sandboxed command.
   cannot work (e.g. setuid bwrap without unprivileged user namespaces)
   keep running on the deny rules alone, with a note shown at most once a
   day. Fail-closed: every launch self-probes the compiled filter host-side
-  first (install it in a forked child; the libc `unshare()`,
-  `ioctl(TIOCSTI)`, `socket(AF_VSOCK)`, `personality(0)` and `ptrace()`
-  wrappers must return EPERM while the `personality(0xffffffff)` query
+  first (the binary re-executes a probe child using kernel-derived
+  `syscall.SYS_*` numbers; `unshare()`, `ioctl(TIOCSTI)`, `socket(AF_VSOCK)`,
+  `personality(0)` and `ptrace()` must return EPERM while the `personality(0xffffffff)` query
   stays allowed — the hand-typed numbers are verified on
   this machine), and if
   the filter cannot be installed (bwrap < 0.4.1, unsupported
@@ -130,9 +135,10 @@ Everything after the first positional (or `--`) is the sandboxed command.
   debuggers (gdb/strace), `setarch`, perf, io_uring runtimes, unshare-based
   builders, keyring-using kerberos, nested containers). The syscall
   tables are cross-checked against kernel headers and a live filter probe
-  by `tests/test_seccomp.py`.
+  by `go/internal/seccomp` tests, including checked-in bytecode fixtures
+  for x86_64, aarch64 and riscv64.
 - **Lifecycle:** if any component dies, everything dies (supervisor loop,
-  `--die-with-parent`, `PR_SET_PDEATHSIG` on the proxy) — even a SIGKILLed
+  `--die-with-parent`, and the in-process proxy) — even a SIGKILLed
   launcher takes the proxy with it.
 - **Output filtering (`--filter-output`):** the sandbox normally shares the
   host terminal, and a payload can print escape sequences the terminal
@@ -153,10 +159,12 @@ Everything after the first positional (or `--`) is the sandboxed command.
   tty runs raw while the sandbox lives (stdin and SIGWINCH forwarded,
   termios restored on exit); **non-tty stdin (a pipe, file, `/dev/null`)
   is inherited directly** instead, so binary data and long lines
-  round-trip byte-exact (`tar c . | sbox.py --filter-output -- tar x`).
-  The pty also merges stdout and stderr (`2>/dev/null` inside the sandbox
-  stops working) and ONLCR translates `\n` to `\r\n` (also in redirected
-  output).
+  round-trip byte-exact (`tar c . | sbox --filter-output -- tar x`).
+  The pty also merges stdout and stderr, so host-side redirection cannot
+  separate payload stderr. Redirection inside the sandbox still works.
+  ONLCR translates `\n` to `\r\n` (also in redirected
+  output). A closed stdout or stderr pipe does not terminate the launcher;
+  it continues supervising and restores the terminal during cleanup.
 
 ## Security model
 
@@ -166,7 +174,9 @@ Everything after the first positional (or `--`) is the sandboxed command.
 - **SSRF guard.** Allowed hostnames are resolved host-side; answers in
   private, loopback, link-local, CGNAT, multicast or reserved ranges are
   rejected, so an allowed name cannot reach host or LAN services (including
-  `169.254.169.254`). Explicit `-a IP/CIDR` entries deliberately bypass this
+  `169.254.169.254`). IPv4-mapped IPv6, NAT64 and 6to4 addresses are
+  checked against their embedded IPv4 address, including CGNAT. Explicit
+  `-a IP/CIDR` entries deliberately bypass this
   guard — use them with care — and so does `-a NAME!private` for that one
   name (internal mirrors on the `$no_proxy` direct route; explicit intent,
   same trade-off).
@@ -174,8 +184,12 @@ Everything after the first positional (or `--`) is the sandboxed command.
   requests always have `Host` rewritten from the checked URL and emitted
   first; header names must be valid tokens (no obs-fold, no `Host :`),
   `Transfer-Encoding` is refused and only an unambiguous `Content-Length`
-  body is forwarded before the origin socket is half-closed — a pipelined
-  second request cannot smuggle its own `Host` upstream. TLS `CONNECT`
+  body is forwarded. The origin is half-closed when the transport supports it
+  (TLS upstreams do not); a pipelined second request cannot smuggle its own
+  `Host` upstream. Responses are
+  forwarded while the body is being uploaded, including `100 Continue` and
+  early rejections. Upstream handshake buffering preserves any initial
+  tunnel data sent with the handshake response. TLS `CONNECT`
   tunnels stay opaque (the documented domain-fronting limit).
 - **Loud, not wide.** Catch-all entries (`*`, `0.0.0.0/0`, effectively-global
   CIDRs) and CIDRs with host bits set (`203.0.113.7/24`) are rejected loudly
@@ -210,7 +224,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
   (connect-only ground opts back in read-only; or `-r "$PWD"
   --bind-socket "$PWD"` to force read-only).
   For untrusted work consider an alias that makes the safe choices
-  defaults: `alias sbox='sbox.py --ro-cwd --filter-output'`.
+  defaults: `alias sbox='sbox --ro-cwd --filter-output'`.
 - **Read-write binds of `$HOME` children are host code execution at next
   login/session**: shell rc/session files (`~/.bashrc`, `~/.profile`,
   `~/.xprofile`, `~/.xsessionrc`, ...), `~/.ssh/authorized_keys`,
@@ -263,7 +277,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
   `$XDG_RUNTIME_DIR`, and any directory containing a Unix socket (bounded
   scan — that closes the "project dir with a dev-server socket" case
   outside `/run`). Each is a trivial full escape. `--bind-socket PATH`
-  (read-only) is the explicit per-path opt-in for the shape/scan rules —
+  is the explicit per-path opt-in for the shape/scan rules —
   never for a read-write mount of connect-only ground; known control
   sockets and protected paths stay refused. Paths **inside `/proc`,
   `/sys` or `/dev`** are refused under every flag with no opt-in:
@@ -283,8 +297,8 @@ Design trade-offs, not bugs:
 - `-b`/`-r` binds are only refused when they cover a protected path (system
   dirs, `$HOME`, `/run/user/<uid>`), lie inside `/proc`/`/sys`/`/dev`, or
   are socket-shaped; anything else you bind is handed over as
-  requested — including the launcher's `/tmp/sbox.*` work dir with any upstream
-  credentials.
+  requested — including the launcher's `/tmp/sbox.*` work directory. Upstream
+  credentials remain in memory.
 - No resource limits (CPU/memory/PID/fds) inside the sandbox; the boundary is
   bwrap's namespaces plus the seccomp deny-list.
 - No domain-fronting protection: an allowed CDN host may serve many origins.
@@ -293,12 +307,12 @@ Design trade-offs, not bugs:
   proxy cannot work, and some proxies reject IP CONNECT targets.
 - The proxy has no connection caps, idle timeouts or header-count limits;
   CONNECT/SOCKS tunnels have no TCP half-close (the forwarded plain-http
-  path *is* one-shot — declared body, then a half-close), and only the
-  first resolved address is tried when chaining through an upstream.
+  path *is* one-shot — declared body, then a half-close except through TLS).
+  Only the first resolved address is tried when chaining through an upstream.
 - `--filter-output`: the pty slave is an inherited fd and cannot become the
   sandbox's controlling terminal, so job control inside is limited; with the
   host tty raw, Ctrl-C is delivered to the sandbox as a **byte** — a command
-  that never reads stdin cannot be interrupted from the keyboard (kill sbox.py
+  that never reads stdin cannot be interrupted from the keyboard (kill sbox
   from another shell). The filter is an allowlist: other non-printable
   characters (NBSP, soft hyphen, ...) are dropped too, and an unterminated
   OSC/DCS swallows following output until its terminator or the 4096-byte cap
@@ -311,7 +325,20 @@ Design trade-offs, not bugs:
 
 ## Development
 
-Single file, stdlib only. Seccomp tests: `python3 tests/test_seccomp.py`
-(plain python3 or pytest; skips cleanly when references or capabilities are
-missing). See [AGENTS.md](AGENTS.md) for architecture notes, verification
-recipes and the invariants to preserve.
+The implementation and tests use only Go's standard library. Run from `go/`:
+
+```sh
+go vet ./...
+go test ./...
+CGO_ENABLED=0 go build ./...
+go test -race ./...
+```
+
+The race detector needs a C toolchain; the installed static binary does not.
+Tests use local TCP/Unix sockets and PTYs. Namespace smoke tests need a host
+that permits unprivileged user namespaces. The syscall cross-checks skip
+unavailable foreign architecture headers or `ausyscall`; the golden bytecode,
+interpreter and native policy tests always run. No external reference
+implementation is required.
+
+See [AGENTS.md](AGENTS.md) for architecture and security invariants.

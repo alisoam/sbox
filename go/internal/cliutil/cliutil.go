@@ -1,21 +1,7 @@
-// Package cliutil implements sbox's argv handling: the tokenizer that
-// splits sbox's own options from the sandboxed command, and the
-// argparse-style option parser used by cmd/sbox.
-//
-// It is a port of sbox.py's split_argv/parse_cli (allow_abbrev=False), with
-// two deliberate, user-visible deltas:
-//
-//   - Clustered short flags ("-va") are rejected loudly instead of being
-//     silently expanded to "-v -a". split_argv can only count tokens for
-//     options it knows by their FULL spelling, so a cluster would either
-//     mis-split argv or smuggle an extra flag past the splitter; refusing
-//     is the fail-closed choice. Attached values ("-aexample.com",
-//     "-b/path") keep argparse semantics: the option takes a value, the
-//     remainder of the token is it.
-//   - Python's hidden "--_proxy SOCK CFG PPID" re-exec flag does not exist
-//     here (the proxy is a goroutine in this process). The hidden
-//     "--_selfprobe" flag (seccomp probe child, see internal/seccomp) does;
-//     it takes no value, so SplitArgv skips exactly one token for it.
+// Package cliutil splits launcher options from the sandboxed command and
+// parses the options without abbreviation. Clustered short flags are rejected;
+// attached values such as -aexample.com remain supported. The hidden
+// --_selfprobe flag dispatches the seccomp probe child and takes no value.
 //
 // OPTS_WITH_VALUE trap: every option that consumes a separate value token
 // MUST appear in OptsWithValue below — SplitArgv finds the first
@@ -31,8 +17,7 @@ import (
 	"strings"
 )
 
-// Prog is the program name used in usage and error messages ("sbox:"; the
-// Python original is "sbox.py").
+// Prog is the program name used in usage and error messages.
 const Prog = "sbox"
 
 // OptsWithValue is the OPTS_WITH_VALUE trap list: every option spelled with
@@ -71,7 +56,7 @@ var ShortWithValue = func() map[byte]bool {
 // belongs to the sandboxed command (so `sbox -- cmd -v` works), like the
 // shell version. The first "--" is the explicit boundary and is dropped;
 // a value token consumed by a value-taking option is NOT treated as a
-// boundary (even if it is "--"), mirroring sbox.py.
+// boundary (even if it is "--").
 func SplitArgv(argv []string) (pre, command []string) {
 	i := 0
 	for i < len(argv) {
@@ -101,10 +86,10 @@ func rest(s []string) []string {
 	return s
 }
 
-// Options is the parsed sbox configuration (argparse opts). Slice fields
+// Options is the parsed sbox configuration. Slice fields
 // collect repeated flags in order; Upstream distinguishes "not passed"
-// (HasUpstream false, env fallback applies) from "--upstream ”" (force
-// direct egress), like Python's None vs "".
+// (HasUpstream false, env fallback applies) from `--upstream ""` (force
+// direct egress).
 type Options struct {
 	Allow            []string
 	AllowFile        []string
@@ -128,7 +113,7 @@ type Options struct {
 	Help             bool
 }
 
-// display names for argparse-style error messages
+// display names for option error messages
 var (
 	longDisplay = map[string]string{
 		"allow":       "-a/--allow",
@@ -189,7 +174,7 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 		// short option (tok starts with "-", tok != "-" and not "--...")
 		c := tok[1]
 		if ShortWithValue[c] {
-			// argparse splits an attached value at the FIRST '=': "-a=x"
+			// Split an attached value at the FIRST '=': "-a=x"
 			// is value "x", "-a==x" is "=x", "-b=" is "" — and "-b/path"
 			// is "/path" (no '=' involved). TrimPrefix removes exactly one.
 			inline := strings.TrimPrefix(tok[2:], "=")
@@ -213,8 +198,7 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 			return nil, nil, fmt.Errorf("unrecognized arguments: %s", tok)
 		}
 	}
-	// --strict-crlf is a --filter-output MODE (sbox.py sets this at the top
-	// of main(), right after parse_cli — same observable behavior).
+	// --strict-crlf always enables output filtering.
 	if opts.StrictCrlf {
 		opts.FilterOutput = true
 	}
@@ -230,13 +214,8 @@ func takeValue(pre []string, i *int, attached bool, inline string, display strin
 	if *i+1 >= len(pre) {
 		return "", fmt.Errorf("argument %s: expected one argument", display)
 	}
-	// argparse never consumes an option-like token as an option's value —
-	// "-a -- cmd" and "-a -b x" are "expected one argument" errors there
-	// (sbox.py inherits it; its split_argv counts the token as consumed
-	// and argparse then dies on the pre-options). Exceptions: a bare "-"
-	// (conventionally stdin) and negative numbers "-5"/"-.5" — argparse
-	// allows those as values when the parser has no numeric-looking
-	// options, and sbox defines none.
+	// Option-like tokens cannot be values. A bare "-" (stdin) and negative
+	// numbers are exceptions because this parser has no numeric option names.
 	if !valueTokenOK(pre[*i+1]) {
 		return "", fmt.Errorf("argument %s: expected one argument", display)
 	}
@@ -244,7 +223,7 @@ func takeValue(pre []string, i *int, attached bool, inline string, display strin
 	return pre[*i], nil
 }
 
-// valueTokenOK mirrors argparse's rule: any token not starting with "-",
+// valueTokenOK accepts: any token not starting with "-",
 // a bare "-", or a negative number may serve as a value.
 func valueTokenOK(tok string) bool {
 	if !strings.HasPrefix(tok, "-") || tok == "-" {
@@ -253,7 +232,7 @@ func valueTokenOK(tok string) bool {
 	return negativeNumber(tok)
 }
 
-// negativeNumber matches Python's _negative_number_matcher
+// negativeNumber accepts signed integer and decimal value tokens
 // (^-\d+$|^-\d*\.\d+$).
 func negativeNumber(tok string) bool {
 	s := tok[1:]
@@ -349,29 +328,24 @@ func applyBool(o *Options, name string) {
 // Description is the one-line help description.
 const Description = "Run COMMAND in a bubblewrap sandbox with an allowlisted network."
 
-// Epilog is the help epilog: a byte-exact snapshot of THIS CPython's
-// argparse rendering of sbox.py's epilog (RawDescriptionHelpFormatter,
-// 80-column wrap, oracle-pinned by TestDifferentialUsage) with exactly
-// one wording delta — the seccomp-install paragraph describes the Go
-// probe child (self re-exec, raw syscall numbers, this repo's test
-// suite) instead of python's forked-child/libc-wrapper wording. The
-// prog-name substitutions (sbox.py -> sbox) are delta #4. NOTE: the
-// epilog carries REAL control bytes (python's "\n/\r/\t" are escapes
-// in a non-raw string, so its --help emits literal CR/TAB/LF
-// mid-line); they are kept byte-faithfully via interpreted splices
-// (raw literals would discard the CRs).
+// Epilog documents the security model and known limits. Keep it aligned with
+// README.md and the package contracts when behavior changes.
 const Epilog = `By default the sandbox has no network except a SOCKS5 *and* HTTP-CONNECT
 proxy (auto-detected) at 127.0.0.1:1080 — http_proxy/https_proxy/all_proxy
 are pre-set. https:// always goes through CONNECT; plain http:// URLs are
 forwarded (absolute-form) as exactly ONE request: Host is rewritten from
 the checked URL, header names must be valid tokens (no obs-fold),
 Transfer-Encoding is refused and only an unambiguous Content-Length body
-is forwarded before the origin socket is half-closed — a pipelined second
-request cannot smuggle its own Host upstream. Destinations not on the
-allowlist are denied
+is forwarded. The origin is half-closed when the transport supports it
+(TLS upstreams do not). A pipelined second request cannot smuggle its own
+Host upstream. Responses stream concurrently
+with uploads, including 100 Continue and early rejections. Tunnel bytes
+buffered during upstream handshakes are preserved. The proxy runs in the
+launcher; upstream credentials stay in memory. Destinations are denied
 BEFORE any DNS lookup happens. Hostnames are resolved host-side; answers in
-private, loopback, link-local or CGNAT ranges are rejected, so allowed names
-cannot reach host/LAN services (explicit -a IP/CIDR entries bypass that
+private, loopback, link-local or CGNAT ranges (including IPv4-mapped IPv6)
+are rejected, so allowed names cannot reach host/LAN services
+(explicit -a IP/CIDR entries bypass that
 guard, as does -a NAME!private for that one name — for internal mirrors;
 effectively catch-all networks such as 0.0.0.0/1 are refused).
 $NO_PROXY/$no_proxy (lowercase winning, curl semantics) only picks the
@@ -415,7 +389,7 @@ Notes:
   - Proxied mode installs /etc/ssh/ssh_config with a ProxyCommand (socat
     HTTP-CONNECT through 127.0.0.1:1080): ssh/scp/sftp/git-over-ssh ride the
     allowlist without extra flags. ~/.ssh/config is read first and wins
-    per-option; ` + "`" + `ssh -o ProxyCommand=none` + "`" + ` opts out (and usually fails,
+    per-option; ssh -o ProxyCommand=none opts out (and usually fails,
     fail-closed). --net installs nothing (direct egress, no allowlist).
     No known_hosts is injected: host-key verification fails closed (tmpfs
     home, no TTY) — pass -r ~/.ssh/known_hosts or pin hosts yourself.
@@ -447,7 +421,7 @@ Notes:
     login/session (a --bind-socket directory that mounts read-write warns
     the same way). Validated bind sources are handed to bwrap
     (>= 0.10) as pinned fds — validation pins first and checks the pinned
-    object, so a concurrent sandbox cannot swap a path component between
+    object (relative paths are resolved to absolute paths), so a concurrent sandbox cannot swap a path component between
     check and mount; only the fds the argv names reach the sandbox, and
     a missing -b/-r source is a hard error (no path-form fallback).
   - The sandbox runs in a new session (TIOCSTI protection): Ctrl-C reaches
@@ -490,8 +464,7 @@ Notes:
     or nested containers).
   - --filter-output sanitizes terminal output host-side: the sandbox
     runs on a pty slave (the host terminal fd never enters the sandbox)
-    and everything it prints passes an allowlist — text, 
-/` + "\r" + `/	 and
+    and everything it prints passes an allowlist — text, \n/\r/\t and
     safe SGR colors pass; OSC strings (clipboard writes, titles,
     hyperlinks), DCS/APC/PM/SOS, non-SGR CSI (cursor moves, screen
     clears, device queries), 2-byte ESC sequences, other C0/C1 controls
@@ -504,13 +477,13 @@ Notes:
     (tar c . | sbox --filter-output -- tar x). A stdin that IS a
     terminal but raw mode failed for is refused outright — the host tty
     fd is never handed to the sandbox unfiltered. Note the pty merges
-    stdout and stderr (2>/dev/null inside the sandbox stops working) and
-    ONLCR translates 
- to ` + "\r" + `
- (also in redirected output).
-    --strict-crlf (implies --filter-output) additionally drops ` + "\r" + `
-    not followed by 
-: a bare ` + "\r" + ` lets payload output visually overwrite
+    stdout and stderr, so host redirection cannot separate payload stderr;
+    redirection inside the sandbox still works.
+    ONLCR translates \n to \r\n (also in redirected output). Closed output
+    pipes do not terminate the launcher; it continues supervising and restoring
+    the terminal during cleanup.
+    --strict-crlf (implies --filter-output) additionally drops \r
+    not followed by \n: a bare \r lets payload output visually overwrite
     the current line after you read it (progress bars break). Known
     limits: Ctrl-C reaches the sandbox as a byte — a command that never
     reads stdin cannot be interrupted from the keyboard (kill sbox
@@ -525,12 +498,7 @@ Examples:
   sbox --ssh-agent -a github.com -- git clone git@github.com:me/repo.git
 `
 
-// Usage is the full help text (usage line, description, options and
-// epilog): a byte-exact snapshot of THIS CPython's argparse rendering
-// (RawDescriptionHelpFormatter, 80-column wrap, sbox.py's PROG patched
-// to "sbox") — pinned against the oracle by TestDifferentialUsage.
-// argparse re-wraps to the caller's terminal width; the snapshot is
-// fixed, which is the one rendering delta.
+// Usage is the complete fixed-width help text.
 const Usage = `usage: sbox [-h] [-a HOST] [-A FILE] [-b PATH] [-r PATH] [--bind-socket PATH]
             [--ro-cwd] [--home] [--gui] [--ssh-agent] [--filter-output]
             [--strict-crlf] [--upstream URL] [--upstream-insecure] [--net]

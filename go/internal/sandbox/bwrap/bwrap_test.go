@@ -95,7 +95,7 @@ echo "--bind-fd FD DEST --ro-bind-fd FD DEST --disable-userns --assert-userns-di
 	}
 	// the shim records every invocation's argv; after TWO Probe() calls
 	// it must have been invoked once, as exactly "bwrap --help" — the
-	// caps cache (python's _BWRAP_CAPS) means no second probe run
+	// capability cache means no second probe run
 	argvFile := filepath.Join(t.TempDir(), "argv")
 	recording := fakeBwrap(t, `printf '%s\n' "$@" >> `+argvFile+`
 echo "--add-seccomp-fd"`)

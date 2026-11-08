@@ -1,26 +1,11 @@
 package sandbox
 
-// The launch supervisor — sbox.py's run_sandbox. One Run() call owns:
-// the 0700 $WORK (mkdtemp under /tmp; its tmp/ dir becomes the
-// sandbox's /tmp), the in-process proxy goroutine plus the readiness
-// wait and the fail-closed self-test, the seccomp gate (compile the
-// table, fail closed when bwrap cannot install it, self-probe on THIS
-// machine, hand the bytes to the provider), the per-launch
-// userns-hardening probe with its once-a-day fallback note, fd-first
-// bind validation, the backend spawn, the signal lifecycle, exit-code
-// propagation and RmTreeWritable teardown. Every early exit unwinds
-// through the same teardown (python's try/finally): $WORK never
-// survives the launcher.
-//
-// Two deliberate deltas vs sbox.py (both documented in PLAN.md):
-//
-//   - the proxy is a goroutine in this process, not a --_proxy re-exec
-//     child: no proxy.json ever exists (credentials stay in memory),
-//     and any launcher death — SIGKILL included — takes the proxy with
-//     it, so the PR_SET_PDEATHSIG/ppid machinery is redundant.
-//   - the seccomp self-probe re-executes this binary (--_selfprobe)
-//     instead of forking; the supervisor runs it through
-//     seccomp.SelfProbe before anything spawns.
+// Each Run owns a private work directory, the in-process proxy and its
+// denial self-test, seccomp validation and the nested-userns probe,
+// pinned bind sources, backend launch, signal forwarding and cleanup.
+// Proxy credentials stay in memory; any launcher death takes the proxy
+// with it. The seccomp self-probe re-executes this binary before launch.
+// Normal and early returns share one deferred teardown.
 
 import (
 	"errors"
@@ -73,7 +58,7 @@ type Supervisor struct {
 	// Exe is this binary (os.Executable()): the --_selfprobe re-exec
 	// target for the seccomp gate.
 	Exe string
-	// Warn receives every diagnostic python prints via err() — notes,
+	// Warn receives diagnostics — notes,
 	// warnings and die() messages alike (the caller adds the "sbox: "
 	// prefix). nil drops them.
 	Warn func(string)
@@ -129,15 +114,15 @@ func (s *Supervisor) Run() int {
 	// During startup there is nothing to forward signals to yet; die so
 	// the teardown below removes $WORK. Replaced by the forwarding
 	// handler once the sandbox is up. Armed before $WORK exists so every
-	// startup signal is caught by these handlers (python: early_signal).
+	// startup signal is caught by these handlers.
 	hub := &sigHub{ch: s.SigCh, seen: map[os.Signal]bool{}}
 	hub.start()
 
 	var (
 		work     string
 		proxySrv *proxy.Server
-		proxyLog *outputfilter.Sanitizer // --filter-output proxy log
-		pump     *outputfilter.Pump      // --filter-output pty pump
+		proxyLog *filteredProxyLog  // --filter-output proxy log
+		pump     *outputfilter.Pump // --filter-output pty pump
 		pinner   *bindpolicy.Pinner
 		held     []*os.File // parent copies of everything handed to the child
 		cmd      *exec.Cmd
@@ -147,24 +132,20 @@ func (s *Supervisor) Run() int {
 	teardown := func() {
 		// A second Ctrl-C while cleaning up must not abort the cleanup
 		// (a skipped RmTreeWritable would leave the work dir behind).
-		// Python flips the three signals to SIG_IGN; here the hub's done
-		// phase IS the ignore: the disposition stays "caught" (children
-		// spawned later inherit the DEFAULT, not an inherited ignore —
-		// Go's Reset does not undo Ignore), and nothing in phase done
-		// forwards or raises. Go signal delivery cannot interrupt the
-		// synchronous teardown below the way a Python handler raises.
+		// The hub keeps catching signals during cleanup but no longer
+		// forwards them. No ignored disposition reaches child processes.
 		hub.done()
 		// --filter-output teardown FIRST after the ignore phase: the
 		// host terminal must be restored before anything below blocks
-		// (a raw terminal is unusable meanwhile) — sbox.py's finally
-		// restores termios, SIGWINCH and the pty fds before killing
-		// anything else. Also the last word of the sanitized proxy
+		// (a raw terminal is unusable meanwhile). Restore termios and
+		// SIGWINCH, then close the pty before killing anything else.
+		// Also emit the last word of the sanitized proxy
 		// log (an unterminated tail stays pending in its sanitizer).
 		if pump != nil {
 			pump.Close()
 		}
 		if proxyLog != nil {
-			outputfilter.EmitDiag(proxyLog.Flush())
+			proxyLog.close()
 		}
 		for _, f := range held {
 			f.Close()
@@ -174,7 +155,7 @@ func (s *Supervisor) Run() int {
 			pinner.Close()
 		}
 		if cmd != nil && cmd.Process != nil && !reaped {
-			// python: terminate(), wait(3), kill() — a sandbox that
+			// Terminate, wait three seconds, then kill: a sandbox that
 			// survived the SIGTERM gets the hard kill.
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 			select {
@@ -186,8 +167,7 @@ func (s *Supervisor) Run() int {
 		}
 		if proxySrv != nil {
 			// Bounded: a handler mid-dial must not wedge the teardown
-			// (the python proxy child got terminate/wait(3)/kill; the
-			// goroutines here die with the process anyway).
+			// (these goroutines die with the launcher process anyway).
 			closed := make(chan struct{})
 			go func() { proxySrv.Close(); close(closed) }()
 			select {
@@ -202,9 +182,8 @@ func (s *Supervisor) Run() int {
 	defer teardown()
 
 	// earlyExit is the boundary check for signals that arrived during
-	// setup (python's early_signal raises wherever it lands; Go checks
-	// between the short setup phases — same observable outcome: cleanup
-	// plus 128+signum).
+	// setup. Each setup phase ends with this check: cleanup then
+	// 128+signum when a signal arrived.
 	earlyExit := func() (int, bool) {
 		if n := hub.earlySignal(); n != 0 {
 			return 128 + n, true
@@ -238,7 +217,7 @@ func (s *Supervisor) Run() int {
 		warn(fmt.Sprintf("cannot create %s: %v", sand, err))
 		return 1
 	}
-	// Explicit, like mkdtemp+chmod in python: umask must never loosen it
+	// Explicit permissions: umask must never loosen them
 	// (this dir holds the proxy socket and the ssh_config).
 	if err := os.Chmod(work, 0o700); err != nil {
 		warn(fmt.Sprintf("cannot chmod %s: %v", work, err))
@@ -341,29 +320,22 @@ func (s *Supervisor) Run() int {
 	}
 
 	if !s.Opts.Net {
-		// The proxy replaces python's --_proxy re-exec child: same
-		// socket, same checks, in this process (no proxy.json — the
-		// credentials never touch disk, and the known-limit shrinks to
-		// nothing: any launcher death takes the proxy with it).
+		// The proxy lives in this process: credentials never touch
+		// disk, and any launcher death takes the proxy with it.
 		np := s.NoProxy
 		if np == nil {
 			np = allow.NoProxyFromEnv(os.Getenv)
 		}
-		// Under --filter-output the proxy's decision log (the python
-		// analog is a PIPE the pump selects on) is emitted sanitized:
-		// tracebacks can quote sandbox-supplied bytes, and diagnostics
-		// must CR their newlines while the host tty is raw. Same
-		// bytes as the default sink ("sbox-proxy: ..."), one
-		// Sanitizer in front.
+		// Under --filter-output sanitize the proxy decision log too:
+		// errors can quote sandbox-supplied bytes. Diagnostics add CR
+		// before newlines while the host tty is raw.
 		logf := s.ProxyLogf
 		if s.Opts.FilterOutput {
-			proxyLog = outputfilter.NewSanitizer(false)
-			var pmu sync.Mutex
-			logf = func(msg string) {
-				pmu.Lock()
-				defer pmu.Unlock()
-				outputfilter.EmitDiag(proxyLog.Feed([]byte("sbox-proxy: " + msg + "\n")))
+			proxyLog = &filteredProxyLog{
+				sanitizer: outputfilter.NewSanitizer(false),
+				emit:      outputfilter.EmitDiag,
 			}
+			logf = proxyLog.write
 		}
 		proxySrv, err = proxy.Listen(sock, proxy.Config{
 			Allows:   s.Allows,
@@ -496,15 +468,13 @@ func (s *Supervisor) Run() int {
 
 	if pump != nil {
 		// The parent's slave copy must go too — else the host holds EOF
-		// away from the pump — and the pump starts (sbox.py arms
-		// SIGWINCH only once the sandbox exists).
+		// away from the pump. SIGWINCH forwarding starts after spawn.
 		_ = pump.Slave.Close()
 		pump.Start()
 	}
 
-	// A signal that raced the spawn is still in early_signal territory
-	// (python installs the forward handler only after Popen): teardown
-	// kills the just-started sandbox. Otherwise forwarding takes over.
+	// A signal that raced the spawn still triggers startup teardown,
+	// killing the new sandbox. Otherwise forwarding takes over.
 	hub.run(cmd)
 	waitCh = make(chan int, 1)
 	go func() { waitCh <- waitExitCode(cmd.Wait()) }()
@@ -514,8 +484,7 @@ func (s *Supervisor) Run() int {
 
 	rc := <-waitCh
 	reaped = true
-	// --filter-output drain (python: if sanitizer and not master_eof:
-	// _drain_master): final output may still be in flight while the
+	// --filter-output drain: final output may still be in flight while the
 	// payload dies a beat later, but a daemonized child holding the
 	// slave open forever bounds the wait to half a second.
 	if pump != nil {
@@ -523,6 +492,43 @@ func (s *Supervisor) Run() int {
 	}
 	hub.done()
 	return rc
+}
+
+// Proxy handlers can finish while the supervisor is tearing down. The
+// emission lock keeps log records ordered, but the state lock covers only
+// sanitizer access: a blocked stderr must never hold up close. An in-flight
+// sink write can finish later; waiting and new records are dropped on close.
+type filteredProxyLog struct {
+	mu        sync.Mutex
+	emitMu    sync.Mutex
+	sanitizer *outputfilter.Sanitizer
+	emit      func(string)
+	closed    bool
+}
+
+func (l *filteredProxyLog) write(msg string) {
+	l.emitMu.Lock()
+	defer l.emitMu.Unlock()
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	text := l.sanitizer.Feed([]byte("sbox-proxy: " + msg + "\n"))
+	l.mu.Unlock()
+	l.emit(text)
+}
+
+func (l *filteredProxyLog) close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.closed {
+		l.closed = true
+		// Every record ends in a newline, so UTF-8 decoding has no
+		// incomplete printable tail. Discard any pending escape without
+		// touching the possibly blocked sink or draining waiting records.
+		l.sanitizer.Flush()
+	}
 }
 
 // sigHub is the signal lifecycle. One goroutine drains the armed
@@ -611,8 +617,8 @@ func signum(s os.Signal) int {
 	return 0
 }
 
-// waitExitCode turns cmd.Wait()'s error into the shell-style exit code
-// python's run_sandbox propagates: 0, the payload's own code, or
+// waitExitCode turns cmd.Wait()'s error into a shell-style exit code:
+// 0, the payload's own code, or
 // 128+signal for a killed sandbox (anything else ⇒ 1).
 func waitExitCode(err error) int {
 	if err == nil {
@@ -635,8 +641,7 @@ func waitExitCode(err error) int {
 // listen(), so existence alone is not enough — poll with a real
 // connect() to avoid an ECONNREFUSED race. In-process the listener is
 // listening the moment proxy.Listen returns; this is belt-and-braces
-// parity with the Python child-process proxy (and a guard for any
-// future out-of-process backend).
+// protection for any future backend with asynchronous startup.
 func WaitForSocket(sockPath string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -680,12 +685,11 @@ func RmTreeWritable(path string) {
 	// WalkDir visits a directory before reading it, so each entry is
 	// chmod'd (+0700) via its pinned fd exactly when its parent listed
 	// it — a 0000 dir is openable by the time we descend into it, like
-	// python's top-down os.walk chmod loop.
+	// a top-down permission-repair pass.
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil || p == path {
 			// Unreadable/vanished entries are skipped; the root itself is
-			// 0700 by construction and never chmod'd (python's os.walk
-			// chmods only the listed CHILDREN).
+			// 0700 by construction and never chmod'd.
 			return nil
 		}
 		fd, err := syscall.Open(p, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)

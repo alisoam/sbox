@@ -1,10 +1,6 @@
-// Package seccomp implements sbox's seccomp deny-list: the hand-typed
-// syscall-number tables (SECCOMP_SYSCALLS), the AUDIT_ARCH map, the cBPF
-// compiler (build_seccomp_bpf) and the launch-time self-probe
-// (seccomp_selfprobe). A faithful port of sbox.py's seccomp layer — the
-// filter bytes are byte-identical (pinned by a differential test against
-// the Python) because bwrap consumes them verbatim via
-// --add-seccomp-fd/--seccomp.
+// Package seccomp implements the syscall deny-list, cBPF compiler and
+// launch-time self-probe. bwrap consumes the compiled bytes through
+// --add-seccomp-fd or --seccomp.
 //
 // Model (deny-list, fail-closed):
 //
@@ -12,8 +8,7 @@
 //     before exec'ing the payload (--add-seccomp-fd, --seccomp on older
 //     bwrap) — after its own namespace setup, before the payload's first
 //     instruction: the bridge, the command and all descendants inherit
-//     it. Installing from a helper INSIDE the sandbox (the previous
-//     design) had a pre-filter window and failed open without python3.
+//     it. An in-sandbox installer would leave a pre-filter execution window.
 //   - Namespaces cannot hide kernel attack surface: io_uring_*,
 //     bpf/perf_event_open/userfaultfd, the un-namespaced keyring,
 //     namespace syscalls (unshare/setns/clone3/clone+CLONE_NEWUSER),
@@ -37,8 +32,8 @@
 //     kernel, so only the low words are compared.
 //   - The tables are hand-typed: a wrong number fails SILENTLY (the
 //     filter loads and denies the wrong syscall). Three pins: the
-//     cross-check test against kernel headers/scmp_sys_resolver/
-//     ausyscall, the differential test against sbox.py, and SelfProbe —
+//     cross-checks against kernel headers/ausyscall, reviewed golden fixtures
+//     and interpreter cases, and SelfProbe —
 //     which re-checks on EVERY launch, host-side, that the compiled
 //     filter denies what it claims (unshare(0) once shipped with
 //     ioctl's number).
@@ -51,17 +46,13 @@ import (
 	"runtime"
 )
 
-// ErrNoTable mirrors build_seccomp_bpf's None return: no syscall table
-// for the machine. The caller dies (fail-closed: running without the
-// filter would allow everything the list denies; --no-seccomp is the
-// explicit opt-out) — with its own message naming platform.machine().
+// ErrNoTable means this architecture has no supported syscall table. The
+// launcher must fail closed unless --no-seccomp was explicitly selected.
 var ErrNoTable = errors.New("no seccomp syscall table for this machine")
 
-// Syscalls are the native syscall numbers per machine (x86_64, aarch64;
-// riscv64 shares the asm-generic aarch64 table). Hand-typed — copy
-// entry-by-entry from sbox.py; a wrong number silently denies the wrong
-// syscall. tests/test_seccomp.py cross-checks every entry against kernel
-// headers / scmp_sys_resolver / ausyscall: extend it when editing this.
+// Syscalls are native syscall numbers for x86_64, aarch64 and riscv64.
+// A wrong number silently denies the wrong syscall. Extend the kernel-header,
+// interpreter and golden tests whenever this table changes.
 var Syscalls = map[string]map[string]uint32{
 	"x86_64": {
 		"ioctl": 16, "clone": 56, "socket": 41, "syslog": 103, "ptrace": 101,
@@ -96,7 +87,7 @@ var Syscalls = map[string]map[string]uint32{
 	},
 }
 
-// riscv64 shares the asm-generic aarch64 table (same alias as sbox.py).
+// riscv64 shares the asm-generic aarch64 table.
 func init() {
 	Syscalls["riscv64"] = Syscalls["aarch64"]
 }
@@ -174,8 +165,7 @@ func Machine(machine string) string {
 	return machine
 }
 
-// insn is one emitted instruction before label resolution:
-// [code, k, jt_label_or_None, jf_label_or_None] in the Python builder.
+// insn is one emitted instruction before resolving symbolic jump labels.
 type insn struct {
 	code uint16
 	k    uint32
@@ -183,13 +173,9 @@ type insn struct {
 	jf   string
 }
 
-// BuildBPF compiles the deny-list into a cBPF program for
-// prctl(PR_SET_SECCOMP) (build_seccomp_bpf), byte-identical to the
-// Python: instruction order, label layout and jump offsets are the spec
-// (bwrap consumes the raw bytes; a multiple of 8, no length prefix).
-// Returns ErrNoTable on unsupported architectures — the caller DIES on
-// that (fail-closed). Any other error is an internal builder bug (a
-// jump out of the cBPF 8-bit offset range).
+// BuildBPF compiles the deny-list into raw cBPF instructions: a multiple of
+// 8 bytes, with no length prefix. It returns ErrNoTable for unsupported
+// architectures, or an error for invalid jump offsets. Callers fail closed.
 func BuildBPF(machine string) ([]byte, error) {
 	machine = Machine(machine)
 	table := Syscalls[machine]

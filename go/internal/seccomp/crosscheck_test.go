@@ -1,14 +1,8 @@
 package seccomp
 
-// Cross-check the hand-typed tables against kernel-header ground truth
-// (tests/test_seccomp.py's cross-check, ported): parse __NR_<name> from
-// the installed asm/unistd_64.h headers, and, when audit-tools is
-// installed, `ausyscall <arch> --dump`. Both are best-effort: every
-// source that is not present on this machine skips (the tables are
-// additionally pinned by the differential test and the runtime probe).
-//
-// Run after editing Syscalls — a wrong number silently denies the wrong
-// syscall.
+// Cross-check hand-typed tables against installed kernel headers and ausyscall.
+// Missing reference tools skip; golden fixtures, interpreter cases and the
+// native runtime probe provide independent coverage on every test run.
 
 import (
 	"os"
@@ -27,12 +21,10 @@ var kernelHeaders = map[string][]string{
 		"/usr/include/asm/unistd_64.h",
 	},
 	"aarch64": {
-		"/usr/include/aarch64-linux-gnu/asm/unistd_64.h",
-		"/usr/include/asm/unistd_64.h",
+		"/usr/include/asm-generic/unistd.h",
 	},
 	"riscv64": {
-		"/usr/include/riscv64-linux-gnu/asm/unistd_64.h",
-		"/usr/include/asm/unistd_64.h",
+		"/usr/include/asm-generic/unistd.h",
 	},
 }
 
@@ -88,20 +80,9 @@ func TestCrossCheckAusyscall(t *testing.T) {
 			if err != nil {
 				t.Skipf("ausyscall does not know %s: %v", machine, err)
 			}
-			nums := map[string]uint32{}
-			for _, line := range strings.Split(string(out), "\n") {
-				fields := strings.Fields(line)
-				if len(fields) != 2 {
-					continue
-				}
-				n, err := strconv.ParseUint(fields[1], 10, 32)
-				if err != nil {
-					continue
-				}
-				nums[fields[0]] = uint32(n)
-			}
+			nums := parseAusyscallDump(string(out))
 			if len(nums) == 0 {
-				t.Skip("ausyscall produced no name->number rows")
+				t.Fatal("ausyscall produced no syscall rows")
 			}
 			for name, want := range Syscalls[machine] {
 				got, ok := nums[name]
@@ -114,5 +95,28 @@ func TestCrossCheckAusyscall(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ausyscall --dump emits NUMBER NAME rows beneath an architecture heading.
+func parseAusyscallDump(out string) map[string]uint32 {
+	nums := map[string]uint32{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		n, err := strconv.ParseUint(fields[0], 10, 32)
+		if err == nil {
+			nums[fields[1]] = uint32(n)
+		}
+	}
+	return nums
+}
+
+func TestParseAusyscallDump(t *testing.T) {
+	nums := parseAusyscallDump("Using x86_64 syscall table:\n0\tread\n16\tioctl\n272\tunshare\n")
+	if len(nums) != 3 || nums["ioctl"] != 16 || nums["unshare"] != 272 {
+		t.Fatalf("wrong kernel reference numbers: %v", nums)
 	}
 }

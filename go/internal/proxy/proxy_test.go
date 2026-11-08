@@ -132,15 +132,6 @@ func (o *origin) recorded() ([]byte, int) {
 	return all, o.halfClosed
 }
 
-// reset clears the record state between two runs against the same origin
-// (differential tests run each scenario through both proxies).
-func (o *origin) reset() {
-	o.mu.Lock()
-	o.got = nil
-	o.halfClosed = 0
-	o.mu.Unlock()
-}
-
 func testConfig(t *testing.T, res Resolver) Config {
 	return Config{
 		Allows: []allow.Entry{
@@ -511,8 +502,7 @@ func TestHTTPAbsoluteRefusals(t *testing.T) {
 	s := startTestProxy(t, testConfig(t, &fakeResolver{}))
 	base := fmt.Sprintf("POST http://127.0.0.1:%d/ HTTP/1.1\r\n", o.port())
 	cases := []struct{ name, headers, wantBody string }{
-		// Bodies and texts are sbox.py's exactly (verified against the
-		// reference): line_clean failure, obs-fold, token failure and
+		// Control-byte refusal, obs-fold, token validation and
 		// the Content-Length rules each have their own message.
 		{"obs-fold", "X-A: 1\r\n continuation\r\n\r\n", "obsolete line folding is not accepted\n"},
 		{"transfer-encoding", "Transfer-Encoding: chunked\r\n\r\n", "Transfer-Encoding is not supported; send Content-Length\n"},
@@ -579,7 +569,7 @@ func TestHTTPAbsoluteDetails(t *testing.T) {
 		}
 	})
 	t.Run("duplicate equal CL is refused", func(t *testing.T) {
-		// ANY second Content-Length header is ambiguous — sbox.py's rule;
+		// ANY second Content-Length header is ambiguous;
 		// equal values are the classic smuggling vector too.
 		o := startOrigin(t, "record", nil)
 		got := httpExchange(t, s, fmt.Sprintf("POST http://127.0.0.1:%d/ HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nhi", o.port()))
@@ -595,7 +585,7 @@ func TestHTTPAbsoluteDetails(t *testing.T) {
 		o := startOrigin(t, "record", nil)
 		httpExchange(t, s, fmt.Sprintf("POST http://127.0.0.1:%d/ HTTP/1.1\r\nX-A: 1\r\nContent-Length: 2\r\nX-B: 2\r\n\r\nhi", o.port()))
 		got, _ := o.recorded()
-		// forwarded verbatim in its original position, like sbox.py
+		// Forwarded verbatim in its original position.
 		if !strings.Contains(string(got), "X-A: 1\r\nContent-Length: 2\r\nX-B: 2\r\n") {
 			t.Errorf("CL position = %q", got)
 		}
@@ -603,8 +593,7 @@ func TestHTTPAbsoluteDetails(t *testing.T) {
 }
 
 // A portless CONNECT target defaults to 443, not 80 (the conventional
-// default — the traffic is virtually always TLS; sbox.py's
-// parse_hostport(target, 443)). Pinned via the 502 body, which names the
+// default — the traffic is virtually always TLS). The 502 body names the
 // attempted address.
 func TestConnectDefaultPort443(t *testing.T) {
 	s := startTestProxy(t, testConfig(t, &fakeResolver{}))
@@ -615,9 +604,8 @@ func TestConnectDefaultPort443(t *testing.T) {
 	}
 }
 
-// Scoped IPv6 literal destinations (fe80::1%zone): Python >= 3.9's
-// ip_address parses them, allowlist matching is zone-blind, and the zone
-// travels into the connect — the port must not pre-reject them as
+// Scoped IPv6 literal destinations (fe80::1%zone): allowlist matching ignores
+// the zone, which travels into the connect. The proxy must not pre-reject them as
 // invalid hostnames (the connect itself failing is fine and expected).
 func TestZoneLiteralDestination(t *testing.T) {
 	p := New(Config{
@@ -653,13 +641,16 @@ type fakeUpstream struct {
 	onConn    func(net.Conn)
 }
 
-func startFakeUpstream(t *testing.T, scheme string) *fakeUpstream {
+func startFakeUpstream(t *testing.T, scheme string, configure ...func(*fakeUpstream)) *fakeUpstream {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("upstream listen: %v", err)
 	}
 	u := &fakeUpstream{ln: ln, scheme: scheme}
+	for _, init := range configure {
+		init(u)
+	}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -819,8 +810,7 @@ func TestUpstreamHTTPChaining(t *testing.T) {
 }
 
 func TestUpstreamHTTPRefused(t *testing.T) {
-	up := startFakeUpstream(t, "http")
-	up.refuse = true
+	up := startFakeUpstream(t, "http", func(up *fakeUpstream) { up.refuse = true })
 	cfg := upstreamConfig(t, fmt.Sprintf("http://127.0.0.1:%d", up.ln.Addr().(*net.TCPAddr).Port), &fakeResolver{})
 	s := startTestProxy(t, cfg)
 	cl := dialProxy(t, s)
@@ -831,8 +821,7 @@ func TestUpstreamHTTPRefused(t *testing.T) {
 }
 
 func TestUpstreamSocks5Chaining(t *testing.T) {
-	up := startFakeUpstream(t, "socks5")
-	up.allowName = true
+	up := startFakeUpstream(t, "socks5", func(up *fakeUpstream) { up.allowName = true })
 	cfg := upstreamConfig(t, fmt.Sprintf("socks5://u:p@127.0.0.1:%d", up.ln.Addr().(*net.TCPAddr).Port), &fakeResolver{})
 	s := startTestProxy(t, cfg)
 	cl := dialProxy(t, s)
@@ -922,6 +911,14 @@ func TestUpstreamTLSInsecure(t *testing.T) {
 		if replyCode(rep) != 0 {
 			t.Fatalf("reply code = %d, want 0", replyCode(rep))
 		}
+		c, halfClose, err := New(cfg).ConnectDestination("127.0.0.1", 80)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if halfClose != nil {
+			t.Fatal("TLS upstream exposed its underlying TCP connection for half-close")
+		}
 	})
 	t.Run("verification fails closed", func(t *testing.T) {
 		cfg := upstreamConfig(t, fmt.Sprintf("https://127.0.0.1:%d", port), &fakeResolver{})
@@ -983,7 +980,7 @@ func TestSelfTest(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- pyparse ---
+// -------------------------------------------------------------- URL parser ---
 
 func TestParseHostPort(t *testing.T) {
 	cases := []struct {
@@ -1149,7 +1146,7 @@ func TestParseUpstream(t *testing.T) {
 	}
 }
 
-func TestPyUnquote(t *testing.T) {
+func TestUnquoteUserinfo(t *testing.T) {
 	cases := map[string]string{
 		"a%20b":        "a b",
 		"%C3%A9":       "é",
@@ -1161,8 +1158,8 @@ func TestPyUnquote(t *testing.T) {
 		"caf%C3%A9%80": "café\ufffd",
 	}
 	for in, want := range cases {
-		if got := pyUnquote(in); got != want {
-			t.Errorf("pyUnquote(%q) = %q, want %q", in, got, want)
+		if got := unquoteUserinfo(in); got != want {
+			t.Errorf("unquoteUserinfo(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

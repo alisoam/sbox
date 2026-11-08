@@ -1,0 +1,570 @@
+{
+  "host_port": [
+    {
+      "input": "example.com:8080",
+      "host": "example.com",
+      "port": 8080
+    },
+    {
+      "input": "example.com",
+      "host": "example.com",
+      "port": 80
+    },
+    {
+      "input": "example.com:",
+      "error": true
+    },
+    {
+      "input": "example.com:0",
+      "error": true
+    },
+    {
+      "input": "example.com:65535",
+      "host": "example.com",
+      "port": 65535
+    },
+    {
+      "input": "example.com:65536",
+      "error": true
+    },
+    {
+      "input": "example.com:+80",
+      "error": true
+    },
+    {
+      "input": ":8080",
+      "host": ":8080",
+      "port": 80
+    },
+    {
+      "input": ":0",
+      "host": ":0",
+      "port": 80
+    },
+    {
+      "input": "::1",
+      "host": ":",
+      "port": 1
+    },
+    {
+      "input": "a:b:c",
+      "error": true
+    },
+    {
+      "input": "a:",
+      "error": true
+    },
+    {
+      "input": ":",
+      "host": ":",
+      "port": 80
+    },
+    {
+      "input": "",
+      "host": "",
+      "port": 80
+    },
+    {
+      "input": "[::1]:443",
+      "host": "::1",
+      "port": 443
+    },
+    {
+      "input": "[::1]",
+      "host": "::1",
+      "port": 80
+    },
+    {
+      "input": "[::1]:",
+      "error": true
+    },
+    {
+      "input": "[::1]:0",
+      "host": "::1",
+      "port": 0
+    },
+    {
+      "input": "[::1]:abc",
+      "error": true
+    },
+    {
+      "input": "[::1]x",
+      "error": true
+    },
+    {
+      "input": "[::1]:70000",
+      "host": "::1",
+      "port": 70000
+    },
+    {
+      "input": "[bad",
+      "host": "bad",
+      "port": 80
+    },
+    {
+      "input": "[v1.x]:5",
+      "host": "v1.x",
+      "port": 5
+    },
+    {
+      "input": "[1.2.3.4]:5",
+      "host": "1.2.3.4",
+      "port": 5
+    },
+    {
+      "input": "host.example.org:443",
+      "host": "host.example.org",
+      "port": 443
+    },
+    {
+      "input": "HOST.Example.COM:80",
+      "host": "HOST.Example.COM",
+      "port": 80
+    },
+    {
+      "input": "host.:80",
+      "host": "host.",
+      "port": 80
+    },
+    {
+      "input": "host:0080",
+      "host": "host",
+      "port": 80
+    },
+    {
+      "input": "host: 80",
+      "error": true
+    },
+    {
+      "input": "host:8_0",
+      "error": true
+    }
+  ],
+  "upstream": [
+    {
+      "input": "",
+      "empty": true
+    },
+    {
+      "input": "p:3128",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 3128,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "p",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "proxy.example.com:8080",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "proxy.example.com",
+        "Port": 8080,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://p",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://p:3128",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 3128,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://p/",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://P:3128/",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 3128,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "https://p",
+      "upstream": {
+        "Scheme": "https",
+        "Host": "p",
+        "Port": 443,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "https://p:8443",
+      "upstream": {
+        "Scheme": "https",
+        "Host": "p",
+        "Port": 8443,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "socks5://p",
+      "upstream": {
+        "Scheme": "socks5",
+        "Host": "p",
+        "Port": 1080,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "socks5://p:9050",
+      "upstream": {
+        "Scheme": "socks5",
+        "Host": "p",
+        "Port": 9050,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "socks5h://p",
+      "upstream": {
+        "Scheme": "socks5",
+        "Host": "p",
+        "Port": 1080,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "socks5h://p:1080",
+      "upstream": {
+        "Scheme": "socks5",
+        "Host": "p",
+        "Port": 1080,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "socks5h://p:1081",
+      "upstream": {
+        "Scheme": "socks5",
+        "Host": "p",
+        "Port": 1081,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "gopher://p",
+      "error": true
+    },
+    {
+      "input": "gopher://p:70",
+      "error": true
+    },
+    {
+      "input": "ftp://p",
+      "error": true
+    },
+    {
+      "input": "http://u:p@p:3128",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 3128,
+        "User": "u",
+        "Pass": "p",
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://u@p",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": "u",
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://:@p",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": "",
+        "Pass": "",
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://u:@p",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": "u",
+        "Pass": "",
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://%75ser:p%40ss@p",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": "user",
+        "Pass": "p@ss",
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://u%3Ap@p",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": "u:p",
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://[::1]:9050",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "::1",
+        "Port": 9050,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://[::1]",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "::1",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "socks5://[2001:db8::1]:1080",
+      "upstream": {
+        "Scheme": "socks5",
+        "Host": "2001:db8::1",
+        "Port": 1080,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://[1.2.3.4]/",
+      "error": true
+    },
+    {
+      "input": "http://[bad/",
+      "error": true
+    },
+    {
+      "input": "http://p:0",
+      "error": true
+    },
+    {
+      "input": "http://p:65536",
+      "error": true
+    },
+    {
+      "input": "http://p:abc",
+      "error": true
+    },
+    {
+      "input": "http://p:-1",
+      "error": true
+    },
+    {
+      "input": "http://p: 80",
+      "error": true
+    },
+    {
+      "input": "http://p:+80",
+      "error": true
+    },
+    {
+      "input": "http://p:8_0",
+      "error": true
+    },
+    {
+      "input": "http://",
+      "error": true
+    },
+    {
+      "input": "http://:8080",
+      "error": true
+    },
+    {
+      "input": "://p",
+      "error": true
+    },
+    {
+      "input": "1://p",
+      "error": true
+    },
+    {
+      "input": "1http://x/",
+      "error": true
+    },
+    {
+      "input": "http://p\tx/",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "px",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": " http://p/",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://p\t/",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://p?q",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://p#f",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http://p/path;q",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "p",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "h",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "h",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "h:",
+      "upstream": {
+        "Scheme": "http",
+        "Host": "h",
+        "Port": 80,
+        "User": null,
+        "Pass": null,
+        "TLSVerify": true
+      }
+    },
+    {
+      "input": "http:p:3128",
+      "error": true
+    },
+    {
+      "input": "http://p﹫/",
+      "error": true
+    },
+    {
+      "input": "http://p／x/",
+      "error": true
+    }
+  ]
+}

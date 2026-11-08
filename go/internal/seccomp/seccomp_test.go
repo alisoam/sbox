@@ -64,7 +64,7 @@ func TestTableShape(t *testing.T) {
 
 // --- a golden cBPF interpreter: decode the emitted bytes and execute
 // them against synthetic seccomp_data, so the semantics (not just the
-// bytes) are pinned independently of the Python oracle. ---
+// bytes) are checked independently of the bytecode fixtures. ---
 
 type bpfInsn struct {
 	code uint16

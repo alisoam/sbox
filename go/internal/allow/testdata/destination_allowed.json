@@ -1,0 +1,1794 @@
+[
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "sub.example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "notexample.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "notexample.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "example.com.evil.net",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "example.com.evil.net",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "203.0.113.7",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "203.0.113.7",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "203.0.113.8",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "203.0.113.8",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "203.0.114.1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "203.0.114.1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "10.1.2.3",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "10.1.2.3",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "2001:db8::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "2001:db8::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "2001:db9::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "2001:db9::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "localhost",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com"
+    ],
+    "host": "localhost",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "notexample.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "notexample.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "example.com.evil.net",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "example.com.evil.net",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "203.0.113.7",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "203.0.113.7",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "203.0.113.8",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "203.0.113.8",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "203.0.114.1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "203.0.114.1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "10.1.2.3",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "10.1.2.3",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "2001:db8::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "2001:db8::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "2001:db9::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "2001:db9::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "localhost",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com:443"
+    ],
+    "host": "localhost",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "sub.example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name sub.example.com"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name sub.example.com"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name sub.example.com"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name sub.example.com"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "notexample.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "notexample.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "example.com.evil.net",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "example.com.evil.net",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "203.0.113.7",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "203.0.113.7",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "203.0.113.8",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "203.0.113.8",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "203.0.114.1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "203.0.114.1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "10.1.2.3",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "10.1.2.3",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "2001:db8::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "2001:db8::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "2001:db9::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "2001:db9::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "localhost",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "sub.example.com"
+    ],
+    "host": "localhost",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "sub.example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "notexample.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "notexample.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "example.com.evil.net",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "example.com.evil.net",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "203.0.113.7",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed network 203.0.113.0/24"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "203.0.113.7",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed network 203.0.113.0/24"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "203.0.113.8",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed network 203.0.113.0/24"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "203.0.113.8",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed network 203.0.113.0/24"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "203.0.114.1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "203.0.114.1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "10.1.2.3",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "10.1.2.3",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "2001:db8::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "2001:db8::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "2001:db9::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "2001:db9::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "localhost",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.0/24"
+    ],
+    "host": "localhost",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "sub.example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "notexample.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "notexample.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "example.com.evil.net",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "example.com.evil.net",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "203.0.113.7",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed network 203.0.113.7/32"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "203.0.113.7",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed network 203.0.113.7/32"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "203.0.113.8",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "203.0.113.8",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "203.0.114.1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "203.0.114.1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "10.1.2.3",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "10.1.2.3",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "2001:db8::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "2001:db8::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "2001:db9::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "2001:db9::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "localhost",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "203.0.113.7"
+    ],
+    "host": "localhost",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "sub.example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed name example.com"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "notexample.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "notexample.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "example.com.evil.net",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "example.com.evil.net",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "203.0.113.7",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "203.0.113.7",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "203.0.113.8",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "203.0.113.8",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "203.0.114.1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "203.0.114.1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "10.1.2.3",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed network 10.0.0.0/8"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "10.1.2.3",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed network 10.0.0.0/8"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "2001:db8::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "2001:db8::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "2001:db9::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "2001:db9::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "localhost",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "example.com",
+      "10.0.0.0/8"
+    ],
+    "host": "localhost",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "EXAMPLE.com.",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "sub.example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "deep.sub.example.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "notexample.com",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "notexample.com",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "example.com.evil.net",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "example.com.evil.net",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "203.0.113.7",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "203.0.113.7",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "203.0.113.8",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "203.0.113.8",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "203.0.114.1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "203.0.114.1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "10.1.2.3",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "10.1.2.3",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "2001:db8::1",
+    "port": 80,
+    "allowed": true,
+    "reason": "matches allowed network 2001:db8::/32"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "2001:db8::1",
+    "port": 443,
+    "allowed": true,
+    "reason": "matches allowed network 2001:db8::/32"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "2001:db9::1",
+    "port": 80,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "2001:db9::1",
+    "port": 443,
+    "allowed": false,
+    "reason": "IP destination not in any allowed network"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "localhost",
+    "port": 80,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  },
+  {
+    "allows": [
+      "[2001:db8::]/32"
+    ],
+    "host": "localhost",
+    "port": 443,
+    "allowed": false,
+    "reason": "hostname not on the allowlist"
+  }
+]

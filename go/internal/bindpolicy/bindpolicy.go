@@ -1,12 +1,7 @@
-// Package bindpolicy implements sbox's bind-mount policy: validation of
-// -b/-r/--bind-socket sources and the automatic cwd mount
-// (validate_bind_source, check_bind_paths, open_path_pinned, BindPinner,
-// _contains_socket), the path tables that decide what may never be bound
-// (SYSTEM_DIRS, NO_DESCEND_ROOTS, CONTROL_SOCKETS, protected_paths,
-// persistence_paths, _runtime_roots) and the $HOME persistence warnings.
-// A faithful port of sbox.py's bind-policy layer — message strings and
-// matching semantics included (pinned by the differential test against
-// the Python).
+// Package bindpolicy validates -b/-r/--bind-socket sources and the automatic
+// cwd mount, pins their descriptors, scans for sockets and warns when
+// writable binds cover host persistence paths.
+// Validation rules and mount modes are covered by native contract tests.
 //
 // Security model (fd-first, fail-closed):
 //
@@ -82,36 +77,65 @@ var SystemDirs = []string{
 // bwrap already provides a fresh, safe /proc and /dev.
 var NoDescendRoots = []string{"/proc", "/sys", "/dev"}
 
-// Covers is sbox.py's covers(): true if a is equal to or an ancestor of
-// b. Callers pass realpaths; b is compared verbatim (the "/" root quirk —
-// rstrip("/") of "/" is "", so every absolute path starts with it — is
-// part of the semantics and preserved).
+// Covers reports whether a is equal to or an ancestor of b. Callers pass
+// realpaths; b is compared verbatim and "/" covers every absolute path.
 func Covers(a, b string) bool {
 	a = strings.TrimRight(a, "/")
 	return b == a || strings.HasPrefix(b, a+"/")
 }
 
-// RealPath resolves symlinks like Python's os.path.realpath: the deepest
-// existing prefix is resolved and the missing tail appended (it never
-// fails — a not-yet-created runtime path must keep its spelling), and the
-// empty string resolves to the CURRENT DIRECTORY (CPython >= 3.13 — the
-// oracle pins this; older Pythons returned "" instead). Getwd failure
-// degrades to "" (pinned by the differential test).
+// RealPath returns an absolute path with symlinks resolved, including
+// dangling links whose targets do not exist yet. Missing components stay
+// in the result so runtime sockets can be created after validation. Resolve
+// each component before processing "..": cleaning first would make
+// "link/../file" refer to the link's parent instead of its target's parent.
+// An unavailable cwd returns "", which cannot be pinned for a bind.
 func RealPath(p string) string {
-	if p == "" {
-		if wd, err := os.Getwd(); err == nil {
-			return wd
+	if !filepath.IsAbs(p) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return ""
 		}
-		return ""
+		// Do not use Join or Abs here: both clean away symlink/.. pairs.
+		p = wd + "/" + p
 	}
-	if rp, err := filepath.EvalSymlinks(p); err == nil {
-		return filepath.Clean(rp)
+	resolved := "/"
+	pending := strings.Split(p, "/")
+	links := 0
+	for len(pending) > 0 {
+		part := pending[0]
+		pending = pending[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+		next := filepath.Join(resolved, part)
+		st, err := os.Lstat(next)
+		if err != nil || st.Mode()&os.ModeSymlink == 0 {
+			resolved = next
+			continue
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			resolved = next
+			continue
+		}
+		links++
+		if links > 255 {
+			// Keep the unresolved link in the result: pinning refuses it,
+			// and path-based mounts fail on the loop instead of mounting a
+			// lexically cleaned path that was never resolved.
+			return next + "/" + strings.Join(pending, "/")
+		}
+		if filepath.IsAbs(target) {
+			resolved = "/"
+		}
+		pending = append(strings.Split(target, "/"), pending...)
 	}
-	parent := filepath.Dir(p)
-	if parent == p {
-		return filepath.Clean(p)
-	}
-	return filepath.Join(RealPath(parent), filepath.Base(p))
+	return resolved
 }
 
 // homeDir is $HOME ("" when unset — entries that need it are dropped).
@@ -168,7 +192,7 @@ func ProtectedPaths(home string) []string {
 // RawSpellings expands $HOME-relative entries WITHOUT resolving symlinks
 // (the $HOME itself may go through one); ControlSockets() additionally
 // carries a realpath'd copy of every entry so refusal still matches when
-// the resolved bind source is compared (sbox.py's _control_sockets).
+// the resolved bind source is compared.
 type ControlSocket struct{ Path string }
 
 // controlSocketRaw is the raw table; $HOME-relative entries drop when
@@ -243,9 +267,7 @@ func expandUser(p string) (string, bool) {
 	return filepath.Join(h, p[2:]), true
 }
 
-// IsSocket reports whether path is a socket file (stat follows symlinks,
-// like sbox.py's _is_socket — a symlink TO a socket counts: it is the
-// connectable name that matters).
+// IsSocket follows symlinks: a link to a socket is a connectable name too.
 func IsSocket(path string) bool {
 	st, err := os.Stat(path)
 	return err == nil && st.Mode()&os.ModeSocket != 0

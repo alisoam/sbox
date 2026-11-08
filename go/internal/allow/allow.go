@@ -1,9 +1,5 @@
-// Package allow implements sbox's network allowlist: entry parsing
-// (parse_allow_entry), loading from -a/-A (load_allows), destination
-// matching (destination_allowed) and the resolved-address guard (bad_ip)
-// — a faithful port of sbox.py's allowlist layer, plus the !private
-// marker, single-label warning and $no_proxy handling from the current
-// spec.
+// Package allow implements network allowlist parsing, loading from -a/-A,
+// destination matching, resolved-address checks and $no_proxy routing.
 //
 // Security model (default-deny):
 //
@@ -45,7 +41,7 @@ import (
 	"strings"
 )
 
-// Entry is one parsed allow entry (sbox.py's {"kind","value","port"} dict).
+// Entry is one parsed allow entry.
 type Entry struct {
 	Kind    string // "name" (hostname, dot-boundary suffix match) or "net" (IP/CIDR)
 	Value   string // canonical form: hostname, or "a.b.c.d/nn" / "2001:db8::/nn"
@@ -174,7 +170,7 @@ func ParseAllowEntry(raw string) (Entry, error) {
 }
 
 // LoadAllows loads entries from -A files (first) and -a values (after),
-// like sbox.py's load_allows. warn receives advisory warnings (single-label
+// warn receives advisory warnings (single-label
 // entries); it may be nil. Every parse problem is an error — fail closed.
 func LoadAllows(optAllows, optFiles []string, warn func(string)) ([]Entry, error) {
 	if warn == nil {
@@ -199,7 +195,7 @@ func LoadAllows(optAllows, optFiles []string, warn func(string)) ([]Entry, error
 		}
 		for lineno, line := range strings.Split(string(data), "\n") {
 			// '#' comments and blank lines are stripped BEFORE parsing
-			// (sbox.py's load_allows does the same) — so error messages
+			// so error messages
 			// quote the entry, not the trailing comment.
 			raw := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
 			if raw == "" {
@@ -267,16 +263,14 @@ func PrivateAllowed(allows []Entry, host string, port int) bool {
 }
 
 // ValidHostname reports whether host is a well-formed lowercase hostname
-// per sbox.py's NAME_RE (the full-match form used by the proxy before it
-// hands a sandbox-supplied name to the resolver; allowlist entry parsing
-// uses the same grammar). It performs no DNS and no lowercasing.
+// before the proxy hands it to the resolver. Allowlist entry parsing uses
+// the same grammar. It performs no DNS and no lowercasing.
 func ValidHostname(host string) bool {
 	return nameRE.MatchString(host)
 }
 
-// prefixContains is Python's `addr in ip_network(...)`: v4 addresses never
-// match v6 prefixes and vice versa (IPv4-mapped destinations count as v6),
-// and zones are ignored, like ipaddress's integer __contains__.
+// prefixContains keeps IPv4 and IPv6 networks separate (mapped addresses
+// count as IPv6) and ignores zone identifiers when comparing addresses.
 func prefixContains(p netip.Prefix, a netip.Addr) bool {
 	if !p.IsValid() || !a.IsValid() {
 		return false
@@ -287,10 +281,9 @@ func prefixContains(p netip.Prefix, a netip.Addr) bool {
 	return p.Contains(a.WithZone(""))
 }
 
-// parseAddrNet is the parsing half of ip_network(host): a bare address
-// gets the full-length prefix, "addr/bits" the given length. Python
-// accepts leading zeros in the prefix length ("/08" is /8); netip does
-// not, so they are stripped. The returned address keeps its zone (if
+// parseAddrNet gives bare addresses a full-length prefix and accepts an
+// explicit length in "addr/bits". Leading zeros in the prefix length are
+// stripped ("/08" is /8). The returned address keeps its zone (if
 // any); the ok flag does NOT cover host bits — that is strictness, which
 // the caller checks on the masked prefix.
 func parseAddrNet(host string) (netip.Addr, int, bool) {
@@ -317,7 +310,7 @@ func parseAddrNet(host string) (netip.Addr, int, bool) {
 	return addr, addr.BitLen(), true
 }
 
-// widenedNetwork is ip_network(host, strict=False): the network under an
+// widenedNetwork returns the network containing an
 // address with host bits set (used only in the "refusing to widen" error).
 func widenedNetwork(host string) (netip.Prefix, bool) {
 	addr, bits, ok := parseAddrNet(host)

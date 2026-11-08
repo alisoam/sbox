@@ -17,8 +17,7 @@ func mustEntry(t *testing.T, raw string) Entry {
 	return e
 }
 
-// TestParseAllowEntryOK pins sbox.py's parse_allow_entry results (values
-// verified against the Python implementation), plus the !private marker.
+// TestParseAllowEntryOK fixes canonical entry values and the !private marker.
 func TestParseAllowEntryOK(t *testing.T) {
 	cases := []struct {
 		raw     string
@@ -44,7 +43,7 @@ func TestParseAllowEntryOK(t *testing.T) {
 		{"203.0.113.7", "net", "203.0.113.7/32", 0, false},
 		{"203.0.113.0/24", "net", "203.0.113.0/24", 0, false},
 		{"10.0.0.0/8", "net", "10.0.0.0/8", 0, false},
-		{"10.0.0.0/08", "net", "10.0.0.0/8", 0, false}, // Python takes leading-zero plens
+		{"10.0.0.0/08", "net", "10.0.0.0/8", 0, false}, // leading-zero prefix lengths are accepted
 		{"255.255.255.255/32", "net", "255.255.255.255/32", 0, false},
 		{"[2001:db8::]/32", "net", "2001:db8::/32", 0, false},
 		{"[2001:db8::]", "net", "2001:db8::/128", 0, false},
@@ -68,8 +67,7 @@ func TestParseAllowEntryOK(t *testing.T) {
 	}
 }
 
-// TestParseAllowEntryErrors pins sbox.py's exact error messages (verified
-// against the Python implementation). Fail-closed: loud, never widened.
+// TestParseAllowEntryErrors fixes diagnostics for fail-closed parsing.
 func TestParseAllowEntryErrors(t *testing.T) {
 	cases := []struct{ raw, want string }{
 		{"", "empty entry"},
@@ -88,7 +86,7 @@ func TestParseAllowEntryErrors(t *testing.T) {
 		{"::/15", "\"::/15\" is an effectively catch-all network (/15); add narrower entries or use --net for unrestricted egress"},
 		{"2001:db8::/15", "\"2001:db8::/15\": host bits set — refusing to widen to 2000::/15; write 2000::/15 instead"},
 		{"[2001:db8::1]/32", "\"[2001:db8::1]/32\": host bits set — refusing to widen to 2001:db8::/32; write 2001:db8::/32 instead"},
-		{"203.0.113.7/24", "not a valid hostname, IP or CIDR: \"203.0.113.7/24\""}, // Python quirk: host-bits message needs a digits-dots/colon host
+		{"203.0.113.7/24", "not a valid hostname, IP or CIDR: \"203.0.113.7/24\""}, // host-bits diagnostics require a digits-dots/colon host
 		{"300.1.2.3", "invalid IP/CIDR entry: \"300.1.2.3\""},
 		{"1.2.3", "invalid IP/CIDR entry: \"1.2.3\""},
 		{"010.1.2.3", "invalid IP/CIDR entry: \"010.1.2.3\""},
@@ -107,12 +105,12 @@ func TestParseAllowEntryErrors(t *testing.T) {
 		{"10.0.0.0/0x8", "not a valid hostname, IP or CIDR: \"10.0.0.0/0x8\""},
 		{":8080", "not a valid hostname, IP or CIDR: \":8080\""},
 		// !private on IP/CIDR entries is rejected loudly — the guard never
-		// applies to them (verified against sbox.py)
+		// applies to them.
 		{"[2001:db8::]/32!private", "\"[2001:db8::]/32!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"},
 		{"10.0.0.0/8!private", "\"10.0.0.0/8!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"},
 		{"1.2.3.4!private", "\"1.2.3.4!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"},
 		{"::1!private", "\"::1!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"},
-		// the catch-all check fires BEFORE the !private check (sbox.py order)
+		// the catch-all check fires BEFORE the !private check
 		{"0.0.0.0/0!private", "\"0.0.0.0/0!private\" is an effectively catch-all network (/0); add narrower entries or use --net for unrestricted egress"},
 	}
 	for _, c := range cases {
@@ -216,7 +214,7 @@ func TestDestinationAllowed(t *testing.T) {
 	}
 
 	// a hostname that looks like an IP (leading zeros) is a NAME for
-	// matching purposes, exactly like Python's ip_address() failure path
+	// matching purposes: parsing did not identify an IP literal.
 	ok, _ := DestinationAllowed(allows, "010.1.2.3", 80)
 	if ok {
 		t.Errorf("010.1.2.3 must not match 10/8 entries")

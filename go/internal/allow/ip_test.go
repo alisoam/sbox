@@ -5,11 +5,8 @@ import (
 	"testing"
 )
 
-// TestBadIPv4 and TestBadIPv6 pin bad_ip's verdicts. The expected values
-// were derived by running sbox.py's bad_ip() on CPython 3.15 (the union of
-// is_private/is_reserved/is_loopback/is_link_local/is_multicast/
-// is_unspecified plus CGNAT), so the Go port is pinned to one deterministic
-// ground truth.
+// TestBadIPv4 and TestBadIPv6 fix policy at special-use range boundaries
+// and globally reachable exceptions.
 func TestBadIPv4(t *testing.T) {
 	cases := []struct {
 		addr string
@@ -138,9 +135,31 @@ func TestBadIPInvalid(t *testing.T) {
 	}
 }
 
+// IPv4-mapped answers must receive every IPv4 guard, including CGNAT.
+// Check both sides of the range so the protection cannot silently widen.
+func TestMappedCGNAT(t *testing.T) {
+	for _, tc := range []struct {
+		address string
+		blocked bool
+	}{
+		{"::ffff:100.63.255.255", false},
+		{"::ffff:100.64.0.0", true},
+		{"::ffff:100.64.0.1", true},
+		{"::ffff:100.127.255.255", true},
+		{"::ffff:100.128.0.0", false},
+	} {
+		addr := netip.MustParseAddr(tc.address)
+		if got := BadIP(addr); got != tc.blocked {
+			t.Errorf("BadIP(%s) = %v, want %v", tc.address, got, tc.blocked)
+		}
+		if BadIP(addr) != BadIP(addr.Unmap()) {
+			t.Errorf("mapped and native CGNAT policies disagree for %s", tc.address)
+		}
+	}
+}
+
 // TestZoneEntries pins zone-scoped entries: the canonical value keeps the
-// zone like str(ip_network(...)) in Python, while matching is zone-blind
-// like ipaddress's integer __contains__.
+// zone, while network membership ignores it.
 func TestZoneEntries(t *testing.T) {
 	e := mustEntry(t, "fe80::1%eth0")
 	if e.Kind != "net" || e.Value != "fe80::1%eth0/128" {
@@ -148,7 +167,7 @@ func TestZoneEntries(t *testing.T) {
 	}
 	allows := []Entry{e}
 	if ok, _ := DestinationAllowed(allows, "fe80::1", 80); !ok {
-		t.Errorf("zone-blind matching: zone-less destination must match zoned entry (python semantics)")
+		t.Errorf("zone-blind matching: zone-less destination must match zoned entry")
 	}
 	if ok, _ := DestinationAllowed(allows, "fe80::1%other", 80); !ok {
 		t.Errorf("zone-blind matching: zoned destination must match zoned entry")

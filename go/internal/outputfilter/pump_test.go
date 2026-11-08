@@ -2,7 +2,7 @@ package outputfilter
 
 // pump.go tests against a REAL pty pair: filtered output flow, the
 // deadline-bounded drain and its flush, the EOF-during-run quirk (no
-// flush — sbox.py's master_eof corner), stdin forwarding with
+// flush), stdin forwarding with
 // backpressure (never drops), and SIGWINCH winsize forwarding via an
 // injected channel.
 
@@ -112,10 +112,8 @@ func TestPumpDrainDeadlineFlushes(t *testing.T) {
 }
 
 func TestPumpEofDuringRunSkipsFlush(t *testing.T) {
-	// EOF arrives while the pump is still in the run phase (python:
-	// master_eof inside the loop): the drain — and with it the flush —
-	// is skipped, so the held-back tail never emits. The port keeps
-	// that quirk.
+	// EOF arrives during the run phase: the drain and its flush are
+	// skipped, so an incomplete tail is dropped.
 	master, slave := requirePty(t)
 	var mu sync.Mutex
 	var out strings.Builder
@@ -235,6 +233,47 @@ func TestPumpStdinBackpressure(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if p.pendingLen() >= maxPendingInput {
 		t.Errorf("backlog did not drain: %d", p.pendingLen())
+	}
+}
+
+func TestPumpStopDuringPendingWrite(t *testing.T) {
+	// A pipe provides a deterministic full buffer: a write larger than
+	// its capacity cannot complete until this test drains the reader.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	capacity, _, errno := syscall.Syscall(syscall.SYS_FCNTL, w.Fd(), syscall.F_GETPIPE_SZ, 0)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	data := make([]byte, 2*int(capacity))
+	p := &Pump{Master: w, chunks: [][]byte{data}, total: len(data)}
+	p.space = sync.NewCond(&p.mu)
+	p.work = sync.NewCond(&p.mu)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.drainPending()
+	}()
+	// Receiving one byte proves Write has started, but leaves too little
+	// capacity for it to finish. Stop discards the queue in that window.
+	if _, err := io.ReadFull(r, make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	p.setStopped()
+	if _, err := io.ReadFull(r, make([]byte, len(data)-1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending writer did not exit after stop")
+	}
+	if got := p.pendingLen(); got != 0 {
+		t.Fatalf("stopped backlog = %d, want 0", got)
 	}
 }
 

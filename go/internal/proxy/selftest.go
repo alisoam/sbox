@@ -14,9 +14,8 @@ import (
 // SelfTest is the fail-closed gate on the REAL socket, before the
 // sandbox starts: a non-allowed destination must be refused on both
 // SOCKS5 and HTTP CONNECT (denied names are never resolved, so this
-// needs no network). errf receives the advisory note (Python's err());
-// every failure is a returned error with sbox.py's message (Python
-// die()s — the launcher prints and exits).
+// needs no external network). errf receives advisory notes. The launcher
+// reports any returned error and exits before starting the sandbox.
 func SelfTest(sockPath string, allows []allow.Entry, errf func(string)) error {
 	if errf == nil {
 		errf = func(string) {}

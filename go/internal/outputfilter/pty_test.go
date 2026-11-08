@@ -8,6 +8,7 @@ package outputfilter
 import (
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -211,10 +212,10 @@ func TestCheckStdinEarly(t *testing.T) {
 	}
 	// A hung-up tty: isatty itself fails (glibc isatty and tcgetattr
 	// are the same TCGETS ioctl), so the early check passes benignly —
-	// exactly python's observable behavior. The "is a terminal but
+	// The "is a terminal but
 	// cannot be configured" branch is a defensive race guard (a tty
 	// hanging up BETWEEN the two ioctls) that is unreachable
-	// deterministically in either implementation; the port keeps it.
+	// deterministically here.
 	m2, s2, err := OpenPty()
 	if err != nil {
 		t.Skipf("no ptmx: %v", err)
@@ -273,4 +274,35 @@ func TestEmitFilteredBestEffort(t *testing.T) {
 	w.Close()
 	_ = r.Close()
 	EmitFiltered("still supervising\n") // must not panic
+}
+
+func TestEmitClosedStandardPipe(t *testing.T) {
+	if stream := os.Getenv("SBOX_TEST_CLOSED_OUTPUT"); stream != "" {
+		if stream == "stdout" {
+			EmitFiltered("still supervising\n")
+		} else {
+			EmitDiag("still supervising\n")
+		}
+		os.Exit(0)
+	}
+	for _, stream := range []string{"stdout", "stderr"} {
+		t.Run(stream, func(t *testing.T) {
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Close()
+			defer w.Close()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestEmitClosedStandardPipe$")
+			cmd.Env = append(os.Environ(), "SBOX_TEST_CLOSED_OUTPUT="+stream)
+			if stream == "stdout" {
+				cmd.Stdout = w
+			} else {
+				cmd.Stderr = w
+			}
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("closed %s pipe killed the emitter: %v", stream, err)
+			}
+		})
+	}
 }

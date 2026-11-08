@@ -12,8 +12,7 @@ import (
 // scanNoteKey is the once-a-day stamp for the scan's gave-up note.
 const scanNoteKey = "socket-scan-gaveup.note"
 
-// DefaultScanDepth and DefaultScanEntries are sbox.py's
-// _contains_socket caps: depth- and entry-capped so huge trees stay
+// DefaultScanDepth and DefaultScanEntries bound the scan so huge trees stay
 // cheap. Directories count toward the entry cap too (a directory-heavy
 // tree — node_modules at depth <= 3 — must not turn the cap into "walk
 // everything").
@@ -22,7 +21,7 @@ const (
 	DefaultScanEntries = 5000
 )
 
-// ContainsSocket is sbox.py's _contains_socket: a bounded scan for a
+// ContainsSocket performs a bounded scan for a
 // Unix socket inside root, returning the first socket path found ("" if
 // none). Binding a directory that contains a socket usually means
 // binding a control socket we simply do not know by name.
@@ -66,9 +65,8 @@ func ContainsSocket(root string, shown string, verbose bool, warn func(string)) 
 	found := ""
 
 	// visit lists one directory's entries (counted, socket-checked) and
-	// recurses into subdirectories whose depth is still under the cap —
-	// os.walk's `dirnames[:] = []` pruning, exactly: a directory AT the
-	// depth cap still has its entries counted, it is just not descended
+	// recurses into subdirectories whose depth is still under the cap.
+	// A directory AT the depth cap still has its entries counted, but is not descended
 	// into. Returns false when the walk is done (socket found or cap).
 	var visit func(dirpath string) bool
 	visit = func(dirpath string) bool {
@@ -91,11 +89,11 @@ func ContainsSocket(root string, shown string, verbose bool, warn func(string)) 
 		}
 		for _, e := range entries {
 			if !e.IsDir() {
-				continue // symlinked dirs are not followed (os.walk default)
+				continue // symlinked dirs are not followed
 			}
 			child := filepath.Join(dirpath, e.Name())
-			// os.walk's prune: a directory AT the depth cap is still
-			// yielded (its entries counted above) but not descended
+			// A directory AT the depth cap still has its entries counted,
+			// but is not descended
 			// into — so stop at children deeper than the cap.
 			if strings.Count(child[len(root):], "/") > DefaultScanDepth {
 				continue

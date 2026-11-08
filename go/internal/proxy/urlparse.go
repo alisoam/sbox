@@ -10,28 +10,15 @@ import (
 	"unicode/utf8"
 )
 
-// This file ports the pieces of Python's stdlib that sbox.py's proxy leans
-// on — urllib.parse.urlsplit (via parts.hostname/.port/.username) for
-// absolute-form targets and --upstream URLs, urllib.parse.unquote for
-// upstream userinfo, and int()'s forgiving syntax where it gates a port —
-// because Go's net/url accepts and rejects a different set of URLs
-// (embedded credentials, empty schemes, NFKC look-alikes, ...). Behavior
-// is observable — a URL Python proxies and Go rejects is a sandboxed
-// client's broken download — so the port is quirk-faithful and pinned by
-// the differential tests against sbox.py.
-//
-// Known delta, deliberate: Python's int() accepts non-ASCII decimal digits
-// ("host:٤٤٣" is port 443 there). ASCII-only is the fail-closed choice.
+// URL parsing preserves sbox's accepted input forms while rejecting ambiguous
+// delimiters and non-ASCII ports. Upstream userinfo is percent-decoded as UTF-8.
+// net/url uses different acceptance rules, so the parser is explicit here.
 
-// errURL is the urlsplit ValueError analog. The message text never
-// reaches users (both call sites collapse it to a fixed message); only
-// error-ness is observable.
+// URL errors are replaced by fixed client-facing messages at the call sites.
 var errURL = errors.New("invalid URL")
 
-// SplitURL is the observable subset of urllib.parse.urlsplit's result:
-// scheme, netloc, path and query (fragments are dropped — sbox.py never
-// reads them). Hostname/Port/Username/Password mirror the SplitResult
-// properties, including their ValueError-raising port access.
+// SplitURL holds the scheme, authority, path and query. Fragments are ignored.
+// Hostname, Port, Username and Password interpret the authority on demand.
 type SplitURL struct {
 	Scheme string
 	Netloc string
@@ -39,19 +26,19 @@ type SplitURL struct {
 	Query  string
 }
 
-// URLSplit ports urllib.parse._urlsplit (CPython 3.15):
+// URLSplit applies these normalization and validation rules:
 //
 //   - leading C0-and-space is stripped, but NOT trailing (some apps rely
 //     on it — WHATWG strips both);
-//   - tab/CR/LF are removed EVERYWHERE (bpo-43882);
+//   - tab/CR/LF are removed EVERYWHERE;
 //   - a scheme must start with an ASCII letter and consist of ASCII
 //     letters, digits, '+', '-' and '.', and is lowercased;
 //   - a netloc (after "//") runs to the first of "/?#";
 //   - mismatched brackets, an IPv4 literal in brackets and garbage in
-//     brackets are ValueErrors ("Invalid IPv6 URL", ...); bracketed hosts
+//     brackets are errors; bracketed hosts
 //     must be valid IPv6 (or IPvFuture v<hex>.<...>);
 //   - a netloc containing characters that NFKC-normalize into "/?#@:"
-//     (fullwidth slashes, small commercial at, ...) is a ValueError —
+//     (fullwidth slashes, small commercial at, ...) is an error —
 //     spoofed delimiters;
 //   - query splits at the first "?", after the fragment was cut.
 func URLSplit(url string) (SplitURL, error) {
@@ -79,7 +66,7 @@ func URLSplit(url string) (SplitURL, error) {
 			}
 		}
 	}
-	// fragment first (sbox.py never looks at it), then query
+	// Remove the fragment before splitting the query.
 	if i := strings.IndexByte(url, '#'); i >= 0 {
 		url = url[:i]
 	}
@@ -144,8 +131,7 @@ func checkBracketedNetloc(netloc string) error {
 var ipvFutureRE = regexp.MustCompile(`^[vV][a-fA-F0-9]+\..+$`)
 
 // nfkcDangerous are the code points whose NFKC normalization contains one
-// of "/?#@:" (generated from CPython's unicodedata; stable across
-// Unicode versions for these): fullwidth forms, small-form punctuation,
+// of "/?#@:": fullwidth forms, small-form punctuation,
 // "a/c"-style abbreviations and the double-question-mark ligatures. A
 // netloc containing any of them could smuggle a delimiter past the
 // parser after normalization.
@@ -185,10 +171,8 @@ func checkNetloc(netloc string) error {
 	return nil
 }
 
-// Hostname mirrors SplitResult.hostname: the host part after the last
-// "@", brackets stripped for IPv6, lowercased. "" when there is no
-// netloc (Python's None is only the empty string everywhere sbox reads
-// it).
+// Hostname returns the lowercased host after the last "@", with IPv6 brackets
+// removed. An absent authority produces an empty hostname.
 func (s SplitURL) Hostname() string {
 	hostinfo := s.Netloc
 	if i := strings.LastIndexByte(s.Netloc, '@'); i >= 0 {
@@ -202,16 +186,14 @@ func (s SplitURL) Hostname() string {
 	return strings.ToLower(host)
 }
 
-// Port mirrors SplitResult.port: (value, present, error). Present is
-// false for "no port given" (Python None); a present port that is not a
-// Python-int, or lies outside 0..65535, is an error. Port 0 parses fine
-// here — sbox.py's own callers then reject it as out of range.
+// Port returns (value, present, error). Empty ports are absent; a present
+// port must be ASCII decimal in 0..65535. Callers reject port zero before dial.
 func (s SplitURL) Port() (int, bool, error) {
 	port := s.portString()
 	if port == "" {
 		return 0, false, nil
 	}
-	n, ok := pyPortParse(port)
+	n, ok := parseURLPort(port)
 	if !ok || n > 65535 {
 		return 0, false, errURL
 	}
@@ -232,9 +214,8 @@ func (s SplitURL) portString() string {
 	return p
 }
 
-// Username mirrors SplitResult.username: everything before the first ":"
-// of the userinfo (still percent-encoded; sbox.py unquotes later), or ""
-// when the netloc carries no "@".
+// Username returns userinfo before its first colon, still percent-encoded,
+// or an absent value when the authority has no "@".
 func (s SplitURL) Username() (string, bool) {
 	userinfo, hasAt := cutLast(s.Netloc, "@")
 	if !hasAt {
@@ -244,7 +225,7 @@ func (s SplitURL) Username() (string, bool) {
 	return u, true
 }
 
-// Password mirrors SplitResult.password: the part after the first ":" of
+// Password returns the part after the first ":" of
 // the userinfo, absent when the userinfo has no ":".
 func (s SplitURL) Password() (string, bool) {
 	userinfo, hasAt := cutLast(s.Netloc, "@")
@@ -255,7 +236,7 @@ func (s SplitURL) Password() (string, bool) {
 	return p, hasColon
 }
 
-// cutLast is str.rpartition(sep): (head, found).
+// cutLast returns the portion preceding the last separator, if present.
 func cutLast(s, sep string) (string, bool) {
 	i := strings.LastIndex(s, sep)
 	if i < 0 {
@@ -264,13 +245,9 @@ func cutLast(s, sep string) (string, bool) {
 	return s[:i], true
 }
 
-// pyPortParse mirrors SplitResult.port's strictness (CPython 3.15): a
-// run of ASCII digits — leading zeros included, but no sign, no
-// whitespace, no underscores, no non-ASCII decimal digits — then the
-// 0..65535 range check. (Bare int() is more forgiving, but urlsplit's
-// port property is what --upstream URLs and absolute-form targets go
-// through, and it is not.)
-func pyPortParse(s string) (int, bool) {
+// parseURLPort accepts ASCII decimal digits, including leading zeros, but
+// rejects signs, whitespace, underscores and non-ASCII decimal digits.
+func parseURLPort(s string) (int, bool) {
 	if s == "" || len(s) > 20 {
 		return 0, false
 	}
@@ -325,11 +302,9 @@ func allSchemeChars(s string) bool {
 	return true
 }
 
-// pyUnquote mirrors urllib.parse.unquote: percent-escapes decode to
-// bytes, then the whole thing decodes as UTF-8 with every invalid byte
-// replaced by U+FFFD (one per byte, like CPython's decoder). "+" is NOT a
-// space (that is unquote_plus).
-func pyUnquote(s string) string {
+// unquoteUserinfo decodes percent-escapes as UTF-8, replacing each invalid
+// byte with U+FFFD. A plus sign remains a plus sign.
+func unquoteUserinfo(s string) string {
 	if !strings.Contains(s, "%") {
 		return s
 	}
@@ -343,7 +318,7 @@ func pyUnquote(s string) string {
 		raw = append(raw, s[i])
 	}
 	// UTF-8 decode with per-byte replacement (strings.ToValidUTF8 would
-	// coalesce runs of bad bytes; Python replaces each byte separately).
+	// coalesce runs of bad bytes instead of replacing each byte separately).
 	var b strings.Builder
 	for i := 0; i < len(raw); {
 		r, size := utf8.DecodeRune(raw[i:])
@@ -373,12 +348,9 @@ func hexVal(c byte) byte {
 	}
 }
 
-// ParseHostPort ports sbox.py's parse_hostport (CONNECT targets), quirks
-// included: "[v6]" and "[v6]:port" (the port parses with Python's int()
-// rules), bare "host:port" split at the LAST colon with the port gated by
-// isdigit+range, and — quirk for quirk — a target with no colon (or an
-// empty host side, like ":80") parses as (target, defaultPort) rather
-// than failing.
+// ParseHostPort accepts bracketed IPv6 or a host with a trailing port.
+// A missing port uses defaultPort. Legacy empty-host and missing-bracket
+// spellings are retained here, then rejected by destination validation.
 func ParseHostPort(target string, defaultPort int) (string, int, error) {
 	if strings.HasPrefix(target, "[") {
 		host, rest, _ := strings.Cut(target[1:], "]")
@@ -388,10 +360,8 @@ func ParseHostPort(target string, defaultPort int) (string, int, error) {
 		if rest == "" {
 			return host, defaultPort, nil
 		}
-		// Python: port = int(rest[1:]) — bare int(). ASCII-digits-only is
-		// the fail-closed subset (bare int() also accepts "+80" and
-		// non-ASCII decimal digits; nothing legitimate sends those).
-		n, ok := pyPortParse(rest[1:])
+		// Port syntax is limited to ASCII decimal digits.
+		n, ok := parseURLPort(rest[1:])
 		if !ok {
 			return "", 0, errParseTarget
 		}
@@ -412,6 +382,5 @@ func ParseHostPort(target string, defaultPort int) (string, int, error) {
 	return target[:i], n, nil
 }
 
-// errParseTarget: Python raises ValueError(target) here; callers only
-// check error-ness (the client sees a fixed "bad CONNECT target" body).
+// Callers report a fixed "bad CONNECT target" body on parse failure.
 var errParseTarget = errors.New("bad CONNECT target")

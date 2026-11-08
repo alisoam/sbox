@@ -16,7 +16,7 @@ import (
 const oPath = 0x200000
 
 // OpenPathPinned O_PATH|O_NOFOLLOW-opens path, refusing ANY symlink on
-// the way (sbox.py's open_path_pinned). The input is always a RealPath()
+// the way. The input is always a RealPath()
 // result (fully resolved — every caller resolves first), so a symlink met
 // anywhere in the walk — intermediate component or final object — means
 // the tree changed since realpath() ran: a concurrent sandbox swapped a
@@ -26,8 +26,7 @@ const oPath = 0x200000
 // cannot be steered through a re-resolved path. There is deliberately NO
 // "expected inode" parameter and no symlink resolution: validation
 // happens fd-FIRST (the caller fstat()s and scans this very fd), so the
-// fd you validated is the fd you mount. Errors are the die()-equivalents
-// the Python produces (the caller propagates them fatally); the original
+// fd you validated is the fd you mount. Errors are fatal to the launch; the original
 // errno is wrapped for ENOENT recognition (Pin's allowMissing).
 func OpenPathPinned(path string) (*os.File, error) {
 	if !filepath.IsAbs(path) {
@@ -111,7 +110,7 @@ func fstatMode(fd int) (uint32, error) {
 	return st.Mode, nil
 }
 
-// errnoText is an errno's strerror (Python's e.strerror — capitalized,
+// errnoText is an errno's strerror (capitalized,
 // like libc's strerror: "No such file or directory").
 func errnoText(err error) string {
 	s := err.Error()
@@ -122,7 +121,7 @@ func errnoText(err error) string {
 }
 
 // Pinner pins validated bind sources as O_PATH fds for bwrap
-// --[ro-]bind-fd (sbox.py's BindPinner). One fd per source path (cached):
+// --[ro-]bind-fd. One fd per source path (cached):
 // the cwd mount and a -b of the same path share the object validation
 // checked. With enabled=false (old bwrap, or capabilities unknown) every
 // Pin is a no-op returning nil, and callers emit the plain path-based

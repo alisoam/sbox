@@ -1,0 +1,468 @@
+[
+  {
+    "raw": "example.com",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "*.example.com",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "*.*.example.com",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "example.com.",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": ".example.com.",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "EXAMPLE.COM",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "localhost",
+    "entry": {
+      "kind": "name",
+      "value": "localhost",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "xn--fo-0ja.com",
+    "entry": {
+      "kind": "name",
+      "value": "xn--fo-0ja.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "_dmarc.example.com",
+    "entry": {
+      "kind": "name",
+      "value": "_dmarc.example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "sub_domain.example.com",
+    "entry": {
+      "kind": "name",
+      "value": "sub_domain.example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "example.com # comment",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "  example.com  ",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": false
+    }
+  },
+  {
+    "raw": "# only",
+    "error": "empty entry"
+  },
+  {
+    "raw": "",
+    "error": "empty entry"
+  },
+  {
+    "raw": "   ",
+    "error": "empty entry"
+  },
+  {
+    "raw": "exämple.com",
+    "error": "not a valid hostname, IP or CIDR: \"exämple.com\""
+  },
+  {
+    "raw": "-bad.example.com",
+    "error": "not a valid hostname, IP or CIDR: \"-bad.example.com\""
+  },
+  {
+    "raw": "bad-.example.com",
+    "error": "not a valid hostname, IP or CIDR: \"bad-.example.com\""
+  },
+  {
+    "raw": "ex..ample",
+    "error": "not a valid hostname, IP or CIDR: \"ex..ample\""
+  },
+  {
+    "raw": "example.*.com",
+    "error": "wildcards are only supported as a leading '*.' in \"example.*.com\""
+  },
+  {
+    "raw": "*",
+    "error": "wildcard-only entry would allow everything; use --net for unrestricted egress"
+  },
+  {
+    "raw": "*.",
+    "error": "empty entry"
+  },
+  {
+    "raw": "*.*",
+    "error": "wildcard-only entry would allow everything; use --net for unrestricted egress"
+  },
+  {
+    "raw": ".",
+    "error": "empty entry"
+  },
+  {
+    "raw": "example.com:443",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": 443,
+      "private": false
+    }
+  },
+  {
+    "raw": "example.com:0",
+    "error": "bad port in allow entry \"example.com:0\" (expected 1-65535)"
+  },
+  {
+    "raw": "example.com:99999",
+    "error": "bad port in allow entry \"example.com:99999\" (expected 1-65535)"
+  },
+  {
+    "raw": "example.com:443x",
+    "error": "bad port in allow entry \"example.com:443x\" (expected host:port)"
+  },
+  {
+    "raw": "example.com:443:80",
+    "error": "invalid IP/CIDR entry: \"example.com:443:80\""
+  },
+  {
+    "raw": "example.com:",
+    "error": "bad port in allow entry \"example.com:\" (expected host:port)"
+  },
+  {
+    "raw": "203.0.113.7",
+    "entry": {
+      "kind": "net",
+      "value": "203.0.113.7/32",
+      "port": null
+    }
+  },
+  {
+    "raw": "203.0.113.0/24",
+    "entry": {
+      "kind": "net",
+      "value": "203.0.113.0/24",
+      "port": null
+    }
+  },
+  {
+    "raw": "10.0.0.0/8",
+    "entry": {
+      "kind": "net",
+      "value": "10.0.0.0/8",
+      "port": null
+    }
+  },
+  {
+    "raw": "10.0.0.0/08",
+    "entry": {
+      "kind": "net",
+      "value": "10.0.0.0/8",
+      "port": null
+    }
+  },
+  {
+    "raw": "255.255.255.255/32",
+    "entry": {
+      "kind": "net",
+      "value": "255.255.255.255/32",
+      "port": null
+    }
+  },
+  {
+    "raw": "203.0.113.7/24",
+    "error": "not a valid hostname, IP or CIDR: \"203.0.113.7/24\""
+  },
+  {
+    "raw": "300.1.2.3",
+    "error": "invalid IP/CIDR entry: \"300.1.2.3\""
+  },
+  {
+    "raw": "1.2.3",
+    "error": "invalid IP/CIDR entry: \"1.2.3\""
+  },
+  {
+    "raw": "010.1.2.3",
+    "error": "invalid IP/CIDR entry: \"010.1.2.3\""
+  },
+  {
+    "raw": "10.0.0.0/33",
+    "error": "not a valid hostname, IP or CIDR: \"10.0.0.0/33\""
+  },
+  {
+    "raw": "10.0.0.0/0x8",
+    "error": "not a valid hostname, IP or CIDR: \"10.0.0.0/0x8\""
+  },
+  {
+    "raw": "0.0.0.0/0",
+    "error": "\"0.0.0.0/0\" is an effectively catch-all network (/0); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "0.0.0.0/1",
+    "error": "\"0.0.0.0/1\" is an effectively catch-all network (/1); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "128.0.0.0/1",
+    "error": "\"128.0.0.0/1\" is an effectively catch-all network (/1); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "10.0.0.0/7",
+    "error": "\"10.0.0.0/7\" is an effectively catch-all network (/7); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "240.0.0.0/4",
+    "error": "\"240.0.0.0/4\" is an effectively catch-all network (/4); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "[2001:db8::]/32",
+    "entry": {
+      "kind": "net",
+      "value": "2001:db8::/32",
+      "port": null
+    }
+  },
+  {
+    "raw": "[2001:db8::]",
+    "entry": {
+      "kind": "net",
+      "value": "2001:db8::/128",
+      "port": null
+    }
+  },
+  {
+    "raw": "[2001:db8::]:443",
+    "entry": {
+      "kind": "net",
+      "value": "2001:db8::/128",
+      "port": 443
+    }
+  },
+  {
+    "raw": "2001:db8::/32",
+    "entry": {
+      "kind": "net",
+      "value": "2001:db8::/32",
+      "port": null
+    }
+  },
+  {
+    "raw": "[2001:DB8::]/32",
+    "entry": {
+      "kind": "net",
+      "value": "2001:db8::/32",
+      "port": null
+    }
+  },
+  {
+    "raw": "a::b",
+    "entry": {
+      "kind": "net",
+      "value": "a::b/128",
+      "port": null
+    }
+  },
+  {
+    "raw": "2001:db8::",
+    "entry": {
+      "kind": "net",
+      "value": "2001:db8::/128",
+      "port": null
+    }
+  },
+  {
+    "raw": "[notv6]",
+    "error": "malformed IPv6 entry: \"[notv6]\""
+  },
+  {
+    "raw": "[1.2.3.4]",
+    "error": "malformed IPv6 entry: \"[1.2.3.4]\""
+  },
+  {
+    "raw": "[2001:db8::/33]",
+    "error": "malformed IPv6 entry: \"[2001:db8::/33]\""
+  },
+  {
+    "raw": "[2001:db8::1]/32",
+    "error": "\"[2001:db8::1]/32\": host bits set — refusing to widen to 2001:db8::/32; write 2001:db8::/32 instead"
+  },
+  {
+    "raw": "::/0",
+    "error": "\"::/0\" is an effectively catch-all network (/0); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "::/15",
+    "error": "\"::/15\" is an effectively catch-all network (/15); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "2001:db8::/15",
+    "error": "\"2001:db8::/15\": host bits set — refusing to widen to 2000::/15; write 2000::/15 instead"
+  },
+  {
+    "raw": "::1",
+    "entry": {
+      "kind": "net",
+      "value": "::1/128",
+      "port": null
+    }
+  },
+  {
+    "raw": "::1/128",
+    "entry": {
+      "kind": "net",
+      "value": "::1/128",
+      "port": null
+    }
+  },
+  {
+    "raw": "64:ff9b::/96",
+    "entry": {
+      "kind": "net",
+      "value": "64:ff9b::/96",
+      "port": null
+    }
+  },
+  {
+    "raw": "2002::/16",
+    "entry": {
+      "kind": "net",
+      "value": "2002::/16",
+      "port": null
+    }
+  },
+  {
+    "raw": ":8080",
+    "error": "not a valid hostname, IP or CIDR: \":8080\""
+  },
+  {
+    "raw": "http://example.com",
+    "error": "bad port in allow entry \"http://example.com\" (expected host:port)"
+  },
+  {
+    "raw": "example.com/",
+    "error": "not a valid hostname, IP or CIDR: \"example.com/\""
+  },
+  {
+    "raw": "example.com!private",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": true
+    }
+  },
+  {
+    "raw": "*.example.com!private",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": true
+    }
+  },
+  {
+    "raw": "example.com:443!private",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": 443,
+      "private": true
+    }
+  },
+  {
+    "raw": "EXAMPLE.COM!PRIVATE",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": true
+    }
+  },
+  {
+    "raw": "example.com !private",
+    "entry": {
+      "kind": "name",
+      "value": "example.com",
+      "port": null,
+      "private": true
+    }
+  },
+  {
+    "raw": "10.0.0.0/8!private",
+    "error": "\"10.0.0.0/8!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"
+  },
+  {
+    "raw": "1.2.3.4!private",
+    "error": "\"1.2.3.4!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"
+  },
+  {
+    "raw": "[2001:db8::]/32!private",
+    "error": "\"[2001:db8::]/32!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"
+  },
+  {
+    "raw": "::1!private",
+    "error": "\"::1!private\": !private only applies to name entries — literal IP/CIDR entries bypass the private-range guard anyway"
+  },
+  {
+    "raw": "0.0.0.0/0!private",
+    "error": "\"0.0.0.0/0!private\" is an effectively catch-all network (/0); add narrower entries or use --net for unrestricted egress"
+  },
+  {
+    "raw": "example.com!PRIVATE!",
+    "error": "not a valid hostname, IP or CIDR: \"example.com!PRIVATE!\""
+  }
+]

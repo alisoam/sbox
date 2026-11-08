@@ -1,19 +1,16 @@
-// CPython-faithful UTF-8 pieces: the incremental decoder with
-// errors='replace' (codecs.getincrementaldecoder("utf-8")) and the
-// isprintable() counterpart. Both are pinned byte-exact by the
-// differential test against the live interpreter.
+// Incremental UTF-8 decoding with one replacement per maximal invalid
+// subpart, and the printable-character predicate. Golden streams pin
+// malformed-byte behavior independently of terminal escape parsing.
 
 package outputfilter
 
 import "unicode"
 
-// replacement is U+FFFD REPLACEMENT CHARACTER, what CPython's
-// errors='replace' emits per maximal invalid subpart.
+// replacement is U+FFFD REPLACEMENT CHARACTER for each maximal invalid subpart.
 const replacement = '\ufffd'
 
-// incDecoder is CPython's incremental UTF-8 decoder with
-// errors='replace'. The exact replacement algorithm matters — the
-// sanitizer's output is byte-compared against sbox.py's:
+// incDecoder preserves incomplete UTF-8 sequences between calls and
+// replaces malformed input according to these rules:
 //
 //   - an invalid LEADING byte (stray continuation 0x80..0xBF, overlong
 //     lead 0xC0/0xC1, out-of-range 0xF5..0xFF) costs one U+FFFD each;
@@ -103,7 +100,7 @@ func (d *incDecoder) decode(data []byte, final bool) string {
 // seqShape returns the sequence length and the legal second-byte range
 // for a valid lead byte (b0 in 0xC2..0xF4). The narrowed ranges kill
 // overlong encodings (E0, F0), surrogates (ED) and > U+10FFFF (F4)
-// exactly like CPython's decoder.
+// without consuming a later valid starter.
 func seqShape(b0 byte) (n int, lo, hi byte) {
 	switch {
 	case b0 < 0xE0:
@@ -141,7 +138,7 @@ func decodeSeq(b0 byte, rest []byte) rune {
 	return r
 }
 
-// isPrintable is Python's str.isprintable() for a single character:
+// isPrintable accepts a single printable character:
 // everything except the Unicode categories Other (C*) and Separator
 // (Z*), with the ASCII space (U+0020) as the one spacing exception —
 // the same category set Go's unicode.IsPrint implements (L, M, N, P, S

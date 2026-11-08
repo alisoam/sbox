@@ -1,4 +1,4 @@
-// Package bwrap is the ONLY bwrap-aware code in the port: the caps
+// Package bwrap is the ONLY bwrap-aware backend code: the caps
 // probe (parse_bwrap_caps/bwrap_caps — capability probing, not version
 // parsing, because distro backports of individual options exist and
 // upstream version numbers lie), the unprivileged-userns probe
@@ -39,7 +39,7 @@ import (
 	"sbox/internal/seccomp"
 )
 
-// probeTimeout bounds both subprocess probes (python: 10 s).
+// probeTimeout bounds both subprocess probes.
 const probeTimeout = 10 * time.Second
 
 // Provider renders sandbox.Specs as bwrap argv. Construct with New,
@@ -48,7 +48,7 @@ const probeTimeout = 10 * time.Second
 type Provider struct {
 	Bin    string // bwrap binary; "" ⇒ "bwrap" (resolved via $PATH)
 	Caps   sandbox.Caps
-	probed bool // Probe() caches, like sbox.py's _BWRAP_CAPS global
+	probed bool // Probe caches the capability result
 }
 
 // the bwrap backend is A sandbox.Provider (asserted here; cmd/sbox
@@ -71,7 +71,7 @@ func (p *Provider) bin() string {
 // hasOpt is parse_bwrap_caps' `has()`: opt must appear as a whole word
 // (no [A-Za-z0-9_] or '-' adjacent — "--bind-fd" must not match inside
 // "--bind-fds" nor "--ro-bind-fd" inside "--ro-bind-fds"). Bytes >=
-// 0x80 count as word characters: python's \w is unicode-aware, and a
+// 0x80 count as word characters: a
 // non-ASCII letter glued to the option is as much a non-boundary as an
 // ASCII one.
 func hasOpt(text, opt string) bool {
@@ -115,15 +115,9 @@ func ParseCaps(text string) sandbox.Caps {
 	}
 }
 
-// Probe runs `bwrap --help` and fills the provider's caps (bwrap_caps).
-// CACHED: a second call returns the first result without re-running
-// bwrap --help (python's _BWRAP_CAPS global; a test shim on $PATH must
-// never be asked twice). On failure the caps stay unknown (zero) — the
-// error is INFORMATIONAL: python's bwrap_caps swallows OSError and the
-// launcher keeps going, so the caller must not die on it either; the
-// degradation is loud where it can be (path-based binds, the TOCTOU
-// note) and seccomp, which cannot degrade, fails closed in Build with
-// python's exact message.
+// Probe caches bwrap --help capabilities. A test shim on PATH must never be
+// asked twice. Failures leave conservative zero caps; the supervisor reports
+// degradation and refuses to launch if required seccomp support is unavailable.
 func (p *Provider) Probe() (sandbox.Caps, error) {
 	if p.probed {
 		return p.Caps, nil
@@ -184,8 +178,7 @@ func (p *Provider) runOk(argv []string) bool {
 // extraFDBase is the first child fd os/exec assigns to ExtraFiles.
 const extraFDBase = 3
 
-// Build renders the spec as a bwrap Launch. Argv layout mirrors
-// sbox.py's run_sandbox assembly: [seccomp flag+fd] + [userns
+// Build renders the spec as a bwrap Launch: [seccomp flag+fd] + [userns
 // hardening] + the fixed skeleton (--unshare-all … --clearenv) + one
 // flag group per Spec op; the caller appends "--" and the payload.
 // Fail-closed by contract: seccomp bytes with a backend that cannot

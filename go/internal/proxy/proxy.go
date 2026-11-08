@@ -1,11 +1,8 @@
 // Package proxy is sbox's host-side egress gate: a SOCKS5 + HTTP-CONNECT
-// server on a 0600 Unix socket (bound into the sandbox at /run/proxy.sock
-// and bridged to 127.0.0.1:1080 by the in-sandbox script). It is a
-// faithful port of sbox.py's Proxy — with the two structural deltas of
-// the Go port: it runs as a goroutine in the launcher process (no re-exec,
-// no proxy.json — credentials never touch disk), and the plain-http
-// forward implements the one-shot semantics of the current spec (see
-// httpAbsolute).
+// server on a 0600 Unix socket, bound into the sandbox at /run/proxy.sock
+// and bridged to 127.0.0.1:1080. It runs in the launcher process, keeping
+// upstream credentials in memory. Plain HTTP forwards exactly one request
+// per connection (see httpAbsolute).
 //
 // Security model (default-deny), in this order:
 //
@@ -22,12 +19,6 @@
 //     redacted, X-Sbox-Error values sanitized to one printable line.
 //   - $no_proxy only picks the ROUTE (direct vs upstream) when chaining;
 //     the allowlist applies either way.
-//
-// The wire behavior — SOCKS5 reply codes, HTTP error bodies and headers,
-// upstream handshake bytes, log line shapes — is byte-faithful to
-// sbox.py where the two share a spec, and pinned by the differential
-// cross-check tests against the Python oracle (see *_diff_test.go) for
-// as long as sbox.py still exists.
 package proxy
 
 import (
@@ -47,7 +38,7 @@ import (
 )
 
 // DestinationError is a denial/connection failure; Rep is the SOCKS5
-// reply code the caller reports (Python's DestinationError).
+// reply code the caller reports.
 type DestinationError struct {
 	Rep int
 	Why string
@@ -73,15 +64,14 @@ type Resolver interface {
 	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
-// Config mirrors sbox.py's proxy.json dict, plus the Go port's
-// injectables (log sink, resolver).
+// Config holds the destination policy, upstream route, logger and resolver.
 type Config struct {
 	Allows   []allow.Entry
 	Upstream *Upstream      // nil: direct egress
 	NoProxy  *allow.NoProxy // nil: never bypass the upstream
 	Verbose  bool
 	// Logf receives the "sbox-proxy: ..." decision log when Verbose.
-	// nil logs to stderr, like the Python process did.
+	// nil logs to stderr.
 	Logf func(msg string)
 	// Resolver resolves allowed hostnames host-side. nil uses
 	// net.DefaultResolver (pure Go: CGO_ENABLED=0 builds do not consult
@@ -89,9 +79,10 @@ type Config struct {
 	Resolver Resolver
 }
 
-// Proxy is one configured proxy instance (Python's Proxy object).
+// Proxy is one configured proxy instance.
 type Proxy struct {
-	cfg Config
+	cfg    Config
+	closed chan struct{}
 }
 
 // New returns a Proxy for cfg.
@@ -106,19 +97,16 @@ func New(cfg Config) *Proxy {
 	if cfg.Resolver == nil {
 		cfg.Resolver = net.DefaultResolver
 	}
-	return &Proxy{cfg: cfg}
+	return &Proxy{cfg: cfg, closed: make(chan struct{})}
 }
 
 func (p *Proxy) logf(format string, args ...any) {
 	p.cfg.Logf(fmt.Sprintf(format, args...))
 }
 
-// ServeConn handles one client connection: one byte of protocol
-// auto-detection (0x05 ⇒ SOCKS5, anything else ⇒ HTTP), then the
-// protocol handler. Python's Proxy.handle. A panicking handler is
-// contained (recovered and logged when verbose) — like asyncio's
-// except Exception in handle(): one bad connection must not take the
-// in-process proxy (and with it the launcher) down.
+// ServeConn detects SOCKS5 (first byte 0x05) or HTTP and dispatches the
+// connection. A panicking handler is recovered and logged when verbose;
+// one malformed connection must not terminate the launcher.
 func (p *Proxy) ServeConn(c net.Conn) {
 	defer c.Close()
 	defer func() {
@@ -140,11 +128,8 @@ func (p *Proxy) ServeConn(c net.Conn) {
 	}
 }
 
-// Server is the listening proxy: a 0600 Unix socket and one goroutine
-// per connection. It replaces sbox.py's --_proxy re-exec process (whose
-// death took every connection with it — Close reproduces that here: it
-// tears the live connections down instead of waiting on them forever;
-// the proxy has no idle timeouts by design).
+// Server listens on a 0600 Unix socket with one goroutine per connection.
+// Close cancels forwarding and closes clients before waiting for handlers.
 type Server struct {
 	ln        net.Listener
 	p         *Proxy
@@ -197,12 +182,12 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// Close stops the listener, tears down the in-flight connections (a
-// wedged client must not wedge teardown — the Python proxy died with the
-// launcher, connections included) and waits for the handlers to finish.
+// Close stops the listener, cancels forwarding and closes client connections,
+// then waits for handlers to finish.
 func (s *Server) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		close(s.p.closed)
 		err = s.ln.Close()
 		s.mu.Lock()
 		for c := range s.conns {
@@ -270,7 +255,7 @@ func (p *Proxy) socks5(c net.Conn, lr *lineReader) {
 		if _, err := io.ReadFull(lr, b); err != nil {
 			return
 		}
-		for _, ch := range b { // must decode as ASCII, like Python's
+		for _, ch := range b { // SOCKS domain names must be ASCII.
 			if ch >= 0x80 {
 				return
 			}
@@ -323,7 +308,7 @@ func (p *Proxy) http(c net.Conn, lr *lineReader, first byte) {
 	if err != nil {
 		return // oversized request line: dropped like any other garbage
 	}
-	// sbox.py's _line_clean on the request line: a control byte here is
+	// A control byte in the request line is
 	// never a valid request (and would be forwarded inside the target).
 	if !lineClean(line) {
 		httpError(c, 400, "bad request line\n", "")
@@ -380,11 +365,11 @@ func (p *Proxy) httpConnect(c net.Conn, lr *lineReader, target string) {
 	tunnel(c, lr, dest)
 }
 
-// hopHeaders is sbox.py's `drop` set EXACTLY: hop-by-hop headers describe
+// hopHeaders lists headers that describe
 // the client's relationship to the PROXY, not to the origin. Host is
 // rewritten from the checked URL and emitted first. Content-Length is NOT
 // here — the client's (validated, single) CL header is forwarded in place
-// like Python; Transfer-Encoding never gets this far (refused at parse).
+// unchanged; Transfer-Encoding is refused while parsing.
 var hopHeaders = map[string]bool{
 	"proxy-connection":    true,
 	"proxy-authorization": true,
@@ -396,27 +381,26 @@ var hopHeaders = map[string]bool{
 	"host":                true, // rewritten from the checked URL, emitted first
 }
 
-// httpAbsolute is the one-shot plain-http forward (the current spec's
-// upgrade of sbox.py's older forwarding mode): exactly ONE request goes
+// httpAbsolute forwards plain HTTP: exactly ONE request goes
 // upstream per connection —
 //
 //   - the Host header is REWRITTEN from the checked URL (userinfo in
 //     the netloc must not reach the origin) and emitted FIRST;
 //   - header names must be RFC 9110 tokens; obs-fold continuation lines
 //     are refused;
-//   - Transfer-Encoding is refused; only an unambiguous Content-Length
-//     body (all values equal) is forwarded;
+//   - Transfer-Encoding and duplicate Content-Length headers are refused;
+//     only one unambiguous Content-Length body is forwarded;
 //   - after the body, the origin socket is half-closed
 //     (TCPConn.CloseWrite) — a pipelined second request from the
 //     sandboxed client can never smuggle its own Host upstream. TLS
-//     upstreams cannot half-close (documented exception, as in sbox.py).
+//     upstreams cannot half-close.
 func (p *Proxy) httpAbsolute(c net.Conn, lr *lineReader, method, target string) {
 	sp, err := URLSplit(target)
 	host := sp.Hostname()
-	// SplitURL.Port mirrors urlsplit's port property: it errors exactly
-	// where Python's parts.port raises (non-numeric, out of range).
+	// SplitURL.Port validates the URL port: it reports an error
+	// for non-numeric or out-of-range values.
 	// ":0" parses fine HERE and dies in ConnectDestination as a 502,
-	// like sbox.py — ":0 is NOT 80".
+	// rather than silently becoming port 80.
 	port, hasPort, portErr := sp.Port()
 	if !hasPort {
 		port = 80
@@ -467,11 +451,11 @@ func (p *Proxy) httpAbsolute(c net.Conn, lr *lineReader, method, target string) 
 			return
 		}
 		if lname == "content-length" {
-			n, ok := pyDigits(value)
+			n, ok := parseContentLength(value)
 			if !ok || contentLength != -1 {
 				// duplicate/ambiguous CL is the classic smuggling vector
 				// (ANY second Content-Length header is refused, even an
-				// identical one — sbox.py's rule)
+				// identical one)
 				httpError(c, 400, "ambiguous Content-Length\n", "")
 				return
 			}
@@ -518,18 +502,63 @@ func (p *Proxy) httpAbsolute(c net.Conn, lr *lineReader, method, target string) 
 	if _, err := dest.Write([]byte(head.String())); err != nil {
 		return
 	}
-	if contentLength > 0 {
-		_, _ = io.CopyN(dest, lr, contentLength) // exactly the declared body
-	}
-	if halfClose != nil {
-		_ = halfClose.CloseWrite() // half-close; TLS upstreams: nil, documented
-	}
-	_, _ = io.Copy(c, dest) // the single response streams back unchanged
+	forwardRequest(c, lr, dest, halfClose, max(contentLength, 0), p.closed)
 }
 
-// pyDigits parses a run of ASCII digits (Python int()'s observable
-// behavior for the values we accept; leading zeros fine, nothing else).
-func pyDigits(s string) (int64, bool) {
+// forwardRequest streams the response while uploading exactly the declared
+// body. In particular, an origin's 100 Continue or early rejection must not
+// wait for a body the client has not sent. Completion of the response closes
+// both connections and joins the upload goroutine, even if the client stalls.
+func forwardRequest(c net.Conn, body io.Reader, dest net.Conn, halfClose *net.TCPConn,
+	n int64, closed <-chan struct{}) {
+	uploadDone := make(chan error, 1)
+	responseDone := make(chan struct{}, 1)
+	go func() {
+		_, err := io.CopyN(dest, body, n)
+		if halfClose != nil {
+			// The origin may have already sent and closed its response.
+			// A failed half-close must not discard those readable bytes.
+			_ = halfClose.CloseWrite()
+		}
+		uploadDone <- err
+	}()
+	go func() {
+		_, _ = io.Copy(c, dest)
+		responseDone <- struct{}{}
+	}()
+	select {
+	case err := <-uploadDone:
+		if err != nil && halfClose == nil {
+			// TLS cannot delimit an incomplete upload with a half-close.
+			// Close the transport, but still drain any buffered response
+			// before closing the client connection.
+			_ = dest.Close()
+		}
+		// A complete body (including a client half-close) still needs its
+		// response. Bytes following the declared body are never forwarded.
+		select {
+		case <-responseDone:
+		case <-closed:
+			_ = c.Close()
+			_ = dest.Close()
+			<-responseDone
+		}
+		_ = c.Close()
+		_ = dest.Close()
+	case <-responseDone:
+		_ = c.Close()
+		_ = dest.Close()
+		<-uploadDone
+	case <-closed:
+		_ = c.Close()
+		_ = dest.Close()
+		<-uploadDone
+		<-responseDone
+	}
+}
+
+// parseContentLength accepts up to 18 ASCII digits, including leading zeros.
+func parseContentLength(s string) (int64, bool) {
 	if s == "" || len(s) > 18 {
 		return 0, false
 	}
@@ -561,7 +590,7 @@ func isToken(s string) bool {
 	return true
 }
 
-// lineClean is sbox.py's _line_clean: true when a request/header line
+// lineClean reports whether a request/header line
 // holds no control bytes besides the optional CR of its final CRLF (tabs
 // pass — legal in field values); DEL is refused with the rest. A bare \r
 // anywhere else would be forwarded inside a header value, where it can
@@ -579,9 +608,7 @@ func lineClean(line string) bool {
 
 // hostHeader renders the forwarded Host header from the checked URL:
 // IPv6 literals get their brackets back, the port is omitted exactly
-// when it is the scheme default (80) — sbox.py's synthesis rules, now
-// applied to every forwarded request (the rewrite), not just missing
-// Host headers.
+// when it is the scheme default (80). Every request gets a rewritten Host.
 func hostHeader(host string, port int) string {
 	switch {
 	case strings.Contains(host, ":"): // IPv6 literal needs its brackets back
@@ -629,7 +656,7 @@ func sanitizeReason(reason string) string {
 
 // ---------------------------------------------------------------- tunnel ---
 
-// tunnel is sbox.py's _tunnel: a bidirectional copy that tears both
+// tunnel is a bidirectional copy that tears both
 // directions down as soon as one ends — no half-close, no lingering.
 func tunnel(c net.Conn, cr io.Reader, dest net.Conn) {
 	done := make(chan struct{}, 2)
@@ -658,9 +685,8 @@ func (p *Proxy) ConnectDestination(host string, port int) (net.Conn, *net.TCPCon
 		return nil, nil, &DestinationError{repGeneral, fmt.Sprintf("invalid port %d", port)}
 	}
 	h := strings.ToLower(strings.TrimRight(host, "."))
-	// netip parses scoped literals ("fe80::1%eth0") — Python ≥3.9's
-	// ip_address does too, net matching is zone-blind there, and the zone
-	// travels into the connect; keep that behavior.
+	// Scoped literals ("fe80::1%eth0") retain their zone for connect;
+	// network matching ignores the zone.
 	addr, addrErr := netip.ParseAddr(h)
 	if addrErr != nil && !hostnameOK(h) {
 		// %q: hostnames come from the sandbox and may contain control
@@ -720,9 +746,8 @@ func (p *Proxy) ConnectDestination(host string, port int) (net.Conn, *net.TCPCon
 		fmt.Sprintf("connect to %s:%d failed: %s", h, port, last)}
 }
 
-// hostnameOK gates resolver input: sbox.py's NAME_RE plus the length
-// rules getaddrinfo enforces (total ≤ 253, labels ≤ 63) — checked here
-// for a clean client error instead of a resolver exception.
+// hostnameOK validates resolver input: hostname grammar, total length ≤ 253,
+// and labels ≤ 63 bytes. Invalid input never reaches the resolver.
 func hostnameOK(h string) bool {
 	if !allow.ValidHostname(h) || len(h) > 253 {
 		return false
@@ -777,7 +802,7 @@ func (p *Proxy) resolveFiltered(host string, port int) ([]netip.Addr, error) {
 
 // -------------------------------------------------------------- plumbing ---
 
-// lineReader reads \n-terminated lines with asyncio's 64 KiB cap: a
+// lineReader reads \n-terminated lines with a 64 KiB cap: a
 // line longer than the limit aborts the connection (the client is not
 // a well-behaved HTTP/SOCKS peer). Buffered bytes beyond the current
 // line stay available — the tunnel must see them.
@@ -795,7 +820,7 @@ const maxLine = 64 * 1024
 var errLineTooLong = errors.New("line too long")
 
 // readLine returns the next line INCLUDING its terminator; at EOF it
-// returns the partial tail (like StreamReader.readline). errLineTooLong
+// returns the partial tail. errLineTooLong
 // means: give up on this connection silently.
 func (lr *lineReader) readLine() (string, error) {
 	if lr.eof {

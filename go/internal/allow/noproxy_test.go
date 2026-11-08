@@ -17,15 +17,14 @@ func TestParseNoProxy(t *testing.T) {
 	for _, n := range np.Nets {
 		got = append(got, n.String())
 	}
-	// CIDRs are supported and normalized (strict=False: host bits masked),
-	// verified against sbox.py's parse_no_proxy.
+	// CIDRs are supported and normalized with host bits masked.
 	if want := []string{"::1/128", "10.0.0.0/8", "10.1.2.3/32"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Nets = %q, want %q", got, want)
 	}
 }
 
 func TestParseNoProxySeparatorsAndStripping(t *testing.T) {
-	// whitespace separates entries too (Python splits on [,\s]+)
+	// whitespace separates entries too
 	if want := []string{"a.com", "b.com", "corp.example"}; !reflect.DeepEqual(ParseNoProxy("a.com b.com\tcorp.example").Names, want) {
 		t.Errorf("whitespace split: Names = %q", ParseNoProxy("a.com b.com\tcorp.example").Names)
 	}
@@ -36,13 +35,12 @@ func TestParseNoProxySeparatorsAndStripping(t *testing.T) {
 	if want := []string{"example.com"}; !reflect.DeepEqual(ParseNoProxy("*.example.com").Names, want) {
 		t.Errorf("leading *.: Names = %q", ParseNoProxy("*.example.com").Names)
 	}
-	// "10.0.0.5/8" widens to 10.0.0.0/8 (strict=False)
+	// "10.0.0.5/8" widens to 10.0.0.0/8 (host bits masked)
 	if np := ParseNoProxy("10.0.0.5/8"); len(np.Nets) != 1 || np.Nets[0].String() != "10.0.0.0/8" {
 		t.Errorf("widen: Nets = %q", np.Nets)
 	}
 	// invalid entries are dropped, never kept as dead name entries; junk
-	// with spaces splits into single labels that ARE valid names (Python
-	// keeps them too: ['not', 'a', 'valid']).
+	// with spaces splits into valid single-label names.
 	np := ParseNoProxy("not a valid host!!, 10.0.0.0/8?")
 	if want := []string{"not", "a", "valid"}; !reflect.DeepEqual(np.Names, want) {
 		t.Errorf("junk drop: Names = %q, want %q", np.Names, want)
@@ -80,14 +78,13 @@ func TestNoProxyMatches(t *testing.T) {
 		{"sub.corp.example", true},
 		{"other.example", false},
 		// IP-literal hosts are matched against IP/CIDR entries only —
-		// ip-ness comes from PARSING the host (sbox.py's no_proxy_matches
-		// has no caller-supplied literal flag), so "10.0.0.5" matches net
+		// parsing the host decides its kind, so "10.0.0.5" matches net
 		// entries no matter how the caller classified it.
 		{"10.0.0.5", true},
 		{"10.0.0.6", false},
 		{"2001:db8::1", true},
 		{"2001:db8::2", false},
-		// CIDR entries match IP-literal destinations (sbox.py supports them)
+		// CIDR entries match IP-literal destinations
 		{"172.16.3.4", true},
 		{"172.20.9.9", true},
 		{"172.32.0.1", false},

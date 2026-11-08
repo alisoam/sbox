@@ -1,5 +1,5 @@
 // Package outputfilter is the --filter-output half of the launcher
-// (sbox.py's "output filter" section): the host-side pty whose slave is
+// with a host-side pty whose slave is
 // the sandbox's ONLY stdio (the real host terminal fd never enters the
 // sandbox), and the stateful allowlist sanitizer every byte read from
 // the master passes before it reaches the host terminal.
@@ -12,7 +12,7 @@
 // characters deceive. --new-session (always on) blocks TIOCSTI input
 // injection; this is the output-side counterpart.
 //
-// The sanitizer is a byte-exact port of sbox.py's OutputSanitizer:
+// The sanitizer allows only:
 // printable text, \n/\r/\t and SGR color/style sequences (parameter
 // string [0-9;]{0,64}, no mode 8) pass; everything else — OSC/DCS/APC/
 // PM/SOS strings, non-SGR CSI (cursor movement, screen clears, device
@@ -21,8 +21,7 @@
 // selector characters — is DROPPED, never rewritten. A C0 control
 // interleaved inside a pending CSI/ESC sequence is EXECUTED, not
 // swallowed. Decoding is stateful (incremental UTF-8, errors replaced —
-// CPython's exact replacement algorithm, pinned by the differential
-// test), so multibyte characters split across read() boundaries
+// maximal invalid subsequences replaced once), so characters split across read() boundaries
 // survive, and filtering is split-invariant: chunked delivery filters
 // identically in both strict_cr modes, including the strict-mode \r
 // one-character lookahead held across feed() boundaries.
@@ -54,7 +53,7 @@ const maxPendingSeq = 4096
 
 // Filter states: plain text, after ESC, ESC + intermediates, inside
 // CSI, inside a string (OSC/DCS/APC/PM/SOS), and the ESC seen inside
-// one. (sbox.py's _F_* constants.)
+// one.
 type filterState int
 
 const (
@@ -72,7 +71,7 @@ const (
 const stringOpeners = "]P_^X"
 
 // charAllowed is the allowlist for a plain (non-escape) character:
-// printable text only (sbox.py's _char_allowed). \n \r \t are handled
+// printable text only. \n \r \t are handled
 // by the caller; everything refused here is dropped — remaining C0
 // controls, DEL, C1 controls (U+0080..U+009F, including the
 // single-character CSI U+009B and OSC U+009D), bidi overrides,
@@ -83,10 +82,8 @@ const stringOpeners = "]P_^X"
 // soft hyphen, ...). C1 bytes are NOT interpreted as sequence
 // initiators — they never start a valid UTF-8 escape.
 //
-// The final line is Python's str.isprintable(): letters, marks, numbers
-// punctuation, symbols and the ASCII space — Go's unicode.IsPrint is
-// the same category set (drift, if any, is caught by the differential
-// test against the live CPython).
+// Printable categories are letters, marks, numbers, punctuation,
+// symbols and ASCII space. The Go toolchain supplies the Unicode table.
 func charAllowed(ch rune) bool {
 	o := uint32(ch)
 	if o < 0x20 || (o >= 0x7F && o <= 0x9F) {
@@ -121,7 +118,7 @@ func charAllowed(ch rune) bool {
 }
 
 // sgrConceals reports whether an SGR parameter string sets mode 8
-// (conceal/invisible) — sbox.py's _sgr_conceals. 38/48 (extended fg/bg
+// (conceal/invisible). 38/48 (extended fg/bg
 // color) take subparameters — '38;5;8' selects color index 8, not
 // conceal — so their arguments are skipped, walking the string exactly
 // like a terminal does. Unknown extended forms degrade to scanning
@@ -169,8 +166,7 @@ func stripLeadingZeros(p string) string {
 	return p[i:]
 }
 
-// sgrParamsOK is the whole SGR validity check (sbox.py's SGR_PARAMS_RE
-// fullmatch): the parameter string between "\x1b[" and the final byte
+// sgrParamsOK checks the parameter string between "\x1b[" and the final byte:
 // must be digits and semicolons, at most 64 chars. Every other CSI
 // body (private markers like '?', intermediates, ':' subparameters)
 // fails it and is dropped.
@@ -188,7 +184,7 @@ func sgrParamsOK(params string) bool {
 }
 
 // Sanitizer is the stateful allowlist filter for sandbox terminal
-// output (sbox.py's OutputSanitizer). Feed takes raw bytes read from
+// output. Feed takes raw bytes read from
 // the pty master and returns the text that is safe to show on the host
 // terminal. Decoding is stateful (incremental UTF-8, errors replaced),
 // so multibyte characters split across read() boundaries survive; a

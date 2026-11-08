@@ -15,16 +15,16 @@ import (
 )
 
 // ConnectTimeout bounds TCP connects AND the upstream handshake (TLS +
-// CONNECT/RFC 1929 exchange) — sbox.py's CONNECT_TIMEOUT, one deadline
+// CONNECT/RFC 1929 exchange), using one deadline
 // for the whole chained setup.
 const ConnectTimeout = 15 * time.Second
 
-// upstreamSchemes is sbox.py's UPSTREAM_SCHEMES (socks5h included; it is
+// upstreamSchemes includes socks5h, which is
 // normalized to socks5 at parse time because resolution stays on our
-// side, keeping the allowlist and the private-IP guard in force).
+// side, keeping the allowlist and the private-IP guard in force.
 const upstreamSchemes = "http, https, socks5, socks5h"
 
-// Upstream is one parsed --upstream URL (Python's parse_upstream dict):
+// Upstream is one parsed --upstream URL:
 // scheme http/https/socks5 (socks5h normalized), host, port (explicit or
 // scheme default), optional percent-decoded credentials and the TLS
 // verification flag. The zero value is not valid; use ParseUpstream.
@@ -43,10 +43,8 @@ func (u *Upstream) Redacted() string {
 	return fmt.Sprintf("%s://%s", u.Scheme, net.JoinHostPort(u.Host, strconv.Itoa(u.Port)))
 }
 
-// ParseUpstream ports sbox.py's parse_upstream. raw == "" means "no
-// upstream" → (nil, nil). A URL without "://" is http://-prefixed. Every
-// failure is an error whose text mirrors the Python die() message
-// (minus the "sbox: " prefix the launcher adds).
+// ParseUpstream parses an upstream URL. An empty URL disables chaining;
+// URLs without "://" use HTTP. Credentials are removed from error messages.
 func ParseUpstream(raw string, insecure bool) (*Upstream, error) {
 	if raw == "" {
 		return nil, nil
@@ -104,11 +102,11 @@ func ParseUpstream(raw string, insecure bool) (*Upstream, error) {
 		u.Scheme = "socks5"
 	}
 	if user, ok := sp.Username(); ok {
-		dec := pyUnquote(user)
+		dec := unquoteUserinfo(user)
 		u.User = &dec
 	}
 	if pass, ok := sp.Password(); ok {
-		dec := pyUnquote(pass)
+		dec := unquoteUserinfo(pass)
 		u.Pass = &dec
 	}
 	return u, nil
@@ -117,7 +115,7 @@ func ParseUpstream(raw string, insecure bool) (*Upstream, error) {
 var redactRE = regexp.MustCompile(`//[^/?#]*@`)
 
 // RedactUserinfo removes any userinfo (user[:pass]@) from the URL's
-// authority — sbox.py's redact_userinfo, count=1.
+// authority, leaving the rest unchanged.
 func RedactUserinfo(url string) string {
 	if loc := redactRE.FindStringIndex(url); loc != nil {
 		return url[:loc[0]] + "//" + url[loc[1]:]
@@ -131,11 +129,10 @@ func RedactUserinfo(url string) string {
 // (with Basic auth when credentials are configured); socks5 upstreams
 // the full RFC 1928/1929 exchange. The returned *net.TCPConn (when
 // non-nil) supports CloseWrite for the one-shot HTTP forward; TLS
-// upstreams cannot half-close (documented exception, same as sbox.py).
+// upstreams cannot half-close.
 func (p *Proxy) openUpstream(destIP string, destPort int) (net.Conn, *net.TCPConn, error) {
 	u := p.cfg.Upstream
-	// One budget for dial + TLS + CONNECT/RFC 1929 exchange — sbox.py
-	// wraps the whole handshake in wait_for(CONNECT_TIMEOUT); a silent
+	// One budget covers dial, TLS and CONNECT/RFC 1929 exchange; a silent
 	// upstream must not wedge a connection goroutine forever.
 	deadline := time.Now().Add(ConnectTimeout)
 	d := &net.Dialer{Deadline: deadline}
@@ -180,8 +177,23 @@ func (p *Proxy) openUpstream(destIP string, destPort int) (net.Conn, *net.TCPCon
 		return nil, nil, hsErr
 	}
 	_ = conn.SetDeadline(time.Time{}) // the tunnel itself is unbounded
-	return conn, raw, nil
+	// Keep bytes read beyond the handshake: a server-first protocol can
+	// send its greeting in the same read as the final CONNECT reply.
+	tunnel := &bufferedConn{Conn: conn, reader: br}
+	if u.Scheme == "https" {
+		// Closing the underlying TCP write side would truncate the TLS
+		// transport without a close-notify. TLS tunnels stay fully open.
+		return tunnel, nil, nil
+	}
+	return tunnel, raw, nil
 }
+
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) { return c.reader.Read(b) }
 
 func (p *Proxy) upstreamErr(err error) error {
 	u := p.cfg.Upstream

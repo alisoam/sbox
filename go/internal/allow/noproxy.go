@@ -10,7 +10,7 @@ import (
 // an upstream proxy is bypassed (direct egress); the allowlist still
 // applies either way — no_proxy never widens what is reachable.
 //
-// Semantics (curl, exactly sbox.py's parse_no_proxy/no_proxy_matches):
+// Routing semantics:
 //
 //   - entries are separated by commas and/or whitespace; surrounding
 //     whitespace is ignored, empty entries dropped;
@@ -58,7 +58,7 @@ func ParseNoProxy(raw string) NoProxy {
 		if item == "" {
 			continue
 		}
-		if strings.Contains(item, "/") { // CIDR (strict=False: host bits masked)
+		if strings.Contains(item, "/") { // CIDR (host bits masked)
 			if w, ok := widenedNetwork(item); ok {
 				np.Nets = append(np.Nets, w)
 			}
@@ -78,8 +78,7 @@ func ParseNoProxy(raw string) NoProxy {
 }
 
 // Matches reports whether the destination host is covered. IP-ness is
-// decided by PARSING the host — exactly sbox.py's no_proxy_matches
-// (_parse_ip): a host that IS an IP literal is only ever matched against
+// decided by parsing the host: an IP literal is only matched against
 // IP/CIDR entries (no_proxy never triggers DNS), a hostname only against
 // name entries.
 func (np NoProxy) Matches(host string) bool {
