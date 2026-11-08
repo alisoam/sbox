@@ -559,6 +559,34 @@ def test_contains_socket_bounds():
         assert tmp in buf.getvalue(), buf.getvalue()
         assert "gave up" in buf2.getvalue(), buf2.getvalue()
 
+        # an UNREADABLE directory inside the tree (0333: no read for the
+        # owner either) is skipped with a note, never silently — a socket
+        # connectable by name could hide there. Root bypasses mode
+        # checks, so the note is only guaranteed non-root. Unlike the
+        # entry-cap note this one prints on EVERY launch (rare, and each
+        # launch binds the tree anew) under its OWN stamp: a cap note
+        # earlier in the day must not silence it.
+        if os.geteuid() != 0:
+            locked = os.path.join(tmp, "locked")
+            os.makedirs(locked, exist_ok=True)
+            os.chmod(locked, 0o333)
+            buf3 = io.StringIO()
+            buf4 = io.StringIO()
+            try:
+                sbox.mark_note_shown("socket-scan-gaveup.note")  # fresh cap stamp
+                with contextlib.redirect_stderr(buf3):
+                    sbox._contains_socket(tmp, max_depth=3, max_entries=5000,
+                                          shown=tmp)
+                with contextlib.redirect_stderr(buf4):
+                    sbox._contains_socket(tmp, max_depth=3, max_entries=5000,
+                                          shown=tmp)
+            finally:
+                os.chmod(locked, 0o755)
+            for buf in (buf3, buf4):  # EVERY time, not once a day
+                assert "could not read" in buf.getvalue() and "locked" in buf.getvalue(), \
+                    buf.getvalue()
+            assert "gave up" not in buf3.getvalue(), buf3.getvalue()
+
         # and a socket is still found under the dir-counting regime
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.bind(os.path.join(tmp, "d0", "x.sock"))
@@ -1333,8 +1361,8 @@ def test_allow_file_comments_and_blank_lines():
                      "pypi.org:443\n")
         entries = sbox.load_allows([], [path])
         assert entries == [
-            {"kind": "name", "value": "example.com", "port": None},
-            {"kind": "name", "value": "pypi.org", "port": 443},
+            {"kind": "name", "value": "example.com", "port": None, "private": False},
+            {"kind": "name", "value": "pypi.org", "port": 443, "private": False},
         ], entries
         with open(path, "a", encoding="utf-8") as fh:
             fh.write("not_a_host!!\n")
@@ -2099,6 +2127,592 @@ def test_sanitizer_boundary_equivalence():
                 out += s.feed(data[pos:pos + step])
                 pos += step
             assert out == one, strict
+
+
+def test_bind_socket_flag_resets_per_path():
+    """--bind-socket's mount flag is decided PER PATH, not per option
+    group: a plain directory (rw opt-in) used to overwrite the loop
+    variable and the NEXT path of the same --bind-socket list mounted
+    READ-WRITE too — connect-only ground (a runtime-dir directory whose
+    sockets the sandbox could replace and impersonate), reachable by
+    accident through argument ORDER. Both orderings must decide
+    independently: plain dir -> --bind, runtime dir -> --ro-bind."""
+    import tempfile as tf
+    with tf.TemporaryDirectory(prefix="sbox-test.") as base:
+        plain = os.path.join(base, "plain")
+        os.makedirs(plain)
+        xdg = os.path.join(base, "xdg")
+        app = os.path.join(xdg, "app")           # a runtime-dir DIRECTORY
+        os.makedirs(app)
+        saved = os.environ.get("XDG_RUNTIME_DIR")
+        os.environ["XDG_RUNTIME_DIR"] = xdg
+        try:
+            for paths, want in (([plain, app], ["--bind", "--ro-bind"]),
+                                ([app, plain], ["--ro-bind", "--bind"])):
+                opts = argparse.Namespace(bind=[], ro_bind=[], home=False,
+                                          bind_socket=paths)
+                binds = sbox.check_bind_paths(opts, "/home/sbox-test-user")
+                assert [f for f, _, _ in binds] == want, (paths, binds)
+            # a socket FILE after a plain dir is the same trap (ro, no fd)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.bind(os.path.join(base, "s.sock"))
+            try:
+                opts = argparse.Namespace(bind=[], ro_bind=[], home=False,
+                                          bind_socket=[plain,
+                                                       os.path.join(base, "s.sock")])
+                binds = sbox.check_bind_paths(opts, "/home/sbox-test-user")
+                assert [f for f, _, _ in binds] == ["--bind", "--ro-bind"], binds
+                # ...and the runtime-dir socket flavor: a socket INSIDE
+                # $XDG_RUNTIME_DIR after the plain dir must be --ro-bind
+                s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s2.bind(os.path.join(xdg, "app.sock"))
+                try:
+                    opts2 = argparse.Namespace(bind=[], ro_bind=[], home=False,
+                                               bind_socket=[plain, os.path.join(xdg, "app.sock")])
+                    binds2 = sbox.check_bind_paths(opts2, "/home/sbox-test-user")
+                    assert [f for f, _, _ in binds2] == ["--bind", "--ro-bind"], binds2
+                finally:
+                    s2.close()
+            finally:
+                s.close()
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_RUNTIME_DIR", None)
+            else:
+                os.environ["XDG_RUNTIME_DIR"] = saved
+
+
+def test_parse_no_proxy_and_matching():
+    """$no_proxy parsing (curl-ish): comma/space separated, leading dots,
+    case and a leading '*.' ignored; matching is exact or dot-boundary
+    suffix; '*' is the catch-all. Entries may also be IP literals or
+    CIDRs — those match literal-IP destinations ONLY (no_proxy never
+    triggers DNS), so 10.0.0.0/8 in $no_proxy actually works instead of
+    silently posing as a hostname suffix. 'host:port' spellings lose
+    their port (curl ignores no_proxy ports); entries that are neither
+    hostnames nor networks are dropped — they could never match.
+    'notexample.com' must never match 'example.com'."""
+    p = sbox.parse_no_proxy
+    assert p(None) == [] and p("") == []
+    assert p("a.example.com") == ["a.example.com"]
+    assert p(" .b.example , C.COM\t* ") == ["b.example", "c.com", "*"]
+    assert p("*.EXAMPLE.com") == ["example.com"]
+    assert p("10.0.0.0/8, h:8080, [::1]:80, ::1, 127.0.0.1, localhost") == \
+        ["10.0.0.0/8", "h", "::1", "::1", "127.0.0.1", "localhost"]
+    assert p("!!! , 1.2.3.4/99 , ") == []  # never-matchable entries dropped
+    m = sbox.no_proxy_matches
+    assert m("x.a.example.com", ["a.example.com"]) and m("a.example.com", ["a.example.com"])
+    assert not m("xa.example.com", ["a.example.com"])
+    assert not m("example.com", ["a.example.com"])
+    assert m("anything.test", ["*"])
+    assert m("Example.COM.", ["example.com"])
+    # network entries match literal IPs only, names never
+    assert m("10.1.2.3", ["10.0.0.0/8"]) and m("10.1.2.3", ["10.1.2.3"])
+    assert not m("10.1.2.4", ["10.1.2.3"])
+    assert not m("10.1.2.3", ["example.com"]) and not m("example.com", ["10.0.0.0/8"])
+
+
+def test_no_proxy_env_precedence():
+    """$no_proxy wins over $NO_PROXY — curl gives the lowercase spelling
+    precedence; the launcher used to read them in the opposite order, so
+    a deployment that set both got the wrong list."""
+    f = sbox.no_proxy_from_env
+    assert f({}) == []
+    assert f({"NO_PROXY": "a.com"}) == ["a.com"]
+    assert f({"NO_PROXY": "a.com", "no_proxy": "b.com"}) == ["b.com"]
+    assert f({"NO_PROXY": "a.com", "no_proxy": ""}) == ["a.com"]  # empty loses
+
+
+def test_parse_allow_entry_private_marker():
+    """A name entry may carry a trailing !private: that one name opts out
+    of the SSRF guard (internal mirrors resolving into RFC 1918 space on
+    the $no_proxy direct route). It is refused on IP/CIDR entries (the
+    guard never applies to those anyway) and never leaks into the value."""
+    p = sbox.parse_allow_entry
+    assert p("mirror.corp!private") == {"kind": "name", "value": "mirror.corp",
+                                        "port": None, "private": True}
+    assert p("MIRROR.Corp:8443!Private") == {"kind": "name", "value": "mirror.corp",
+                                             "port": 8443, "private": True}
+    assert p("mirror.corp") == {"kind": "name", "value": "mirror.corp",
+                                "port": None, "private": False}
+    for bad in ("10.0.0.0/8!private", "10.0.0.5!private", "[2001:db8::]/32!private"):
+        try:
+            p(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    assert sbox.private_allowed(
+        [p("mirror.corp!private")], "sub.mirror.corp", 80)
+    assert not sbox.private_allowed(
+        [p("mirror.corp!private")], "mirror.corp.evil.example", 80)
+    assert not sbox.private_allowed([p("mirror.corp")], "mirror.corp", 80)
+    # port-scoped !private only lifts the guard on that port
+    assert sbox.private_allowed([p("mirror.corp:8443!private")], "mirror.corp", 8443)
+    assert not sbox.private_allowed([p("mirror.corp:8443!private")], "mirror.corp", 80)
+
+
+def test_upstream_insecure_env_flag():
+    """$SBOX_UPSTREAM_INSECURE must be an explicit 1/true/yes/on: any
+    non-empty string used to count, so SBOX_UPSTREAM_INSECURE=0 silently
+    DISABLED TLS verification of the upstream."""
+    saved = {k: os.environ.get(k) for k in ("SBOX_UPSTREAM_INSECURE",)}
+    try:
+        for raw, want in (("1", True), ("true", True), ("YES", True), (" On ", True),
+                          ("0", False), ("false", False), ("", False), (None, False)):
+            if raw is None:
+                os.environ.pop("SBOX_UPSTREAM_INSECURE", None)
+            else:
+                os.environ["SBOX_UPSTREAM_INSECURE"] = raw
+            assert sbox._env_flag("SBOX_UPSTREAM_INSECURE") is want, raw
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_line_clean_rejects_embedded_controls():
+    """Header/request lines carry no control bytes besides the final CRLF
+    (tabs pass — legal in field values): an embedded bare \\r used to be
+    forwarded inside a header value verbatim."""
+    c = sbox._line_clean
+    assert c(b"Host: ok\r\n") and c(b"X: a\tb\n") and c(b"\r\n") and c(b"\n")
+    assert c(b"GET /a HTTP/1.1\r\n")
+    for bad in (b"X: a\rb\r\n", b"X: a\x00b\r\n", b"X: a\x7fb\r\n",
+                b"GET /a\rb HTTP/1.1\r\n", b"X: a\x1bb\n"):
+        assert not c(bad), bad
+
+
+def test_parse_hostport_connect_default():
+    """A portless CONNECT target defaults to 443 (the conventional TLS
+    port), not 80; everything else about the parse is unchanged."""
+    assert sbox.parse_hostport("example.com", 443) == ("example.com", 443)
+    assert sbox.parse_hostport("example.com:8443", 443) == ("example.com", 8443)
+    assert sbox.parse_hostport("[2001:db8::1]", 443) == ("2001:db8::1", 443)
+
+
+def test_resolve_filtered_handles_scoped_ipv6():
+    """getaddrinfo can answer scoped IPv6 names ("fe80::1%eth0");
+    ipaddress only understands those on Python >= 3.9 and sbox supports
+    3.8: the ValueError used to escape resolve_filtered, the generic
+    handler swallowed it, and the client just saw the connection drop.
+    The address PART is judged (link-local stays blocked) while the
+    scoped spelling survives for connect(). private_ok (the -a
+    name!private opt-out) keeps private answers instead."""
+    import asyncio
+
+    def fake_getaddrinfo(host, port, *a, **kw):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (host, port, 0, 1))]
+
+    saved = sbox.socket.getaddrinfo
+    sbox.socket.getaddrinfo = fake_getaddrinfo
+    try:
+        async def run(host, private_ok=False):
+            return await sbox.resolve_filtered(host, 443, private_ok)
+
+        try:
+            asyncio.run(run("fe80::1%eth0"))
+        except sbox.DestinationError as e:
+            assert e.rep == 2, e  # blocked (link-local), not a crash
+        else:
+            raise AssertionError("scoped link-local answer was not blocked")
+        infos = asyncio.run(run("2606:4700::1111%eth0"))
+        assert infos[0][4][0] == "2606:4700::1111%eth0", infos
+        # ...and with the !private opt-out the blocked answers pass too
+        infos = asyncio.run(run("fe80::1%eth0", private_ok=True))
+        assert infos[0][4][0] == "fe80::1%eth0", infos
+    finally:
+        sbox.socket.getaddrinfo = saved
+
+
+def test_sanitizer_blank_glyphs_dropped():
+    """isprintable() accepts glyphs that RENDER as empty space — Hangul
+    fillers (U+115F/U+1160/U+3164/U+FFA0) and the Braille blank (U+2800)
+    — invisible-text spoofing in the same class as zero-width chars."""
+    s = sbox.OutputSanitizer()
+    evil = "a\u115fb\u1160c\u3164d\uffa0e\u2800f\n"
+    assert s.feed(evil.encode("utf-8")) == "abcdef\n"
+    # split across chunks the fillers still drop (stateful decode)
+    s2 = sbox.OutputSanitizer()
+    assert s2.feed(evil[:4].encode()) + s2.feed(evil[4:].encode()) == "abcdef\n"
+
+
+def test_sanitizer_variation_selectors_dropped():
+    """isprintable() also accepts the Mn code points that render as
+    NOTHING: variation selectors (U+FE00..U+FE0E, U+E0100..U+E01EF) and
+    the combining grapheme joiner (U+034F) — long invisible runs can
+    smuggle hidden bytes through text that survives copy-paste. U+FE0F
+    (emoji presentation) is deliberately KEPT: it is ubiquitous,
+    renders as nothing harmful on its own, and dropping it mangles
+    ordinary emoji output."""
+    s = sbox.OutputSanitizer()
+    evil = "a\ufe00b\ufe0ec\U000e0100d\U000e01efe\u034ff\n"
+    assert s.feed(evil.encode("utf-8")) == "abcdef\n"
+    # U+FE0F rides along (emoji presentation: "OK" + VS16)
+    assert s.feed("\u2714\ufe0f\n".encode("utf-8")) == "\u2714\ufe0f\n"
+    # chunk-boundary equivalence: dropping must not depend on where the
+    # 4-byte UTF-8 sequence was split (stateful decoder + filter states)
+    raw = evil.encode("utf-8")
+    for cut in range(1, len(raw)):
+        s2 = sbox.OutputSanitizer()
+        assert s2.feed(raw[:cut]) + s2.feed(raw[cut:]) == "abcdef\n", cut
+
+
+def test_net_binds_resolver_databases():
+    """--net shares the host resolver, so its config and name databases
+    ride along: nsswitch.conf (resolution order), services
+    (getservbyname('https') used to fail) and protocols."""
+    import tempfile as tf
+    with tf.TemporaryDirectory(prefix="sbox-test.") as tmp:
+        oldcwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            opts = argparse.Namespace(net=True, home=False, gui=False, ssh_agent=False,
+                                      ro_cwd=False, bind=[], ro_bind=[], bind_socket=[])
+            bw = sbox.build_bwrap(opts, "/tmp/sbox-test-sand", "/tmp/sbox-test-sock",
+                                  "/home/sbox-test-user", [], None, None)[0]
+        finally:
+            os.chdir(oldcwd)
+    for f in ("/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/services", "/etc/protocols"):
+        # bound try-style (missing files must not fail the launch)
+        pairs = {bw[i + 1]: bw[i + 2] for i in range(len(bw) - 2)
+                 if bw[i] == "--ro-bind-try"}
+        assert pairs.get(f) == f, (f, bw)
+    assert "--share-net" in bw
+
+
+def test_emit_diag_cr_safe_for_raw_tty():
+    """Host diagnostics (err() and the piped proxy log) CR their own
+    newlines while the host tty is raw — without it every multi-line
+    note staircases once OPOST is off."""
+    import contextlib
+    import io
+    saved = sbox._raw_term
+    buf = io.StringIO()
+    try:
+        sbox._raw_term = False
+        with contextlib.redirect_stderr(buf):
+            sbox._emit_diag("a\nb\n")
+        assert buf.getvalue() == "a\nb\n", buf.getvalue()
+        buf = io.StringIO()
+        sbox._raw_term = True
+        with contextlib.redirect_stderr(buf):
+            sbox._emit_diag("a\nb\n")
+        assert buf.getvalue() == "a\r\nb\r\n", buf.getvalue()
+    finally:
+        sbox._raw_term = saved
+
+
+def test_split_argv_internal_proxy_flag():
+    """--_proxy takes THREE values (argparse nargs=3) but used to be in
+    OPTS_WITH_VALUE (one value): split_argv and argparse disagreed, and
+    the parse_cli fallback after the main() shortcut was dead and broken
+    (str ppid). The tokenizer skips nargs+1 tokens (OPTS_MULTI_VALUE);
+    main() honors ONLY the re-exec spelling (argv[0] == --_proxy) — a
+    --_proxy anywhere else is an inert hidden option, never a re-exec."""
+    assert sbox.split_argv(["--_proxy", "a", "b", "c", "--", "cmd"]) == \
+        (["--_proxy", "a", "b", "c"], ["cmd"])
+    assert sbox.split_argv(["-v", "--_proxy", "a", "b", "c", "cmd"]) == \
+        (["-v", "--_proxy", "a", "b", "c"], ["cmd"])
+    # the main() fast path keeps working for the real re-exec spelling
+    assert sbox.split_argv(["--_proxy", "a", "b", "c"]) == (["--_proxy", "a", "b", "c"], [])
+
+
+def _run_proxy_clients(cases, cfgs, origin=None):
+    """Drive the real Proxy over a unix socket (and an optional loopback
+    origin server that records what it receives). cases: list of
+    (cfg-key, request-bytes); returns list of response-byte chunks."""
+    import asyncio
+    import tempfile as tf
+    seen = {}
+
+    async def handle_origin(reader, writer):
+        try:
+            line = await reader.readline()
+            headers = []
+            cl = 0
+            while True:
+                h = await reader.readline()
+                if h in (b"\r\n", b"\n", b""):
+                    break
+                k, _, v = h.partition(b":")
+                if k.strip().lower() == b"content-length":
+                    cl = int(v.strip() or b"0")
+                headers.append(h)
+            body = await reader.readexactly(cl) if cl else b""
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                         b"Connection: close\r\n\r\nok")
+            await writer.drain()
+            # What the origin sees AFTER responding: with the one-shot
+            # half-close that must be EOF (b"") — a pipelined second
+            # request would surface here instead (request smuggling).
+            after = await reader.readline()
+            seen.setdefault("origin", []).append((line, headers, body, after))
+            seen["line"], seen["headers"], seen["after"] = line, headers, after
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def scenario():
+        out = []
+        with tf.TemporaryDirectory(prefix="sbox-test.proxy.") as d:
+            osrv = port = None
+            if origin is not None:
+                osrv = await asyncio.start_server(handle_origin, "127.0.0.1", 0)
+                port = osrv.sockets[0].getsockname()[1]
+            servers = {}
+            try:
+                for key, cfg in cfgs.items():
+                    sock = os.path.join(d, f"{key}.sock")
+                    servers[key] = (
+                        sock, await asyncio.start_unix_server(sbox.Proxy(cfg).handle,
+                                                              path=sock))
+                for key, req in cases:
+                    if callable(req):
+                        req = req(port)
+                    sock = servers[key][0]
+                    r, w = await asyncio.open_unix_connection(sock)
+                    try:
+                        w.write(req)
+                        await w.drain()
+                        out.append(await asyncio.wait_for(r.read(-1), 15))
+                    finally:
+                        w.close()
+            finally:
+                for _, srv in servers.values():
+                    srv.close()
+                if osrv is not None:
+                    osrv.close()
+            return out
+
+    resp = asyncio.run(scenario())
+    return resp, seen
+
+
+def test_proxy_absolute_form_policy():
+    """Forwarded plain-HTTP (absolute-form) policy, live against the real
+    Proxy: Host is ALWAYS rewritten from the checked URL, emitted FIRST,
+    and is the ONLY Host the origin sees — "Host :" (space before the
+    colon) used to slip through as a forwarded line named "Host " and
+    lenient origins parse that as a SECOND Host header; obs-fold lines
+    are the same trap. Exactly ONE request is forwarded: Transfer-
+    Encoding is refused, only an unambiguous Content-Length body rides,
+    and the origin socket is half-closed afterwards — a pipelined second
+    request can never reach it. Embedded control bytes (bare \\r) are
+    refused instead of forwarded; a portless CONNECT target defaults to
+    443."""
+    allow_loopback = [{"kind": "net", "value": "127.0.0.1/32", "port": None}]
+    allow_443 = [{"kind": "net", "value": "127.0.0.1/32", "port": 443}]
+    cfgs = {"main": {"allows": allow_loopback, "verbose": False},
+            "port443": {"allows": allow_443, "verbose": False}}
+    origin_port = []  # filled by the first case's request builder
+    smuggle = b"GET http://127.0.0.1/smuggled HTTP/1.1\r\nHost: evil\r\n\r\n"
+    cases = [
+        # rewrite + no-smuggle: a pipelined second request behind the head
+        ("main", lambda port: origin_port.append(port) or (
+            f"GET http://127.0.0.1:{port}/x?q=1 HTTP/1.1\r\n"
+            f"Host: evil.example\r\nX-Test: 1\r\nConnection: keep-alive\r\n\r\n"
+        ).encode() + smuggle),
+        # "Host :" — space before the colon: name is not a token -> 400
+        ("main", b"GET http://127.0.0.1/ HTTP/1.1\r\nHost : evil-vhost.example\r\n\r\n"),
+        # obs-fold continuation line (leading SP) -> 400
+        ("main", b"GET http://127.0.0.1/ HTTP/1.1\r\nX-A: 1\r\n Host: folded\r\n\r\n"),
+        # colon-less header line -> 400
+        ("main", b"GET http://127.0.0.1/ HTTP/1.1\r\nNotAHeader\r\n\r\n"),
+        # duplicate and empty Host headers: dropped, exactly one remains
+        ("main", lambda port: (
+            f"GET http://127.0.0.1:{port}/dup HTTP/1.1\r\n"
+            f"Host: a.example\r\nHost: b.example\r\nHost:\r\nX-T: 2\r\n\r\n").encode()),
+        # Transfer-Encoding body framing -> 400 (cannot be one-shot safely)
+        ("main", b"POST http://127.0.0.1/te HTTP/1.1\r\n"
+                 b"Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"),
+        # duplicate/ambiguous Content-Length -> 400
+        ("main", b"POST http://127.0.0.1/cl HTTP/1.1\r\n"
+                 b"Content-Length: 3\r\nContent-Length: 4\r\n\r\nabc"),
+        # a declared Content-Length body rides — and a smuggled request
+        # pipelined BEHIND the declared body still never reaches the origin
+        ("main", lambda port: (
+            f"POST http://127.0.0.1:{port}/body HTTP/1.1\r\n"
+            f"Content-Length: 3\r\n\r\nabc").encode() + smuggle),
+        # embedded bare \r in a header value: refused, not forwarded
+        ("main", b"GET http://127.0.0.1/x HTTP/1.1\r\nX-Evil: a\rb\r\n\r\n"),
+        # control byte in the request line: refused
+        ("main", b"GET http://127.0.0.1/\rx HTTP/1.1\r\n\r\n"),
+        # portless CONNECT defaults to 443: allowed (NOT a 403 denial —
+        # whatever answers or fails on 443), while :80 with a :443-only
+        # entry stays denied — that is the default-port proof either way
+        ("port443", b"CONNECT 127.0.0.1 HTTP/1.1\r\n\r\n"),
+        ("port443", b"CONNECT 127.0.0.1:80 HTTP/1.1\r\n\r\n"),
+    ]
+    resp, seen = _run_proxy_clients(cases, cfgs, origin=True)
+    (ok, host_sp, obs_fold, no_colon, dup_host, te, dup_cl, body_ok,
+     bare_cr, bad_line, connect_default, connect_80) = resp
+    assert ok.startswith(b"HTTP/1.1 200") and ok.endswith(b"ok"), ok
+    orig = seen["origin"]
+    assert len(orig) == 3, orig  # /x, /dup, /body — everything else was refused
+
+    def headers_of(rec):
+        return [h.decode("latin-1").rstrip("\r\n") for h in rec[1]]
+
+    # -- /x: rewrite, Host first, hop-by-hop dropped, no smuggle
+    line, headers, body, after = orig[0]
+    assert line == b"GET /x?q=1 HTTP/1.1\r\n", orig
+    assert after == b"", (orig, "pipelined second request reached the origin")
+    hdrs = headers_of(orig[0])
+    assert hdrs[0].lower().startswith("host:"), hdrs  # ours is the FIRST header
+    hosts = [h for h in hdrs if h.lower().startswith("host:")]
+    assert hosts == [f"Host: 127.0.0.1:{origin_port[0]}"], hdrs
+    assert "evil.example" not in str(hdrs) and "smuggled" not in str(hdrs), hdrs
+    assert any(h.lower().startswith("x-test:") for h in hdrs), hdrs
+    # the client's hop-by-hop Connection was dropped; ours (close) is the
+    # only one left
+    conns = [h for h in hdrs if h.lower().startswith("connection:")]
+    assert conns == ["Connection: close"], hdrs
+
+    # -- /dup: duplicate/empty client Hosts all dropped; ours is the only one
+    line, headers, body, after = orig[1]
+    hdrs = headers_of(orig[1])
+    hosts = [h for h in hdrs if h.lower().startswith("host:")]
+    assert hosts == [f"Host: 127.0.0.1:{origin_port[0]}"], hdrs
+    assert "a.example" not in str(hdrs) and "b.example" not in str(hdrs), hdrs
+    assert after == b""
+
+    # -- /body: declared body forwarded verbatim; the smuggle behind it
+    #    never arrived (origin saw EOF right after "abc")
+    line, headers, body, after = orig[2]
+    assert line == b"POST /body HTTP/1.1\r\n", orig
+    assert body == b"abc", orig
+    assert after == b"", (orig, "request smuggled behind the declared body")
+
+    for got in (host_sp, obs_fold, no_colon, te, dup_cl, bare_cr, bad_line):
+        assert got.startswith(b"HTTP/1.1 400"), got
+    assert not connect_default.startswith(b"HTTP/1.1 403"), connect_default
+    assert connect_80.startswith(b"HTTP/1.1 403"), connect_80
+
+
+def test_proxy_upstream_no_proxy_bypass():
+    """$no_proxy picks the ROUTE (never widens policy): with an upstream
+    configured, a no_proxy-matching host still egresses DIRECT (the dead
+    upstream would fail otherwise), a non-matching host still chains and
+    reports the upstream failure. And even no_proxy='*' — every host
+    rerouted direct — does not touch the allowlist: a non-allowed
+    destination is still denied."""
+    dead_upstream = {"scheme": "http", "host": "127.0.0.1", "port": 1,
+                     "user": None, "pass": None, "tls_verify": True}
+    cfgs = {
+        "bypass": {"allows": [{"kind": "net", "value": "127.0.0.1/32", "port": None}],
+                   "upstream": dead_upstream, "no_proxy": ["127.0.0.1"],
+                   "verbose": False},
+        "chain": {"allows": [{"kind": "net", "value": "127.0.0.1/32", "port": None}],
+                  "upstream": dead_upstream, "no_proxy": ["something.else"],
+                  "verbose": False},
+        "star": {"allows": [{"kind": "net", "value": "127.0.0.1/32", "port": None}],
+                 "upstream": dead_upstream, "no_proxy": ["*"],
+                 "verbose": False},
+    }
+    cases = [("bypass", lambda port: f"GET http://127.0.0.1:{port}/ HTTP/1.1\r\n\r\n".encode()),
+             ("chain", lambda port: f"GET http://127.0.0.1:{port}/ HTTP/1.1\r\n\r\n".encode()),
+             # no_proxy=* but 10.9.9.9 is not allowlisted -> still DENIED
+             ("star", b"GET http://10.9.9.9/ HTTP/1.1\r\n\r\n")]
+    resp, seen = _run_proxy_clients(cases, cfgs, origin=True)
+    bypassed, chained, star_denied = resp
+    assert bypassed.startswith(b"HTTP/1.1 200") and bypassed.endswith(b"ok"), bypassed
+    assert seen["line"] == b"GET / HTTP/1.1\r\n", seen
+    assert chained.startswith(b"HTTP/1.1 502"), chained  # upstream refused
+    assert star_denied.startswith(b"HTTP/1.1 403"), star_denied
+
+
+def test_allow_private_name_entries():
+    """-a mirror.corp!private: the name is allowlisted like any other, and
+    may resolve into private/loopback space on the DIRECT route (internal
+    mirrors — the documented $no_proxy use case). Without the marker the
+    same name is refused by the SSRF guard BEFORE any connection, and with
+    an upstream configured the guard still runs before the chain (the
+    403-vs-502 split proves which side refused)."""
+    def fake_getaddrinfo(host, port, *a, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    dead_upstream = {"scheme": "http", "host": "127.0.0.1", "port": 1,
+                     "user": None, "pass": None, "tls_verify": True}
+    name_entry = lambda private: {"kind": "name", "value": "mirror.test",
+                                  "port": None, "private": private}
+    cfgs = {
+        "priv": {"allows": [name_entry(True)], "verbose": False},
+        "guard": {"allows": [name_entry(False)], "verbose": False},
+        "up_priv": {"allows": [name_entry(True)], "upstream": dead_upstream,
+                    "no_proxy": [], "verbose": False},
+    }
+    cases = [("priv", lambda port: f"GET http://mirror.test:{port}/ HTTP/1.1\r\n\r\n".encode()),
+             ("guard", lambda port: f"GET http://mirror.test:{port}/ HTTP/1.1\r\n\r\n".encode()),
+             ("up_priv", lambda port: f"GET http://mirror.test:{port}/ HTTP/1.1\r\n\r\n".encode())]
+    saved = sbox.socket.getaddrinfo
+    sbox.socket.getaddrinfo = fake_getaddrinfo
+    try:
+        resp, seen = _run_proxy_clients(cases, cfgs, origin=True)
+    finally:
+        sbox.socket.getaddrinfo = saved
+    ok, refused, upstream = resp
+    assert ok.startswith(b"HTTP/1.1 200") and ok.endswith(b"ok"), ok
+    assert b"Host: mirror.test" in seen["headers"][0], seen  # the name rode along
+    assert refused.startswith(b"HTTP/1.1 403"), refused  # SSRF guard, not a 502
+    assert b"resolves only to blocked" in refused, refused
+    assert upstream.startswith(b"HTTP/1.1 502"), upstream  # guard passed; upstream is dead
+
+
+def test_run_sandbox_filter_output_pipes_proxy_stderr():
+    """Under --filter-output the proxy's stderr is a PIPE pumped through
+    the output filter and CR-translated — it used to inherit the RAW host
+    tty (staircasing without CR, and tracebacks quoting sandbox-supplied
+    bytes bypassed the filter). INNER_PROXY is blanked so no socat bridge
+    runs host-side; the verbose allow/deny log of the real proxy (the
+    self-test denial) must arrive through the pipe."""
+    import contextlib
+    import io
+    import signal
+    import tempfile as tf
+    import pty as pty_mod
+    try:
+        pty_mod.openpty()
+    except OSError as e:
+        raise unittest.SkipTest(f"no ptys available: {e}")
+    with tf.TemporaryDirectory(prefix="sbox-test.") as tmp:
+        shim = os.path.join(tmp, "bwrap")
+        with open(shim, "w", encoding="utf-8") as fh:
+            fh.write('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n')
+        os.chmod(shim, 0o755)
+        opts = argparse.Namespace(net=False, home=False, gui=False, ssh_agent=False,
+                                  ro_cwd=True, bind=[], ro_bind=[], bind_socket=[],
+                                  no_seccomp=True, verbose=True,
+                                  filter_output=True)
+        saved_path = os.environ["PATH"]
+        saved_sigs = {s: signal.getsignal(s) for s in
+                      (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGWINCH)}
+        saved_inner = sbox.INNER_PROXY
+        saved_stdin = sys.stdin
+        errbuf = io.StringIO()
+        devnull = open(os.devnull, "r")
+        try:
+            sbox.INNER_PROXY = ""           # no socat bridge host-side
+            os.environ["PATH"] = tmp + os.pathsep + saved_path
+            sys.stdin = devnull
+            with contextlib.redirect_stderr(errbuf):
+                rc = sbox.run_sandbox(opts, ["/bin/sh", "-c", "sleep 0.6"], [], None)
+        finally:
+            sbox.INNER_PROXY = saved_inner
+            sys.stdin = saved_stdin
+            devnull.close()
+            os.environ["PATH"] = saved_path
+            for s, h in saved_sigs.items():
+                signal.signal(s, h)
+        assert rc == 0, rc
+        log = errbuf.getvalue()
+        assert "sbox-proxy:" in log and "deny" in log, log  # piped + emitted
 
 
 def _main():

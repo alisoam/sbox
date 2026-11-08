@@ -125,7 +125,9 @@ Allowlist/denial semantics:
   ordered: allowlist → resolve (filtered) → connect.
 - SSRF guard: allowed names resolving into private/loopback/link-local/CGNAT/
   multicast/reserved ranges are rejected (`bad_ip`, incl. NAT64/6to4/Teredo
-  embedding). Only explicit `-a IP/CIDR` literals bypass it — deliberately.
+  embedding). Only explicit `-a IP/CIDR` literals — and name entries with the
+  explicit `!private` marker (`-a mirror.corp!private`, for internal mirrors
+  on the $no_proxy direct route) — bypass it, deliberately.
 - Fail loud, never widen: catch-all entries (`*`, `0.0.0.0/0`,
   effectively-global CIDRs, host bits set) are rejected, not interpreted;
   single-label entries (`-a com` — a whole TLD) are warned about

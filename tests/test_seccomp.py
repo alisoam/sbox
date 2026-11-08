@@ -247,10 +247,19 @@ def test_filter_runtime_probe():
             if vsock_fd >= 0:
                 os.close(vsock_fd)
             # personality(0) is PER_LINUX, a harmless no-op that returns 0
-            # unfiltered — EPERM here proves the new deny entry fires
-            # (glibc wrapper => ground truth for the number).
+            # unfiltered — EPERM here proves the deny entry fires
+            # (glibc wrapper => ground truth for the number). The 0xffffffff
+            # query magic must stay ALLOWED (the kernel changes nothing for
+            # it), and ADDR_NO_RANDOMIZE (setarch -R) must stay denied.
             results.append(probe_fn("personality(0) denied EPERM",
                                     lambda: libc.personality(0), EPERM))
+            results.append(probe_fn("personality(ADDR_NO_RANDOMIZE) denied EPERM",
+                                    lambda: libc.personality(0x0040000), EPERM))
+            ctypes.set_errno(0)
+            q = libc.personality(ctypes.c_ulong(sbox.PERSONALITY_QUERY))
+            results.append({"label": "personality(0xffffffff) query allowed",
+                            "rc": q, "errno": ctypes.get_errno(),
+                            "ok": q >= 0})
             # Newer deny entries (each once shipped wrong somewhere):
             # vmsplice(pipe_w, NULL, 0, 0) is rc==0 unfiltered (zero
             # segments) — EPERM under the filter (glibc wrapper => ground
@@ -346,7 +355,7 @@ def test_tables_structurally_consistent():
     names = set(keysets.pop())
     # Every name the BPF builder references must exist in every table...
     for req in sbox.SECCOMP_FAKE_MISSING + sbox.SECCOMP_EPERM + (
-            "clone", "ioctl", "socket"):
+            "clone", "ioctl", "socket", "personality"):
         assert req in names, f"{req!r} missing from SECCOMP_SYSCALLS"
     # ...and the BPF must actually build for every supported arch.
     for arch in archs:
@@ -625,6 +634,16 @@ def test_bpf_interpreter_golden_cases():
             ("bpf", [0], _EPERM),
             ("mount", [0], _EPERM),
             ("personality", [0], _EPERM),
+            # personality: only the 0xffffffff "query" magic passes (the
+            # kernel changes nothing for it); the kernel truncates the
+            # argument to u32, so the low word decides — junk in the high
+            # word must not turn a persona CHANGE into an allow, and
+            # sign-extended -1 must not lose the query.
+            ("personality", [0xFFFFFFFF], _ALLOW),
+            ("personality", [0xFFFFFFFFFFFFFFFF], _ALLOW),
+            ("personality", [0x100000000 | 0xFFFFFFFF], _ALLOW),
+            ("personality", [0x100000000], _EPERM),
+            ("personality", [0x0040000], _EPERM),   # ADDR_NO_RANDOMIZE
             ("open_tree", [0], _EPERM),
             ("mount_setattr", [0], _EPERM),
             # the newer deny entries (numbers were each mistyped once in

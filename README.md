@@ -53,7 +53,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
 
 | Option | Meaning |
 | --- | --- |
-| `-a, --allow HOST` | Allow `HOST` and its subdomains (suffix match on a dot boundary). Also accepts IPs, CIDRs and an optional `:port` (`example.com:443`, `203.0.113.0/24`, `[2001:db8::]/32`). Repeatable. |
+| `-a, --allow HOST` | Allow `HOST` and its subdomains (suffix match on a dot boundary). Also accepts IPs, CIDRs and an optional `:port` (`example.com:443`, `203.0.113.0/24`, `[2001:db8::]/32`). A trailing `!private` (`mirror.corp!private`) lets that one **name** resolve into private ranges — internal mirrors on the `$no_proxy` direct route. Repeatable. |
 | `-A, --allow-file FILE` | File with allow entries, one per line, `#` comments. Repeatable. |
 | `-b, --bind PATH` | Bind `PATH` read-write into the sandbox. Repeatable. |
 | `-r, --ro-bind PATH` | Bind `PATH` read-only. Repeatable. |
@@ -64,7 +64,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `--ssh-agent` | Forward `$SSH_AUTH_SOCK` read-only to `/run/ssh-agent.sock`. |
 | `--filter-output` | Sanitize stdout/stderr host-side through a PTY filter: strip dangerous ANSI escape sequences (OSC 52 clipboard writes, terminal queries, invisible text, cursor manipulation), keep text and safe SGR colors. Without it raw sandbox bytes reach your terminal — use it for untrusted work. |
 | `--strict-crlf` | With `--filter-output` (implied): additionally drop `\r` not followed by `\n`, defeating single-line overwrite spoofs. Breaks progress bars. |
-| `--upstream URL` | Chain egress through an upstream proxy: `http://`, `https://`, `socks5://`, `socks5h://` (userinfo supported). Default: `$SBOX_UPSTREAM`, else `$https_proxy`/`$HTTPS_PROXY`; empty string forces direct. |
+| `--upstream URL` | Chain egress through an upstream proxy: `http://`, `https://`, `socks5://`, `socks5h://` (userinfo supported). Default: `$SBOX_UPSTREAM`, else `$https_proxy`/`$HTTPS_PROXY`; empty string forces direct. `$NO_PROXY`/`$no_proxy` is honored when chaining (lowercase wins; it picks the route only — the allowlist still applies; network entries match literal IPs, internal *names* need `-a name!private` to survive the SSRF guard on the direct route). |
 | `--upstream-insecure` | Skip TLS verification of an `https://` upstream (or `$SBOX_UPSTREAM_INSECURE`). |
 | `--net` | Share the host network namespace: direct egress, no proxy/allowlist (`-a/-A/--upstream` ignored). |
 | `--no-seccomp` | Do not install the seccomp deny-list. Without it the launcher FAILS CLOSED: if the filter cannot be installed (bwrap < 0.4.1, unsupported architecture) it refuses to run rather than run unfiltered. |
@@ -96,7 +96,8 @@ Everything after the first positional (or `--`) is the sandboxed command.
   syscalls plus the new mount API, file handles — `open_by_handle_at`,
   `name_to_handle_at` — `quotactl`, `syslog`, `fanotify_init`, `vmsplice`,
   process-injection APIs — ptrace, `process_vm_readv/writev`, kcmp,
-  `pidfd_getfd`, personality — and `ioctl(TIOCSTI/TIOCLINUX)`) is
+  `pidfd_getfd`, personality *changes* (the harmless `0xffffffff` query
+  stays allowed) — and `ioctl(TIOCSTI/TIOCLINUX)`) is
   installed **by bwrap itself**, as the very last step before exec'ing the
   payload (`--add-seccomp-fd`, `--seccomp` on older bwrap): the shell, the
   socat bridge and the command inherit it from their first instruction —
@@ -119,8 +120,9 @@ Everything after the first positional (or `--`) is the sandboxed command.
   keep running on the deny rules alone, with a note shown at most once a
   day. Fail-closed: every launch self-probes the compiled filter host-side
   first (install it in a forked child; the libc `unshare()`,
-  `ioctl(TIOCSTI)`, `socket(AF_VSOCK)`, `personality()` and `ptrace()`
-  wrappers must all return EPERM — the hand-typed numbers are verified on
+  `ioctl(TIOCSTI)`, `socket(AF_VSOCK)`, `personality(0)` and `ptrace()`
+  wrappers must return EPERM while the `personality(0xffffffff)` query
+  stays allowed — the hand-typed numbers are verified on
   this machine), and if
   the filter cannot be installed (bwrap < 0.4.1, unsupported
   architecture) the launcher refuses to run — `--no-seccomp` is the
@@ -165,7 +167,16 @@ Everything after the first positional (or `--`) is the sandboxed command.
   private, loopback, link-local, CGNAT, multicast or reserved ranges are
   rejected, so an allowed name cannot reach host or LAN services (including
   `169.254.169.254`). Explicit `-a IP/CIDR` entries deliberately bypass this
-  guard — use them with care.
+  guard — use them with care — and so does `-a NAME!private` for that one
+  name (internal mirrors on the `$no_proxy` direct route; explicit intent,
+  same trade-off).
+- **One request per plain-http connection.** Forwarded (absolute-form)
+  requests always have `Host` rewritten from the checked URL and emitted
+  first; header names must be valid tokens (no obs-fold, no `Host :`),
+  `Transfer-Encoding` is refused and only an unambiguous `Content-Length`
+  body is forwarded before the origin socket is half-closed — a pipelined
+  second request cannot smuggle its own `Host` upstream. TLS `CONNECT`
+  tunnels stay opaque (the documented domain-fronting limit).
 - **Loud, not wide.** Catch-all entries (`*`, `0.0.0.0/0`, effectively-global
   CIDRs) and CIDRs with host bits set (`203.0.113.7/24`) are rejected loudly
   instead of being widened or silently allowed; single-label entries
@@ -281,8 +292,9 @@ Design trade-offs, not bugs:
   (`CONNECT 1.2.3.4:443`), never the hostname — hostname-based policy on that
   proxy cannot work, and some proxies reject IP CONNECT targets.
 - The proxy has no connection caps, idle timeouts or header-count limits;
-  tunnels have no TCP half-close, and only the first resolved address is tried
-  when chaining through an upstream.
+  CONNECT/SOCKS tunnels have no TCP half-close (the forwarded plain-http
+  path *is* one-shot — declared body, then a half-close), and only the
+  first resolved address is tried when chaining through an upstream.
 - `--filter-output`: the pty slave is an inherited fd and cannot become the
   sandbox's controlling terminal, so job control inside is limited; with the
   host tty raw, Ctrl-C is delivered to the sandbox as a **byte** — a command
