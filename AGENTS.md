@@ -1,14 +1,14 @@
 # AGENTS.md
 
-`sbox` is a Linux Go command in `go/`. It runs a command in bubblewrap with
-network access restricted by a host-side SOCKS5/HTTP CONNECT proxy. The Go
-module uses only the standard library; build with Go >= 1.22 and
+`sbox` is a Linux Go command at the repository root. It runs a command in
+bubblewrap with network access restricted by a host-side SOCKS5/HTTP CONNECT
+proxy. The Go module uses only the standard library; build with Go >= 1.26 and
 `CGO_ENABLED=0`. Host runtime dependencies are `bwrap` and `socat` (`--net`
 needs only bwrap). There is no separate interpreter or reference implementation.
 
 ## Development
 
-Run from `go/`:
+Run from the repository root:
 
 ```sh
 go vet ./...
@@ -24,13 +24,13 @@ filters in a re-executed child and also interpret bytecode without bwrap.
 Missing foreign architecture headers or ausyscall may skip cross-checks;
 native contract tests and checked-in golden fixtures must always run.
 
-Useful live checks, after building `go/sbox`:
+Useful live checks, after building `./sbox`:
 
 ```sh
-./go/sbox -a example.com -v -- curl -sI https://example.com
-./go/sbox -- curl -sI https://example.com                  # must be denied
-./go/sbox --filter-output -- printf 'visible\n'
-./go/sbox --shell
+./sbox -a example.com -v -- curl -sI https://example.com
+./sbox -- curl -sI https://example.com                  # must be denied
+./sbox --filter-output -- printf 'visible\n'
+./sbox --shell
 ```
 
 Use gofmt. Keep prose near 100 columns. Behavior changes must update package

@@ -21,7 +21,7 @@ standard library.
 - Linux with unprivileged user namespaces (many containers block this —
   bwrap then fails with "No permissions to create a new namespace")
 - `bwrap` and `socat` on the host (`--net` needs only `bwrap`)
-- Go >= 1.22 to build; the installed binary needs no language runtime
+- Go >= 1.26 to build; the installed binary needs no language runtime
 - seccomp deny-list: any `bwrap >= 0.4.1` (`--seccomp`) or newer
   (`--add-seccomp-fd`); `>= 0.8` additionally disables nested user
   namespaces at the kernel level (`--disable-userns` — probed once per
@@ -37,12 +37,11 @@ standard library.
 Build and install from the repository root:
 
 ```sh
-cd go
 CGO_ENABLED=0 go build -o sbox ./cmd/sbox
 install -Dm755 sbox ~/.local/bin/sbox
 ```
 
-The Go module lives in `go/`. The default static build uses Go's DNS
+The default static build uses Go's DNS
 resolver; custom NSS backends such as mDNS and myhostname are not supported.
 
 ## Usage
@@ -135,7 +134,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
   debuggers (gdb/strace), `setarch`, perf, io_uring runtimes, unshare-based
   builders, keyring-using kerberos, nested containers). The syscall
   tables are cross-checked against kernel headers and a live filter probe
-  by `go/internal/seccomp` tests, including checked-in bytecode fixtures
+  by `internal/seccomp` tests, including checked-in bytecode fixtures
   for x86_64, aarch64 and riscv64.
 - **Lifecycle:** if any component dies, everything dies (supervisor loop,
   `--die-with-parent`, and the in-process proxy) — even a SIGKILLed
@@ -325,7 +324,8 @@ Design trade-offs, not bugs:
 
 ## Development
 
-The implementation and tests use only Go's standard library. Run from `go/`:
+The implementation and tests use only Go's standard library. Run from the
+repository root:
 
 ```sh
 go vet ./...
