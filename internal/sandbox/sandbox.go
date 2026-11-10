@@ -11,17 +11,17 @@
 // supervisor.go is the launch owner: the 0700
 // $WORK, the in-process proxy goroutine with readiness checks and the
 // fail-closed self-test, the seccomp gate, the userns-hardening probe,
-// the spawn (ONLY argv-named fds cross the exec boundary), the signal
-// lifecycle (early_signal → forward → SIG_IGN during cleanup),
-// exit-code propagation, and RmTreeWritable teardown. cmd/sbox is the
-// CLI front end that drives it.
+// the overlay staging gate, the spawn (ONLY argv-named fds cross the
+// exec boundary), the signal lifecycle (early_signal → forward →
+// SIG_IGN during cleanup), exit-code propagation, and RmTreeWritable
+// teardown. cmd/sbox is the CLI front end that drives it.
 //
 // The Spec is an ordered op list, not a bag of sections: bwrap applies
 // argv order (a later bind shadows an earlier mount at or below its
 // target). The provider preserves this order. The ops themselves are semantic
-// (setenv / mount / tmpfs / dir / proc / dev / share-net / chdir), not
-// bwrap flag spellings; any backend must be able to execute the same
-// sequence.
+// (setenv / mount / tmpfs / dir / proc / dev / overlay / share-net /
+// chdir), not bwrap flag spellings; any backend must be able to execute
+// the same sequence.
 //
 // The fd invariant (runc CVE-2024-21626, "Leaky Vessels"): ONLY the fds
 // the argv actually names may reach the sandbox. bwrap closes the fds
@@ -31,6 +31,18 @@
 // mount tree. Launch.PassFDs is derived purely from the emitted argv
 // and becomes cmd.ExtraFiles, so Go itself guarantees that nothing else
 // crosses the exec boundary.
+//
+// Overlay ops (disposable writable views) get special treatment in the
+// bwrap backend: bwrap resolves overlay sources by PATHNAME, which
+// would reintroduce the exact check-to-mount race --bind-fd removes.
+// The provider therefore renders a two-level launch — a private,
+// unprivileged STAGING bwrap that mounts each source at a private path
+// on a staging tmpfs. Validated sources come from pinned fds, overlay
+// lowers are read-only, and ordinary binds keep their requested mode.
+// A separate size-bounded tmpfs holds fresh upper/work dirs; the REAL
+// sandbox bwrap overlays the staged lowers. Staging and its descriptors are
+// invisible to the payload (the sandbox pivots to a fresh root; seccomp
+// and --as-pid-1 semantics are unchanged; see internal/sandbox/bwrap).
 package sandbox
 
 import (
@@ -55,6 +67,7 @@ type Caps struct {
 	AddSeccompFD  bool // --add-seccomp-fd (current spelling)
 	LegacySeccomp bool // --seccomp (bwrap >= 0.4.1, same wire format)
 	DisableUserns bool // --disable-userns AND --assert-userns-disabled
+	Overlay       bool // --overlay-src + --overlay (bwrap >= 0.11, unprivileged only)
 }
 
 // SeccompFlag is the option the filter is handed through, "" when this
@@ -117,6 +130,20 @@ type ProcFS struct{ Path string }
 // DevFS mounts a fresh device tmpfs at Path.
 type DevFS struct{ Path string }
 
+// Overlay is a disposable writable layer over Src at Dst: reads see the
+// validated host directory, writes land in the launch's private bounded
+// overlay store and vanish when the sandbox exits. FD is the PINNED
+// source descriptor from bindpolicy (nil is invalid: bwrap resolves
+// overlay lower paths by name, so the pinned object is re-mounted in a
+// trusted staging arrangement and the mount must never re-resolve the
+// path). Src is the resolved host path (the pinned object's name), Dst
+// the in-sandbox mount point — the resolved path itself.
+type Overlay struct {
+	Src string
+	Dst string
+	FD  *os.File
+}
+
 // ShareNet keeps the HOST network namespace (only meaningful with an
 // otherwise fully unshared sandbox). NOTE: sharing the netns also
 // exposes host loopback services and abstract Unix sockets.
@@ -132,6 +159,7 @@ func (Tmpfs) isOp()    {}
 func (Mkdir) isOp()    {}
 func (ProcFS) isOp()   {}
 func (DevFS) isOp()    {}
+func (Overlay) isOp()  {}
 func (ShareNet) isOp() {}
 func (Chdir) isOp()    {}
 
@@ -151,6 +179,10 @@ type Spec struct {
 	Bridge        string
 	Seccomp       []byte
 	DisableUserns bool
+	// OverlayStoreSize is the combined byte budget of every Overlay's
+	// writable layer (one shared store). 0 ⇒ cliutil.DefaultOverlaySize.
+	// Backend-neutral: a backend without overlays errors on Overlay ops.
+	OverlayStoreSize int64
 }
 
 // Launch is the provider's rendered spawn plan. Bin is the backend
@@ -185,6 +217,16 @@ type Provider interface {
 	// on some backend version — a probe that runs a different argv than
 	// the launch would pass while the launch dies).
 	UsernsProbe(shareNet bool) bool
+	// OverlayProbe runs a throwaway COMPLETE overlay arrangement —
+	// trusted staging sandbox, pinned read-only source, bounded store,
+	// overlay mount, hardening skeleton — with a trivial payload, before
+	// the flags are committed to a real launch. Overlays depend on
+	// backend internals (overlay sources resolved by path, unprivileged
+	// overlayfs in the kernel, nested namespaces) that caps probing
+	// cannot see; a probe shaped like the launch is the only honest
+	// answer. It uses the launch's network mode and filter bytes; nil means
+	// --no-seccomp. Bounded; an error makes the launcher refuse overlays.
+	OverlayProbe(shareNet, hardenUserns bool, filter []byte) error
 	Build(spec *Spec) (*Launch, error)
 }
 
@@ -278,20 +320,60 @@ func joinPath(a, b string) string {
 	return a + "/" + b
 }
 
+// SystemMounts returns the read-only system trees needed by the shell and
+// commands. Overlay probes use the same mounts as production launches so their
+// executable and dynamic loader are present in the fresh root.
+func SystemMounts() []Op {
+	return []Op{
+		Mount{Src: "/usr", Dst: "/usr"},
+		Mount{Src: "/lib", Dst: "/lib", Try: true},
+		Mount{Src: "/lib64", Dst: "/lib64", Try: true},
+		Mount{Src: "/bin", Dst: "/bin", Try: true},
+		Mount{Src: "/sbin", Dst: "/sbin", Try: true},
+		// CA stores: Debian/Ubuntu (/etc/ssl), Fedora/RHEL (/etc/pki,
+		// where /etc/ssl/certs is often a dangling symlink without
+		// this), misc.
+		Mount{Src: "/etc/ssl", Dst: "/etc/ssl", Try: true},
+		Mount{Src: "/etc/pki", Dst: "/etc/pki", Try: true},
+		Mount{Src: "/etc/ca-certificates", Dst: "/etc/ca-certificates", Try: true},
+		Mount{Src: "/etc/hosts", Dst: "/etc/hosts", Try: true},
+		Mount{Src: "/etc/localtime", Dst: "/etc/localtime", Try: true},
+		Mount{Src: "/etc/passwd", Dst: "/etc/passwd", Try: true},
+		Mount{Src: "/etc/group", Dst: "/etc/group", Try: true},
+		// Debian/Ubuntu: many /usr/bin entries (awk, editor, java, vi,
+		// at times python3) are symlinks into /etc/alternatives, which
+		// dangle without this; ld.so.cache matters if libs live outside
+		// the default loader paths.
+		Mount{Src: "/etc/alternatives", Dst: "/etc/alternatives", Try: true},
+		Mount{Src: "/etc/ld.so.cache", Dst: "/etc/ld.so.cache", Try: true},
+	}
+}
+
 // BuildSpec constructs the ordered launch policy (rendered by the provider): opts is the parsed CLI; cwd the launcher's
 // working directory; sand the 0700
 // $WORK/tmp dir mounted as the sandbox's /tmp; sock the host-side proxy
 // Unix socket path; home the $HOME the launcher resolved; userBinds the
 // validated (flag, realpath, fd) triples from bindpolicy.CheckBindPaths;
-// agent the resolved agent socket ("" when not forwarding); sshCfg the
-// generated ssh_config path (proxied mode only, "" otherwise); pinner
-// the bind-policy pin cache (nil ⇒ path-based mounts). warn receives
-// advisory notes and warnings. Fatal errors (a
+// overlays the validated (realpath, fd) pairs from
+// bindpolicy.CheckOverlays; agent the resolved agent socket ("" when not
+// forwarding); sshCfg the generated ssh_config path (proxied mode only,
+// "" otherwise); pinner the bind-policy pin cache (nil ⇒ path-based
+// mounts). warn receives advisory notes and warnings. Fatal errors (a
 // refused --home pin, a raced cwd) come back as error — the launch
 // dies; nothing here ever degrades silently.
+//
+// Overlay rules: an overlay covering the cwd replaces the automatic cwd
+// mount with its merged view (the path exists through the overlay, so
+// chdir lands there); a cwd outside every overlay is auto-mounted
+// READ-ONLY while overlays are in use — a writable cwd bind would
+// silently persist exactly what --overlay asks to keep disposable (an
+// explicit -b "$PWD" still opts back in, and conflicts with overlapping
+// overlays are refused in bindpolicy). Overlay ops are emitted after the
+// user binds: later mounts shadow earlier ones, so a read-only
+// ancestor cwd mount gives way to the overlay below it.
 func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
-	userBinds []bindpolicy.Bind, agent, sshCfg string,
-	pinner *bindpolicy.Pinner, warn func(string)) (*Spec, error) {
+	userBinds []bindpolicy.Bind, overlays []bindpolicy.Overlay,
+	agent, sshCfg string, pinner *bindpolicy.Pinner, warn func(string)) (*Spec, error) {
 
 	if warn == nil {
 		warn = func(string) {}
@@ -319,29 +401,9 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 		DevFS{"/dev"},
 		// /tmp is the 0700 $WORK dir — never the host's /tmp.
 		Mount{Src: sand, Dst: "/tmp", RW: true},
-		Mount{Src: "/usr", Dst: "/usr"},
-		Mount{Src: "/lib", Dst: "/lib", Try: true},
-		Mount{Src: "/lib64", Dst: "/lib64", Try: true},
-		Mount{Src: "/bin", Dst: "/bin", Try: true},
-		Mount{Src: "/sbin", Dst: "/sbin", Try: true},
-		// CA stores: Debian/Ubuntu (/etc/ssl), Fedora/RHEL (/etc/pki,
-		// where /etc/ssl/certs is often a dangling symlink without
-		// this), misc.
-		Mount{Src: "/etc/ssl", Dst: "/etc/ssl", Try: true},
-		Mount{Src: "/etc/pki", Dst: "/etc/pki", Try: true},
-		Mount{Src: "/etc/ca-certificates", Dst: "/etc/ca-certificates", Try: true},
-		Mount{Src: "/etc/hosts", Dst: "/etc/hosts", Try: true},
-		Mount{Src: "/etc/localtime", Dst: "/etc/localtime", Try: true},
-		Mount{Src: "/etc/passwd", Dst: "/etc/passwd", Try: true},
-		Mount{Src: "/etc/group", Dst: "/etc/group", Try: true},
-		// Debian/Ubuntu: many /usr/bin entries (awk, editor, java, vi,
-		// at times python3) are symlinks into /etc/alternatives, which
-		// dangle without this; ld.so.cache matters if libs live outside
-		// the default loader paths.
-		Mount{Src: "/etc/alternatives", Dst: "/etc/alternatives", Try: true},
-		Mount{Src: "/etc/ld.so.cache", Dst: "/etc/ld.so.cache", Try: true},
-		Tmpfs{Path: "/run", Perms: 0o755},
 	}
+	ops = append(ops, SystemMounts()...)
+	ops = append(ops, Tmpfs{Path: "/run", Perms: 0o755})
 
 	var bridge string
 	if !opts.Net {
@@ -441,15 +503,39 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 	// (--bind-socket "$PWD" opts a socket-bearing dir back in,
 	// read-write). A cwd at or below an explicitly bound path still
 	// exists inside the sandbox, so chdir works.
+	//
+	// Overlays change two things: a cwd COVERED by an overlay uses the
+	// overlay's merged view (no automatic mount at all), and any
+	// remaining automatic cwd mount is READ-ONLY while overlays are in
+	// use — the writable-by-default cwd is the one silent persistence
+	// channel --overlay exists to close (an explicit -b "$PWD" opts back
+	// in; bindpolicy refuses a bind overlapping an overlay).
 	realHome := bindpolicy.RealPath(home)
 	project := bindpolicy.RealPath(cwd)
 	userBound := map[string]bool{}
 	for _, b := range userBinds {
 		userBound[b.Path] = true
 	}
+	overlayCovers := func(p string) bool {
+		for _, o := range overlays {
+			if bindpolicy.Covers(o.Path, p) {
+				return true
+			}
+		}
+		return false
+	}
+	overlaysOn := len(overlays) > 0
 	bind := true
+	roCwd := opts.RoCwd || overlaysOn
 	var cwdFD *os.File
-	if project == realHome || strings.HasPrefix(project, realHome+"/") {
+	if overlayCovers(project) && overlaysOn {
+		// The overlay's merged view replaces the automatic cwd mount:
+		// the path exists through the overlay, so chdir (below) lands in
+		// the disposable view. Nothing to validate here — the overlay
+		// source went through CheckOverlays, and a deeper cwd cannot
+		// cover anything the overlay root does not.
+		bind = false
+	} else if project == realHome || strings.HasPrefix(project, realHome+"/") {
 		if !opts.Home {
 			warn("note: cwd is inside $HOME and $HOME is a tmpfs — using /tmp instead (--home to bind)")
 			bind = false
@@ -463,7 +549,15 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 			}
 		}
 	} else {
-		refusal, warning, _, fd, fatal := bindpolicy.ValidateBindSource(pinner, "cwd", project, opts, home, warn)
+		// Overlays flip the effective cwd mode to read-only: the
+		// validator's connect-only-ground rules key on that intent.
+		cwdOpts := opts
+		if overlaysOn && !opts.RoCwd {
+			cwdOpts = &cliutil.Options{}
+			*cwdOpts = *opts
+			cwdOpts.RoCwd = true
+		}
+		refusal, warning, _, fd, fatal := bindpolicy.ValidateBindSource(pinner, "cwd", project, cwdOpts, home, warn)
 		if fatal != nil {
 			return nil, fatal
 		}
@@ -498,24 +592,41 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 	// default) cwd mount must come first for explicit -r/-b flags to
 	// win — `-r "$PWD"` would otherwise silently end up read-write.
 	if bind {
-		ops = append(ops, Mount{Src: project, Dst: project, RW: !opts.RoCwd, FD: cwdFD})
+		if roCwd && !opts.RoCwd {
+			warn("note: the cwd is mounted read-only because --overlay is in use — " +
+				"writes through a plain cwd bind would persist on the host; pass " +
+				"-b \"$PWD\" to opt back into a writable cwd mount")
+		}
+		ops = append(ops, Mount{Src: project, Dst: project, RW: !roCwd, FD: cwdFD})
 	}
 	for _, b := range userBinds {
 		// mount exactly the validated (pinned) object — the fd the
 		// bind policy checked, never a re-resolved path.
 		ops = append(ops, Mount{Src: b.Path, Dst: b.Path, RW: b.Flag == "--bind", FD: b.FD})
 	}
+	// Overlays last among the mounts: a later mount shadows an earlier
+	// one at or below its target, so an overlay must follow the
+	// (read-only) automatic cwd mount it replaces in part — overlapping
+	// binds and overlays were already refused by bindpolicy.
+	for _, o := range overlays {
+		ops = append(ops, Overlay{Src: o.Path, Dst: o.Path, FD: o.FD})
+	}
 
 	// Backends apply the chdir after all mounts, wherever it sits in
-	// their argv.
-	if bind || anyCovers(userBinds, project) {
+	// their argv. An overlay-covered cwd exists through the overlay's
+	// merged view; explicit-bind and refused-cwd cases are unchanged.
+	if bind || anyCovers(userBinds, project) || (overlaysOn && overlayCovers(project)) {
 		ops = append(ops, Chdir{Dir: project})
 	} else {
 		ops = append(ops, Chdir{Dir: "/tmp"})
 	}
 
 	bridge += "exec \"$@\"\n"
-	return &Spec{Ops: ops, Bridge: bridge}, nil
+	size := opts.OverlaySize
+	if size == 0 {
+		size = cliutil.DefaultOverlaySize
+	}
+	return &Spec{Ops: ops, Bridge: bridge, OverlayStoreSize: size}, nil
 }
 
 // anyCovers reports whether any bind's resolved path is equal to or an

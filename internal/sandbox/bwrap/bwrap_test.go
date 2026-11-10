@@ -43,6 +43,10 @@ func TestParseCaps(t *testing.T) {
 		{"adjacent dash breaks the word", "--userns-disable --assert-userns-disabled", sandbox.Caps{}},
 		{"option list context (leading spaces, trailing newline)",
 			"  --add-seccomp-fd FD\n  --seccomp FD\n", sandbox.Caps{AddSeccompFD: true}},
+		{"overlay support", "--overlay-src SRC\n--overlay RWSRC WORKDIR DEST", sandbox.Caps{Overlay: true}},
+		{"--overlay alone is not enough", "--overlay RWSRC WORKDIR DEST", sandbox.Caps{}},
+		{"--overlay-src alone is not enough", "--overlay-src SRC", sandbox.Caps{}},
+		{"--overlay2 is not --overlay", "--overlay-src S\n--overlay2 A B C", sandbox.Caps{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := ParseCaps(tc.text); got != tc.want {
@@ -160,7 +164,7 @@ func plainSpec(t *testing.T) *sandbox.Spec {
 	}
 	spec, err := sandbox.BuildSpec(&cliutil.Options{}, cwd,
 		filepath.Join(dir, "sand"), filepath.Join(dir, "sock"), filepath.Join(dir, "home"),
-		nil, "", "", nil, nil)
+		nil, nil, "", "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

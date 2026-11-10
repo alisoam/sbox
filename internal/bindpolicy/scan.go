@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"sbox/internal/notes"
@@ -31,15 +32,19 @@ const (
 // path-rooted scan could be steered to a different directory entirely;
 // /proc/self/fd cannot); shown is the HOST-path spelling for notes.
 //
-// Hitting the entry cap is FAIL-OPEN by design (ordinary big trees must
-// keep binding): it says so through warn, but at most once a day (or
-// with verbose) — a large cwd would otherwise print on EVERY launch.
-// Unreadable directories (a 0711 subdir the scan cannot list) are noted
-// too — on every launch, under no stamp: unlike the cap this is rare,
-// and a socket connectable by name could hide there, so an earlier
+// Hitting the entry cap or the depth cap is FAIL-OPEN by design (ordinary
+// big trees must keep binding): it says so through warn, but at most once
+// a day (or with verbose) — a large cwd would otherwise print on EVERY
+// launch. Unreadable directories (a 0711 subdir the scan cannot list) are
+// noted too — on every launch, under no stamp: unlike the caps this is
+// rare, and a socket connectable by name could hide there, so an earlier
 // gave-up note must not silence it. What stays racy is a socket
 // appearing after the scan — a sandbox cannot create a host control
 // socket, so that residual is accepted.
+//
+// Paths carved from DIRECTORY ENTRY NAMES (sockets found, unreadable
+// dirs) are attacker-controllable bytes and are quoted when they reach a
+// diagnostic — never emitted raw into the terminal.
 func ContainsSocket(root string, shown string, verbose bool, warn func(string)) string {
 	if warn == nil {
 		warn = func(string) {}
@@ -63,6 +68,7 @@ func ContainsSocket(root string, shown string, verbose bool, warn func(string)) 
 	n := 0
 	var unreadable []string
 	found := ""
+	depthPruned := false
 
 	// visit lists one directory's entries (counted, socket-checked) and
 	// recurses into subdirectories whose depth is still under the cap.
@@ -96,6 +102,10 @@ func ContainsSocket(root string, shown string, verbose bool, warn func(string)) 
 			// but is not descended
 			// into — so stop at children deeper than the cap.
 			if strings.Count(child[len(root):], "/") > DefaultScanDepth {
+				// The window closed silently: a socket could hide below
+				// the depth cap just as well as beyond the entry cap.
+				// Record it (the note is lossy, like the entry-cap one).
+				depthPruned = true
 				continue
 			}
 			if !visit(child) {
@@ -109,6 +119,9 @@ func ContainsSocket(root string, shown string, verbose bool, warn func(string)) 
 	if found != "" {
 		return found
 	}
+	if depthPruned {
+		note(fmt.Sprintf("did not descend below depth %d", DefaultScanDepth))
+	}
 	if len(unreadable) > 0 {
 		first := unreadable[0]
 		if strings.HasPrefix(first, root) && shown != "" {
@@ -121,7 +134,7 @@ func ContainsSocket(root string, shown string, verbose bool, warn func(string)) 
 		warn(fmt.Sprintf("note: socket scan of %s could not read %d director%s (e.g. %s) — "+
 			"the bind is allowed, but an unscanned socket could lurk there; "+
 			"--bind-socket is only needed when you know there is one",
-			shownOr(shown, root), len(unreadable), plural, first))
+			shownOr(shown, root), len(unreadable), plural, strconv.Quote(first)))
 	}
 	return ""
 }

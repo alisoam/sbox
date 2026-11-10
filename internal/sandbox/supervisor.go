@@ -33,6 +33,15 @@ import (
 // EVERY launch and get lost in the noise).
 const usernsFallbackNote = "userns-fallback.note"
 
+// overlayStoreSize resolves the effective overlay budget: the parsed
+// --overlay-size, or the 1 GiB default.
+func overlayStoreSize(opts *cliutil.Options) int64 {
+	if opts.OverlaySize > 0 {
+		return opts.OverlaySize
+	}
+	return cliutil.DefaultOverlaySize
+}
+
 // Supervisor wires one full launch together. Construct it in cmd/sbox
 // (or tests) and call Run; the returned int is the process exit code.
 type Supervisor struct {
@@ -238,6 +247,26 @@ func (s *Supervisor) Run() int {
 		warn(err.Error())
 		return 1
 	}
+	// Overlays: validated like binds (fd-first, no opt-ins), then the
+	// capability and runtime gates. Nothing below may degrade silently:
+	// a host that cannot run the full staging arrangement refuses the
+	// launch rather than mounting an unverified overlay source.
+	overlays, err := bindpolicy.CheckOverlays(s.Opts, s.Home, pinner, userBinds, warn)
+	if err != nil {
+		warn(err.Error())
+		return 1
+	}
+	if len(overlays) > 0 {
+		if !caps.Overlay {
+			warn("--overlay requires bwrap >= 0.11 (--overlay-src/--overlay support) — refusing")
+			return 1
+		}
+		if !caps.BindFD {
+			warn("--overlay requires fd-pinned binds (bwrap >= 0.10) — refusing to " +
+				"mount unverified overlay sources")
+			return 1
+		}
+	}
 	if rc, dead := earlyExit(); dead {
 		return rc
 	}
@@ -319,6 +348,27 @@ func (s *Supervisor) Run() int {
 		return rc
 	}
 
+	if len(overlays) > 0 {
+		if err := s.Provider.OverlayProbe(s.Opts.Net, hardenUserns, bpf); err != nil {
+			// The COMPLETE arrangement ran and failed: setuid bwrap (which
+			// refuses the overlay options), a kernel without unprivileged
+			// overlayfs, blocked namespace nesting, or a staging detail the
+			// caps probe cannot see. Refuse — a path-based overlay lower
+			// layer would give up the source-swap guarantee entirely.
+			warn("--overlay: this bwrap/kernel cannot run the overlay staging arrangement " +
+				"(probed with the same flags as the launch) — refusing; needs bwrap >= 0.11 " +
+				"(non-setuid) and a kernel with unprivileged overlayfs (>= 5.11): " + err.Error())
+			return 1
+		}
+	}
+	if len(overlays) > 0 && s.Opts.Verbose {
+		warn(fmt.Sprintf("overlay: %d source(s) staged; shared writable layer capped at %d bytes",
+			len(overlays), overlayStoreSize(s.Opts)))
+	}
+	if rc, dead := earlyExit(); dead {
+		return rc
+	}
+
 	if !s.Opts.Net {
 		// The proxy lives in this process: credentials never touch
 		// disk, and any launcher death takes the proxy with it.
@@ -378,7 +428,7 @@ func (s *Supervisor) Run() int {
 		warn(fmt.Sprintf("cannot determine the current directory: %v", err))
 		return 1
 	}
-	spec, err := BuildSpec(s.Opts, cwd, sand, sock, s.Home, userBinds, agent, sshCfg, pinner, warn)
+	spec, err := BuildSpec(s.Opts, cwd, sand, sock, s.Home, userBinds, overlays, agent, sshCfg, pinner, warn)
 	if err != nil {
 		warn(err.Error())
 		return 1

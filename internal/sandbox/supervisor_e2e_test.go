@@ -200,3 +200,121 @@ func TestSupervisorWorkDirShape(t *testing.T) {
 	}
 	requireEmptyDirE2E(t, sup.TempRoot)
 }
+
+// TestSupervisorOverlayEndToEnd drives the REAL bwrap provider against a
+// shim that advertises overlay-era caps: the supervisor validates and
+// pins the overlay source, runs the complete-arrangement probe (the
+// shim), then launches — and the recorded argv must show the full
+// TWO-LEVEL arrangement: staging skeleton, staged pins, bounded store,
+// the inner sandbox argv with the overlay pair, and the payload.
+func TestSupervisorOverlayEndToEnd(t *testing.T) {
+	t.Setenv("USER", "tester")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("SSH_AUTH_SOCK", "")
+	root, err := os.MkdirTemp("", "sboxovle.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	rec := filepath.Join(root, "argv")
+	// --help advertises overlay caps; the ARRANGEMENT PROBE (its payload
+	// contains "/probe") exits 0 so the gate passes; every other
+	// invocation records its argv (overwriting: the probe ran first) and
+	// exits 42.
+	shim := writeShimE2E(t, filepath.Join(root, "bwrap"), fmt.Sprintf(`case "$1" in
+    --help)
+        echo "--add-seccomp-fd FD"
+        echo "--overlay-src SRC"
+        echo "--overlay RWSRC WORKDIR DEST"
+        echo "--bind-fd FD DEST --ro-bind-fd FD DEST"
+        exit 0
+        ;;
+esac
+case "$*" in
+    *"/probe"*) exit 0 ;;
+esac
+printf '%%s\n' "$@" > %s
+exit 42
+`, rec))
+
+	home := filepath.Join(root, "home")
+	cwd := filepath.Join(root, "proj")
+	ovl := filepath.Join(root, "ovl")
+	workroot := filepath.Join(root, "work")
+	for _, d := range []string{home, cwd, ovl, workroot} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sup := &sandbox.Supervisor{
+		Opts:     &cliutil.Options{NoSeccomp: true, Overlay: []string{ovl}},
+		Command:  []string{"make", "-j2"},
+		Provider: bwrap.New(shim),
+		Warn:     func(string) {},
+		SigCh:    make(chan os.Signal, 8),
+		Home:     home,
+		TempRoot: workroot,
+		Getwd:    func() (string, error) { return cwd, nil },
+	}
+	if rc := sup.Run(); rc != 42 {
+		t.Fatalf("rc = %d, want 42 (the shim's exit code)", rc)
+	}
+	requireEmptyDirE2E(t, sup.TempRoot) // $WORK removed
+
+	data, err := os.ReadFile(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	for _, want := range [][]string{
+		// staging skeleton exactly as Build renders it
+		{"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+			"--unshare-net", "--die-with-parent"},
+		{"--ro-bind", "/", "/"},
+		{"--proc", "/proc"},
+		{"--dev", "/dev"},
+		// the cwd pin (read-only under overlays) and the overlay source
+		// pinned into staging — each pin has a private mountpoint, the
+		// overlay lower at /tmp/sbox-stage/src/0
+		{"--ro-bind-fd", "3"},
+		{"--perms", "0700", "--tmpfs", "/tmp"},
+		{"--ro-bind-fd", "4", "/tmp/sbox-stage/src/0"},
+		// the single bounded store shared by all overlays (default 1GiB)
+		{"--perms", "0700", "--size", "1073741824", "--tmpfs", "/tmp/sbox-stage/st"},
+		{"--perms", "0700", "--dir", "/tmp/sbox-stage/st/u0"},
+		{"--perms", "0700", "--dir", "/tmp/sbox-stage/st/w0"},
+		{"--"},
+		// the inner sandbox: full hardening skeleton
+		{"--unshare-all", "--die-with-parent", "--new-session", "--as-pid-1", "--clearenv"},
+		// the overlay pair, adjacent, on the staged paths
+		{"--overlay-src", "/tmp/sbox-stage/src/0"},
+		{"--overlay", "/tmp/sbox-stage/st/u0", "/tmp/sbox-stage/st/w0", ovl},
+		// the read-only automatic cwd mount (overlays in use) is STAGED
+		// from its pin and re-bound by path inside
+		{"--chdir", cwd},
+		// the payload boundary the supervisor appends
+		{"--", "/bin/sh", "-c"},
+		{"sbox-sh", "make", "-j2"},
+	} {
+		if !argvContains(got, want...) {
+			t.Errorf("backend argv missing %v:\n%s", want, got)
+		}
+	}
+	args := strings.Split(strings.TrimSpace(got), "\n")
+	for i := 0; i+2 < len(args); i++ {
+		if args[i] == "--ro-bind-fd" && args[i+1] == "3" {
+			staged := args[i+2]
+			if !strings.HasPrefix(staged, "/tmp/sbox-stage/mounts/") ||
+				!argvContains(got, "--ro-bind", staged, cwd) {
+				t.Errorf("cwd pin was not rebound from its private staging path: %q", staged)
+			}
+			break
+		}
+	}
+
+	for _, bad := range []string{"--add-seccomp-fd", "/tmp/sbox-stage/seccomp.bpf", "exec 3<"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("--no-seccomp must keep %q out of the argv", bad)
+		}
+	}
+}

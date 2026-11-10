@@ -3,7 +3,9 @@ package bindpolicy
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -170,8 +172,11 @@ func ValidateBindSource(pinner *Pinner, label, p string, opts *cliutil.Options,
 			if strings.HasPrefix(found, scanRoot) {
 				shown = rp + found[len(scanRoot):] // name the HOST path, not the fd spelling
 			}
+			// The name is carved from a directory entry the tree's writer
+			// controls: quote it — a hostile file name must not inject
+			// terminal controls into the refusal message.
 			return fmt.Sprintf("%s %s: contains a Unix socket (%s) — control-socket "+
-					"territory; pass --bind-socket to bind it anyway", label, p, shown),
+					"territory; pass --bind-socket to bind it anyway", label, p, strconv.Quote(shown)),
 				"", rp, fd, nil
 		}
 	}
@@ -300,6 +305,145 @@ func anyCovers(roots []string, p string) bool {
 		}
 	}
 	return false
+}
+
+// Overlay is one validated --overlay source returned by CheckOverlays for
+// staging: the resolved realpath plus its PINNED descriptor. Overlays keep
+// no mount-mode decision — the writable layer is always the private store,
+// never the source, which is exactly why the source can be pinned read-only.
+type Overlay struct {
+	Path string
+	FD   *os.File
+}
+
+// CheckOverlays validates every --overlay source before anything is
+// started and returns the resolved (realpath, pinned-fd) pairs in CLI
+// order. Sources pass the SAME fd-first validation as -b/-r (protected
+// paths, bidirectional control-socket matching, socket shape, the bounded
+// contains-socket scan) with these overlay-specific differences:
+//
+//   - Only existing DIRECTORIES: a missing source or a file is a hard
+//     error (there is nothing to merge a writable layer onto).
+//   - NO opt-in anywhere: runtime-dir ground, socket files and
+//     socket-bearing directories are refused outright — an overlay whose
+//     lower layer is control-socket territory is as much an escape as a
+//     rw bind of it, and there is no --bind-socket for overlays.
+//   - A pinned fd is REQUIRED (nil is an error): bwrap resolves overlay
+//     sources by PATH, so the launcher can only keep its swap protection
+//     by re-mounting the pinned object in a private staging namespace.
+//     Without fd binds (bwrap < 0.10) overlays refuse to run at all.
+//
+// Overlays are ephemeral by design (writes never reach the source tree),
+// so persistence warnings do not apply. Cross-checks: duplicate or nested
+// overlays, and any overlapping writable exposure — explicit binds
+// (-b/-r/--bind-socket) or --home — are hard errors; a path must not be
+// both an overlay's disposable view and some bind's persistent mount.
+func CheckOverlays(opts *cliutil.Options, home string, pinner *Pinner,
+	userBinds []Bind, warn func(string)) ([]Overlay, error) {
+	if warn == nil {
+		warn = func(string) {}
+	}
+	var out []Overlay
+	for _, p := range opts.Overlay {
+		rp := RealPath(p)
+		if rp == "" || !filepath.IsAbs(rp) {
+			return nil, fmt.Errorf("--overlay %s: cannot resolve to an absolute path", p)
+		}
+		// String-only rules first (no exemption, no opt-in): a path
+		// refused on its shape reports the refusal, not a pin error.
+		var hits []string
+		for _, q := range ProtectedPaths(home) {
+			if Covers(rp, q) {
+				hits = append(hits, q)
+			}
+		}
+		if len(hits) > 0 {
+			sort.Strings(hits)
+			return nil, fmt.Errorf("--overlay %s covers protected path(s): %s",
+				p, strings.Join(hits, ", "))
+		}
+		for _, r := range NoDescendRoots {
+			if Covers(r, rp) {
+				return nil, fmt.Errorf("--overlay %s: %s is inside %s — kernel/pseudo-fs "+
+					"ground (host escapes; the sandbox gets a fresh, safe view anyway)", p, rp, r)
+			}
+		}
+		var sockHits []string
+		for _, cs := range ControlSockets() {
+			if Covers(rp, cs.Path) || Covers(cs.Path, rp) {
+				sockHits = append(sockHits, cs.Path)
+			}
+		}
+		if len(sockHits) > 0 {
+			sort.Strings(sockHits)
+			return nil, fmt.Errorf("--overlay %s overlaps host control socket(s): %s — "+
+				"that hands the sandbox full control of the host", p, strings.Join(sockHits, ", "))
+		}
+		if anyCovers(RuntimeRoots(), rp) {
+			return nil, fmt.Errorf("--overlay %s: %s lives under a runtime dir — control-socket "+
+				"territory, and overlays have no opt-in for it", p, rp)
+		}
+
+		// fd-first, exactly like -b: pin, then validate the pinned object.
+		if pinner == nil {
+			return nil, fmt.Errorf("--overlay %s: internal: no pinner configured", p)
+		}
+		fd, fatal := pinner.Pin(rp, false)
+		if fatal != nil {
+			return nil, fmt.Errorf("--overlay %s: %v", p, fatal)
+		}
+		if fd == nil {
+			return nil, fmt.Errorf("--overlay %s: no pinned descriptor — overlays require "+
+				"fd binds (bwrap >= 0.10); refusing rather than mounting an unpinned source", p)
+		}
+		mode, err := fstatMode(int(fd.Fd()))
+		if err != nil {
+			return nil, fmt.Errorf("--overlay %s: cannot stat the pinned source: %v", p, err)
+		}
+		if mode&syscall.S_IFMT != syscall.S_IFDIR {
+			return nil, fmt.Errorf("--overlay %s: %s is not a directory — overlays merge a "+
+				"writable layer onto a directory", p, rp)
+		}
+		scanRoot := fmt.Sprintf("/proc/self/fd/%d", fd.Fd())
+		if found := ContainsSocket(scanRoot, rp, opts.Verbose, warn); found != "" {
+			shown := found
+			if strings.HasPrefix(found, scanRoot) {
+				shown = rp + found[len(scanRoot):]
+			}
+			return nil, fmt.Errorf("--overlay %s: contains a Unix socket (%s) — control-socket "+
+				"territory; overlays have no --bind-socket-style opt-in", p, strconv.Quote(shown))
+		}
+
+		// Cross-checks against earlier overlays.
+		for _, o := range out {
+			if o.Path == rp {
+				return nil, fmt.Errorf("--overlay %s: %s is already overlaid", p, rp)
+			}
+			if Covers(o.Path, rp) || Covers(rp, o.Path) {
+				return nil, fmt.Errorf("--overlay %s overlaps --overlay %s — nested overlays "+
+					"are not supported; overlay the outermost directory", p, o.Path)
+			}
+		}
+		// And against every explicit mount: an overlay must not double as
+		// a bind (the bind would shadow or persist what the overlay
+		// promises to keep disposable).
+		for _, b := range userBinds {
+			if Covers(b.Path, rp) || Covers(rp, b.Path) {
+				return nil, fmt.Errorf("--overlay %s overlaps the %s mount of %s — pick one "+
+					"view per path", p, b.Flag, b.Path)
+			}
+		}
+		// And --home: a rw $HOME bind under or over the overlay hands
+		// writes a persistent path around the disposable layer.
+		if opts.Home {
+			if realHome := RealPath(home); Covers(realHome, rp) || Covers(rp, realHome) {
+				return nil, fmt.Errorf("--overlay %s overlaps $HOME under --home — the home "+
+					"bind would expose the same tree writable; drop --home or move the overlay", p)
+			}
+		}
+		out = append(out, Overlay{Path: rp, FD: fd})
+	}
+	return out, nil
 }
 
 func pathExists(p string) bool {

@@ -3,10 +3,13 @@
 // parsing, because distro backports of individual options exist and
 // upstream version numbers lie), the unprivileged-userns probe
 // (userns_probe_ok, run per launch with the same ns/pid/session flags
-// as the real argv), and the argv renderer for a sandbox.Spec
-// (build_bwrap's tail): the fixed hardening skeleton, one flag per op
-// in Spec order, and the fd-number accounting that guarantees only
-// argv-named fds reach the child.
+// as the real argv), the complete-arrangement overlay probe
+// (overlay_probe_ok: staging sandbox, pinned sources, bounded store,
+// seccomp bridge, nested namespaces and a real overlayfs write), and
+// the argv renderer for a sandbox.Spec (build_bwrap's tail): the fixed
+// hardening skeleton, one flag per op in Spec order, and the
+// fd-number accounting that guarantees only argv-named fds reach the
+// child.
 //
 // The fd accounting is the security core: bwrap closes the fds attached
 // to setup ops (--bind-fd, the seccomp fd), but an fd attached to
@@ -21,6 +24,32 @@
 // after an earlier op attached to N must never depend on bwrap's
 // close ordering — and the dups are closed right after the spawn
 // (Launch.CloseAfterSpawn).
+//
+// OVERLAYS (Specs carrying sandbox.Overlay ops) render as a two-level
+// launch because bwrap resolves overlay sources by pathname in its parent
+// mount namespace. A read-only host-root mirror still follows host renames;
+// using original host paths there would discard the fd-pinning guarantee.
+//
+// The trusted outer bwrap mirrors the host root read-only for its runtime,
+// mounts fresh proc/dev and a private tmpfs at /tmp, and stages ALL mount
+// sources at independent paths under /tmp/sbox-stage. Every validated pin
+// is mounted from its descriptor; ordinary binds retain their requested
+// mode, while overlay lowers are always read-only. Setup files and the
+// inner bwrap binary also live on this private tmpfs. A separate, single
+// size-bounded tmpfs holds all overlay upper/work directories.
+//
+// The inner bwrap resolves only those stable staged sources, builds the
+// final sandbox on a fresh root, and installs seccomp as its last step
+// before exec. When filtering, a fixed trusted shell bridge opens the
+// staged filter as fd 3; bwrap consumes it before running the payload.
+// The payload and its descendants are filtered from their first instruction,
+// with --as-pid-1 retained. Staging paths, pivot leftovers and setup
+// descriptors are unreachable from that final root.
+//
+// A host rename or replacement cannot redirect a staged pin to a different
+// source. This is not a content snapshot: host edits within a source remain
+// visible. Overlay writes go only to the bounded store and fail with ENOSPC
+// when full. Explicit writable binds continue to write to their host sources.
 package bwrap
 
 import (
@@ -31,15 +60,17 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
 
+	"sbox/internal/bindpolicy"
 	"sbox/internal/sandbox"
 	"sbox/internal/seccomp"
 )
 
-// probeTimeout bounds both subprocess probes.
+// probeTimeout bounds subprocess probes.
 const probeTimeout = 10 * time.Second
 
 // Provider renders sandbox.Specs as bwrap argv. Construct with New,
@@ -112,6 +143,11 @@ func ParseCaps(text string) sandbox.Caps {
 		// >= 0.10 (or a distro backport): TOCTOU-free binds via pinned
 		// O_PATH fds.
 		BindFD: hasOpt(text, "--bind-fd") && hasOpt(text, "--ro-bind-fd"),
+		// >= 0.11: disposable overlays. Both spellings required —
+		// --overlay alone (no way to name a source) is useless here.
+		// NOTE: bwrap refuses these options in setuid mode; the runtime
+		// overlay probe is what actually decides the host can run one.
+		Overlay: hasOpt(text, "--overlay-src") && hasOpt(text, "--overlay"),
 	}
 }
 
@@ -175,8 +211,163 @@ func (p *Provider) runOk(argv []string) bool {
 	return cmd.Run() == nil
 }
 
+// OverlayProbe answers: can THIS host really run the complete --overlay
+// arrangement — trusted staging sandbox (ro host mirror, pinned source,
+// bounded store), the fixed seccomp bridge when a filter applies, nested
+// namespaces, the inner hardening skeleton, an actual overlayfs mount
+// and a write through it — with the SAME flags the real launch will
+// use? Capability probing cannot see any of this: bwrap refuses the
+// overlay options in setuid mode, unprivileged overlayfs needs a
+// suitable kernel (>= 5.11 for userxattr), and the staging arrangement
+// depends on namespace nesting the userns probe never exercises. The
+// probe runs once per launch, before the real argv is committed; an error
+// means the launcher REFUSES to run overlays (never a silent fallback —
+// a path-based overlay would give up the fd-pinning guarantee).
+//
+// The payload verifies more than exit status: it writes through the
+// overlay (a broken mount fails), checks that neither the staging tree nor the
+// pivot leftovers are visible, and the launcher side then verifies the
+// write did NOT reach the host source (an overlay silently mounted
+// read-write onto the source itself would "pass" every other check).
+func (p *Provider) OverlayProbe(shareNet, hardenUserns bool, filter []byte) error {
+	root, err := os.MkdirTemp("/tmp", "sboxovl.")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	src := filepath.Join(root, "src")
+	sand := filepath.Join(root, "sand")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		return err
+	}
+	if err := os.Mkdir(sand, 0o755); err != nil {
+		return err
+	}
+	fd, err := bindpolicy.OpenPathPinned(src)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+	if !bindpolicy.FdReaches(fd, src) {
+		return errors.New("overlay probe source changed while pinning")
+	}
+
+	spec := overlayProbeSpec(src, sand, fd, shareNet, hardenUserns, filter)
+
+	launch, err := p.Build(spec)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, f := range launch.PassFDs {
+			f.Close()
+		}
+		for _, f := range launch.CloseAfterSpawn {
+			f.Close()
+		}
+	}()
+	if launch.Bin == "" {
+		return errors.New("overlay probe has no backend binary")
+	}
+	argv := append(append([]string{}, launch.Argv...), "--",
+		"/bin/sh", "-c",
+		`test ! -e "$2" && test ! -e /oldroot && : > "$1"`,
+		"sbox-overlay-probe", filepath.Join(src, "probe"), stageDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, launch.Bin, argv...)
+	// The staging argv names its fds (--file, staged binds): hand them
+	// over exactly like the supervisor does.
+	cmd.ExtraFiles = launch.PassFDs
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("overlay probe: %w (output %q)", err, out)
+	}
+	// The write must have landed in the disposable store, never on the
+	// host source: a present probe file means the "overlay" was writing
+	// through to the real tree.
+	if _, err := os.Stat(filepath.Join(src, "probe")); err == nil {
+		_ = os.RemoveAll(filepath.Join(src, "probe"))
+		return errors.New("overlay probe wrote through to the host source")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("cannot check overlay probe source: %w", err)
+	}
+	return nil
+}
+
+// overlayProbeSpec shares the production runtime mounts and launch options.
+// Kept separate so the runtime can also be exercised on hosts that disallow
+// the second user namespace, without skipping the shell/runtime regression.
+func overlayProbeSpec(src, sand string, fd *os.File, shareNet, hardenUserns bool, filter []byte) *sandbox.Spec {
+	spec := &sandbox.Spec{
+		Ops: []sandbox.Op{
+			sandbox.ProcFS{Path: "/proc"},
+			sandbox.DevFS{Path: "/dev"},
+			// The $WORK-style rw path mount is staged separately from
+			// the private /tmp holding setup files and the overlay store.
+			sandbox.Mount{Src: sand, Dst: "/tmp", RW: true},
+			sandbox.Overlay{Src: src, Dst: src, FD: fd},
+		},
+		DisableUserns:    hardenUserns,
+		OverlayStoreSize: 1 << 20,
+		Seccomp:          filter,
+	}
+	spec.Ops = append(spec.Ops, sandbox.SystemMounts()...)
+	if shareNet {
+		spec.Ops = append(spec.Ops, sandbox.ShareNet{})
+	}
+
+	return spec
+}
+
 // extraFDBase is the first child fd os/exec assigns to ExtraFiles.
 const extraFDBase = 3
+
+// Staging paths, visible ONLY inside the staging sandbox: the real
+// sandbox pivots to a fresh root, so the payload can never reach them.
+const (
+	stageDir      = "/tmp/sbox-stage"
+	stageBinary   = stageDir + "/bwrap"
+	stageSeccomp  = stageDir + "/seccomp.bpf" // the filter bytes, staged for the inner bwrap
+	stageStore    = stageDir + "/st"          // the ONE size-bounded tmpfs (all overlays)
+	stageMountFmt = stageDir + "/mounts/%d"   // ordinary mounts, with their requested mode
+	stageSrcFmt   = stageDir + "/src/%d"      // pinned overlay sources, ro
+	stageUpperFmt = stageStore + "/u%d"
+	stageWorkFmt  = stageStore + "/w%d"
+)
+
+// stageSeccompBridge is the staging payload when seccomp is enabled:
+// bwrap closes every fd its argv does not name, so the filter cannot
+// ride an inherited descriptor into the inner bwrap. The staging sandbox
+// materializes the bytes host-side (--file), this fixed script opens
+// them as fd 3, and `exec "$@"` hands control to the inner bwrap with
+// its options expanded VERBATIM from argv (never re-parsed by the
+// shell). The script is a constant: no untrusted bytes reach it.
+const stageSeccompBridge = "exec 3<" + stageSeccomp + "\nexec \"$@\""
+
+// stageBin resolves the host binary to bind at stageBinary. Staging the
+// executable also preserves binaries located under the host's /tmp, which
+// the staging namespace hides. Bare or relative names resolve through PATH
+// here, never inside the staging payload.
+func (p *Provider) stageBin() (string, error) {
+	bin := p.Bin
+	if bin == "" {
+		bin = "bwrap"
+	}
+	if !filepath.IsAbs(bin) {
+		resolved, err := exec.LookPath(bin)
+		if err != nil {
+			return "", err
+		}
+		bin = resolved
+	}
+	// Fail HERE, not inside the staging sandbox: a missing binary is a
+	// launch-time error with a host-side message.
+	if st, err := os.Stat(bin); err != nil || !st.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", bin)
+	}
+	return bin, nil
+}
 
 // Build renders the spec as a bwrap Launch: [seccomp flag+fd] + [userns
 // hardening] + the fixed skeleton (--unshare-all … --clearenv) + one
@@ -185,9 +376,23 @@ const extraFDBase = 3
 // install them is an ERROR (never a silent skip — --no-seccomp is the
 // explicit opt-out and never produces Seccomp bytes), and so is a
 // pinned-fd mount on a backend without --bind-fd.
+//
+// Specs with Overlay ops render as a two-level launch (see the package
+// comment). Every source gets a private staging mountpoint, with pins
+// consumed by the outer bwrap. The inner argv retains the operation order
+// and requested mount modes, but resolves its sources only through these
+// independent mountpoints. Host pathname swaps cannot redirect them.
 func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 	l := &sandbox.Launch{Bin: p.bin()}
-	argv := []string{}
+	var owned []*os.File
+	built := false
+	defer func() {
+		if !built {
+			for _, f := range owned {
+				f.Close()
+			}
+		}
+	}()
 	// childFD names f in the child: the FIRST use passes the original
 	// file; every further use gets its own dup (CloseAfterSpawn) — a
 	// pin named twice in one argv (the cwd mount plus a -b of the same
@@ -207,6 +412,7 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 			return "", fmt.Errorf("cannot dup pinned bind fd: %v", err)
 		}
 		dup := os.NewFile(uintptr(nfd), f.Name()+" dup")
+		owned = append(owned, dup)
 		l.PassFDs = append(l.PassFDs, dup)
 		l.CloseAfterSpawn = append(l.CloseAfterSpawn, dup)
 		return strconv.Itoa(extraFDBase + len(l.PassFDs) - 1), nil
@@ -217,6 +423,42 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 		l.PassFDs = append(l.PassFDs, f)
 		return strconv.Itoa(extraFDBase + len(l.PassFDs) - 1)
 	}
+
+	hasOverlay := false
+	shareNet := false
+	for _, op := range spec.Ops {
+		if _, ok := op.(sandbox.Overlay); ok {
+			hasOverlay = true
+		}
+		if _, ok := op.(sandbox.ShareNet); ok {
+			shareNet = true
+		}
+	}
+	if hasOverlay {
+		// Fail closed before anything spawns: overlays depend on both
+		// the overlay options and fd-pinned sources (a path-based lower
+		// layer would re-open the exact check-to-mount race --bind-fd
+		// exists to close).
+		if !p.Caps.Overlay {
+			return nil, errors.New("this bwrap lacks --overlay-src/--overlay — " +
+				"cannot run --overlay (bwrap >= 0.11 required)")
+		}
+		if !p.Caps.BindFD {
+			return nil, errors.New("this bwrap lacks --bind-fd/--ro-bind-fd — --overlay " +
+				"refuses to run without pinned sources (bwrap >= 0.10)")
+		}
+		if spec.OverlayStoreSize <= 0 {
+			return nil, errors.New("internal: Spec.OverlayStoreSize not set for overlays")
+		}
+	}
+
+	// inner is the REAL sandbox's bwrap argv (without the payload); the
+	// staging fragments below are named in staging-argv order so the fd
+	// numbers assigned by childFD/nameFD match the ExtraFiles slots.
+	var inner []string
+	var stagedMounts []string // all mount sources, on independent private paths
+	var stagedDirs []string   // per-overlay upper/work dir creations
+	var seccompFD string      // the staging --file fd number, "" when unfiltered
 
 	if spec.Seccomp != nil {
 		// Fail-closed: this mirrors seccomp_fd_args' die — the filter
@@ -232,7 +474,24 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 		if err != nil {
 			return nil, fmt.Errorf("seccomp: cannot hand the filter to bwrap: %v", err)
 		}
-		argv = append(argv, flag, nameFD(r))
+		owned = append(owned, r)
+		if hasOverlay {
+			// bwrap #1 copies the pipe into the staging sandbox (--file);
+			// the staging bridge re-opens it as fd 3, which the inner
+			// bwrap consumes at argv-parse time — the filter is still
+			// installed by the INNER bwrap as its very last setup step,
+			// so the payload is covered from its first instruction.
+			// (Overlays imply bwrap >= 0.11, which always has this
+			// spelling; a hypothetical overlay+legacy build refuses.)
+			if flag != "--add-seccomp-fd" {
+				return nil, errors.New("--overlay requires --add-seccomp-fd for the " +
+					"staged filter (this bwrap only offers --seccomp)")
+			}
+			seccompFD = nameFD(r)
+			inner = append(inner, "--add-seccomp-fd", "3")
+		} else {
+			inner = append(inner, flag, nameFD(r))
+		}
 	}
 	if spec.DisableUserns {
 		// Kernel-level: bwrap sets max_user_namespaces=1 in a nested
@@ -247,9 +506,9 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 			return nil, errors.New("internal: Spec.DisableUserns set but bwrap lacks " +
 				"--disable-userns/--assert-userns-disabled (caps not probed?)")
 		}
-		argv = append(argv, "--unshare-user", "--disable-userns", "--assert-userns-disabled")
+		inner = append(inner, "--unshare-user", "--disable-userns", "--assert-userns-disabled")
 	}
-	argv = append(argv,
+	inner = append(inner,
 		"--unshare-all",
 		"--die-with-parent",
 		"--new-session",
@@ -264,28 +523,35 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 		"--clearenv",
 	)
 
+	overlayIdx := 0
+	mountIdx := 0
 	for _, op := range spec.Ops {
 		switch o := op.(type) {
 		case sandbox.Setenv:
-			argv = append(argv, "--setenv", o.Name, o.Value)
+			inner = append(inner, "--setenv", o.Name, o.Value)
 		case sandbox.ProcFS:
-			argv = append(argv, "--proc", o.Path)
+			inner = append(inner, "--proc", o.Path)
 		case sandbox.DevFS:
-			argv = append(argv, "--dev", o.Path)
+			inner = append(inner, "--dev", o.Path)
 		case sandbox.ShareNet:
-			argv = append(argv, "--share-net")
+			inner = append(inner, "--share-net")
 		case sandbox.Tmpfs:
-			argv = append(argv, "--perms", perms(o.Perms), "--tmpfs", o.Path)
+			inner = append(inner, "--perms", perms(o.Perms), "--tmpfs", o.Path)
 		case sandbox.Mkdir:
-			argv = append(argv, "--perms", perms(o.Perms), "--dir", o.Path)
+			inner = append(inner, "--perms", perms(o.Perms), "--dir", o.Path)
 		case sandbox.Chdir:
 			// bwrap applies --chdir after all mounts, wherever it
 			// sits in argv.
-			argv = append(argv, "--chdir", o.Dir)
+			inner = append(inner, "--chdir", o.Dir)
 		case sandbox.Mount:
 			base := "--ro-bind"
 			if o.RW {
 				base = "--bind"
+			}
+			staged := ""
+			if hasOverlay {
+				staged = fmt.Sprintf(stageMountFmt, mountIdx)
+				mountIdx++
 			}
 			if o.FD != nil {
 				if !p.Caps.BindFD {
@@ -297,18 +563,115 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 				if err != nil {
 					return nil, err
 				}
-				argv = append(argv, base+"-fd", n, o.Dst)
+				if hasOverlay {
+					// A host-root mirror still follows host-side renames.
+					// Every pin therefore needs its own mountpoint on the
+					// PRIVATE tmpfs, never the original host pathname.
+					stagedMounts = append(stagedMounts, base+"-fd", n, staged)
+					inner = append(inner, base, staged, o.Dst)
+				} else {
+					inner = append(inner, base+"-fd", n, o.Dst)
+				}
 			} else {
 				if o.Try {
 					base += "-try"
 				}
-				argv = append(argv, base, o.Src, o.Dst)
+				if hasOverlay {
+					// This also preserves sources under the host's /tmp,
+					// which the staging sandbox replaces with a tmpfs.
+					// bwrap reads these sources from its original root.
+					stagedMounts = append(stagedMounts, base, o.Src, staged)
+					inner = append(inner, base, staged, o.Dst)
+				} else {
+					inner = append(inner, base, o.Src, o.Dst)
+				}
 			}
+		case sandbox.Overlay:
+			// The lower layer MUST be the pinned object: bwrap resolves
+			// overlay sources by pathname, so the pin is re-mounted
+			// read-only at a stable staging path and the inner overlay
+			// references THAT — a swapped source component cannot
+			// redirect it after validation.
+			if o.FD == nil {
+				return nil, fmt.Errorf("internal: overlay of %s carries no pinned fd — "+
+					"overlays without fd validation are refused (bwrap >= 0.10)", o.Src)
+			}
+			n, err := childFD(o.FD)
+			if err != nil {
+				return nil, err
+			}
+			src := fmt.Sprintf(stageSrcFmt, overlayIdx)
+			upper := fmt.Sprintf(stageUpperFmt, overlayIdx)
+			work := fmt.Sprintf(stageWorkFmt, overlayIdx)
+			stagedMounts = append(stagedMounts, "--ro-bind-fd", n, src)
+			inner = append(inner, "--overlay-src", src, "--overlay", upper, work, o.Dst)
+			stagedDirs = append(stagedDirs,
+				"--perms", perms(0o700), "--dir", upper,
+				"--perms", perms(0o700), "--dir", work)
+			overlayIdx++
 		default:
 			return nil, fmt.Errorf("internal: unknown sandbox op %T", op)
 		}
 	}
-	l.Argv = argv
+
+	if !hasOverlay {
+		l.Argv = inner
+		built = true
+		return l, nil
+	}
+
+	bin, err := p.stageBin()
+	if err != nil {
+		return nil, fmt.Errorf("--overlay: cannot resolve the bwrap binary for the staging sandbox: %v", err)
+	}
+	// The staging sandbox: unprivileged, hermetic (own pid/net/ipc/uts
+	// namespaces, fresh /proc and /dev — the host's stay invisible),
+	// die-with-parent chained under the launcher, host root mirrored
+	// read-only for the trusted setup runtime. The inner argv uses only
+	// independently staged sources. --share-net of the real launch keeps
+	// staging on the launcher's network namespace (the inner "shared"
+	// netns is staging's view of it).
+	staging := []string{
+		"--unshare-user",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
+	}
+	if !shareNet {
+		staging = append(staging, "--unshare-net")
+	}
+	staging = append(staging,
+		"--die-with-parent",
+		"--ro-bind", "/", "/",
+		"--proc", "/proc",
+		"--dev", "/dev",
+		// /tmp already exists on the host, so mounting over it does
+		// not need a mkdir on the read-only root. All setup paths are
+		// created beneath this private, writable tmpfs.
+		"--perms", perms(0o700), "--tmpfs", "/tmp",
+		"--ro-bind", bin, stageBinary,
+	)
+	if seccompFD != "" {
+		staging = append(staging, "--perms", perms(0o400), "--file", seccompFD, stageSeccomp)
+	}
+	staging = append(staging, stagedMounts...)
+	staging = append(staging, "--perms", perms(0o700),
+		"--size", strconv.FormatInt(spec.OverlayStoreSize, 10), "--tmpfs", stageStore)
+	staging = append(staging, stagedDirs...)
+	staging = append(staging, "--")
+	if seccompFD != "" {
+		staging = append(staging, "/bin/sh", "-c", stageSeccompBridge, "sbox-stage", stageBinary)
+	} else {
+		staging = append(staging, stageBinary)
+	}
+	staging = append(staging, inner...)
+
+	// The fd invariant still holds, with staging as the consumer: every
+	// ExtraFiles slot is named by the STAGING argv (--file, the staged
+	// --*-bind-fd ops); the inner argv names only fd 3, which the
+	// staging bridge opened from the staged file — never a launcher fd.
+	l.Argv = staging
+	built = true
 	return l, nil
 }
 

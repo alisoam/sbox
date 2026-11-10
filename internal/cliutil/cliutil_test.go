@@ -48,6 +48,14 @@ func TestSplitArgv(t *testing.T) {
 			[]string{"-a", "x", "--_selfprobe"}, []string{"y"}},
 		{"bind-socket consumes value", []string{"--bind-socket", "/run/user/1000/bus", "--", "sh"},
 			[]string{"--bind-socket", "/run/user/1000/bus"}, []string{"sh"}},
+		{"overlay consumes value", []string{"--overlay", "/proj", "--", "make"},
+			[]string{"--overlay", "/proj"}, []string{"make"}},
+		{"overlay value may be --", []string{"--overlay", "--", "x"},
+			[]string{"--overlay", "--"}, []string{"x"}},
+		{"overlay-size consumes value", []string{"--overlay-size", "1GiB", "--", "make"},
+			[]string{"--overlay-size", "1GiB"}, []string{"make"}},
+		{"overlay attached value", []string{"--overlay=/proj", "make"},
+			[]string{"--overlay=/proj"}, []string{"make"}},
 		{"upstream consumes value", []string{"--upstream", "http://p:3128", "--", "curl"},
 			[]string{"--upstream", "http://p:3128"}, []string{"curl"}},
 		{"-- after everything", []string{"-v", "--"}, []string{"-v"}, nil},
@@ -95,6 +103,8 @@ func TestParseCLIFlags(t *testing.T) {
 		"-A", "/path/allows", "--allow-file", "/other",
 		"-b", "/src", "-b", "/dst", "-r", "/ro", "--ro-bind", "/ro2",
 		"--bind-socket", "/run/user/1000/bus",
+		"--overlay", "/proj", "--overlay", "/other/deep",
+		"--overlay-size", "512MiB",
 		"--ro-cwd", "--home", "--gui", "--ssh-agent", "--net", "-v", "--verbose", "--shell",
 		"--upstream-insecure", "--no-seccomp", "--filter-output", "--strict-crlf",
 		"--", "curl", "-v", "example.com",
@@ -113,6 +123,12 @@ func TestParseCLIFlags(t *testing.T) {
 	}
 	if want := []string{"/run/user/1000/bus"}; !sliceEq(opts.BindSocket, want) {
 		t.Errorf("BindSocket = %q, want %q", opts.BindSocket, want)
+	}
+	if want := []string{"/proj", "/other/deep"}; !sliceEq(opts.Overlay, want) {
+		t.Errorf("Overlay = %q, want %q", opts.Overlay, want)
+	}
+	if opts.OverlaySize != 512<<20 {
+		t.Errorf("OverlaySize = %d, want %d", opts.OverlaySize, 512<<20)
 	}
 	for _, c := range []struct {
 		name string
@@ -262,6 +278,14 @@ func TestParseCLIErrors(t *testing.T) {
 		{[]string{"--verbose=x"}, `argument --verbose: ignored explicit argument "x"`},
 		{[]string{"--ssh-agent=1"}, `argument --ssh-agent: ignored explicit argument "1"`},
 		{[]string{"--strict-crlf=1"}, `argument --strict-crlf: ignored explicit argument "1"`},
+		{[]string{"--overlay"}, "argument --overlay: expected one argument"},
+		{[]string{"--overlay-size"}, "argument --overlay-size: expected one argument"},
+		{[]string{"--overlay-size", "1.5GiB"}, `argument --overlay-size: invalid size "1.5GiB"`},
+		{[]string{"--overlay-size", "bananas"}, `argument --overlay-size: invalid size "bananas"`},
+		{[]string{"--overlay-size", "-1"}, `argument --overlay-size: invalid size "-1"`},
+		{[]string{"--overlay-size", "0"}, `argument --overlay-size: invalid size "0"`},
+		{[]string{"--overlay-size", "1KiB"}, `argument --overlay-size: invalid size "1KiB"`},
+		{[]string{"--overlay-size", "17TiB"}, `argument --overlay-size: invalid size "17TiB"`},
 	}
 	for _, c := range cases {
 		_, _, err := ParseCLI(c.argv)
@@ -271,6 +295,37 @@ func TestParseCLIErrors(t *testing.T) {
 		}
 		if err.Error() != c.want && !strings.HasPrefix(err.Error(), c.want) {
 			t.Errorf("ParseCLI(%q) err = %q, want %q", c.argv, err, c.want)
+		}
+	}
+}
+
+func TestParseSizeBytes(t *testing.T) {
+	gib := int64(1) << 30
+	for _, tc := range []struct {
+		in   string
+		want int64
+	}{
+		{"1073741824", gib},
+		{"1GiB", gib},
+		{"1gib", gib},
+		{"1GB", 1e9},
+		{"1gb", 1e9},
+		{"500MB", 500e6},
+		{"512MiB", 512 << 20},
+		{"16TiB", 1 << 44},
+		{"1MiB", 1 << 20},
+		{"1mib", 1 << 20},
+		{"1048576", 1 << 20},
+	} {
+		got, err := ParseSizeBytes(tc.in)
+		if err != nil || got != tc.want {
+			t.Errorf("ParseSizeBytes(%q) = %d, %v; want %d, nil", tc.in, got, err, tc.want)
+		}
+	}
+	for _, bad := range []string{"", " ", "GiB", "1.5GiB", "1 GiB", "-1GiB", "+1GiB",
+		"1XiB", "1 GiB ", "0", "1024", "1KB", "1G", "2PiB", "999999999999999999999"} {
+		if got, err := ParseSizeBytes(bad); err == nil {
+			t.Errorf("ParseSizeBytes(%q) = %d, want an error", bad, got)
 		}
 	}
 }

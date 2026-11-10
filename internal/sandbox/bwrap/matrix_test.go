@@ -112,7 +112,7 @@ func TestBuildLaunchMatrix(t *testing.T) {
 			defer pinner.Close()
 			opts := &cliutil.Options{Net: tc.net, Home: tc.home, Gui: tc.gui, RoCwd: tc.roCwd}
 			spec, err := sandbox.BuildSpec(opts, tc.cwd, sand, sock, home, tc.binds,
-				tc.agent, tc.sshCfg, pinner, func(string) {})
+				nil, tc.agent, tc.sshCfg, pinner, func(string) {})
 			if err != nil {
 				t.Fatal(err)
 			}

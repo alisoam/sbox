@@ -102,20 +102,29 @@ func TestFilteredProxyLogCloseWithBlockedSink(t *testing.T) {
 }
 
 // fakeProvider stands in for the bwrap backend: preset caps, a possibly
-// recording userns probe, and Build returning a Launch for a shim
-// binary.
+// recording userns probe, an overlay probe, and Build returning a
+// Launch for a shim binary.
 type fakeProvider struct {
-	caps     Caps
-	bin      string
-	userns   int
-	usernsOK bool
-	specs    []*Spec
-	build    func(*Spec) (*Launch, error)
+	caps      Caps
+	bin       string
+	userns    int
+	usernsOK  bool
+	overlay   int
+	overlayOK bool
+	specs     []*Spec
+	build     func(*Spec) (*Launch, error)
 }
 
 func (f *fakeProvider) Name() string          { return "fake" }
 func (f *fakeProvider) Probe() (Caps, error)  { return f.caps, nil }
 func (f *fakeProvider) UsernsProbe(bool) bool { f.userns++; return f.usernsOK }
+func (f *fakeProvider) OverlayProbe(bool, bool, []byte) error {
+	f.overlay++
+	if !f.overlayOK {
+		return fmt.Errorf("overlay probe failed")
+	}
+	return nil
+}
 func (f *fakeProvider) Build(spec *Spec) (*Launch, error) {
 	f.specs = append(f.specs, spec)
 	if f.build != nil {
@@ -390,6 +399,116 @@ func TestSupervisorTOCTOUNote(t *testing.T) {
 	if len(notes) != 1 || !strings.Contains(notes[0], "lacks --bind-fd") {
 		t.Errorf("TOCTOU note = %v", notes)
 	}
+}
+
+func TestSupervisorOverlay(t *testing.T) {
+	overlayable := func(t *testing.T, root string) string {
+		t.Helper()
+		p := filepath.Join(root, "ovl")
+		if err := os.Mkdir(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("invalid source refuses before any probe", func(t *testing.T) {
+		sup, fp, root := newTestSupervisor(t)
+		sup.Opts.Overlay = []string{filepath.Join(root, "does-not-exist")}
+		var notes []string
+		sup.Warn = func(w string) { notes = append(notes, w) }
+		if rc := sup.Run(); rc != 1 {
+			t.Fatalf("rc = %d, notes = %v", rc, notes)
+		}
+		if len(notes) != 1 || !strings.Contains(notes[0], "--overlay") {
+			t.Errorf("notes = %v, want the --overlay validation refusal", notes)
+		}
+		if fp.overlay != 0 {
+			t.Errorf("probe runs = %d, want 0 (validation dies first)", fp.overlay)
+		}
+	})
+
+	t.Run("missing capability refuses without the probe", func(t *testing.T) {
+		sup, fp, root := newTestSupervisor(t)
+		sup.Opts.Overlay = []string{overlayable(t, root)}
+		fp.caps = Caps{BindFD: true} // no Overlay
+		var notes []string
+		sup.Warn = func(w string) { notes = append(notes, w) }
+		if rc := sup.Run(); rc != 1 {
+			t.Fatalf("rc = %d, notes = %v", rc, notes)
+		}
+		if len(notes) != 1 || !strings.Contains(notes[0], "bwrap >= 0.11") {
+			t.Errorf("notes = %v, want the capability refusal", notes)
+		}
+		if fp.overlay != 0 {
+			t.Errorf("probe runs = %d, want 0", fp.overlay)
+		}
+	})
+
+	t.Run("failing arrangement probe refuses", func(t *testing.T) {
+		sup, fp, root := newTestSupervisor(t)
+		sup.Opts.Overlay = []string{overlayable(t, root)}
+		fp.caps = Caps{BindFD: true, Overlay: true}
+		fp.overlayOK = false
+		var notes []string
+		sup.Warn = func(w string) { notes = append(notes, w) }
+		if rc := sup.Run(); rc != 1 {
+			t.Fatalf("rc = %d, notes = %v", rc, notes)
+		}
+		if fp.overlay != 1 {
+			t.Errorf("probe runs = %d, want 1", fp.overlay)
+		}
+		if len(notes) != 1 || !strings.Contains(notes[0], "cannot run the overlay staging arrangement") {
+			t.Errorf("notes = %v, want the probe refusal", notes)
+		}
+	})
+
+	t.Run("probe ok launches with a pinned overlay op", func(t *testing.T) {
+		sup, fp, root := newTestSupervisor(t)
+		ovl := overlayable(t, root)
+		sup.Opts.Overlay = []string{ovl}
+		fp.caps = Caps{BindFD: true, Overlay: true}
+		fp.overlayOK = true
+		var notes []string
+		sup.Warn = func(w string) { notes = append(notes, w) }
+		if rc := sup.Run(); rc != 42 {
+			t.Fatalf("rc = %d, notes = %v", rc, notes)
+		}
+		if fp.overlay != 1 || len(fp.specs) != 1 {
+			t.Fatalf("probe runs = %d specs = %d", fp.overlay, len(fp.specs))
+		}
+		var ovlOp *Overlay
+		for _, op := range fp.specs[0].Ops {
+			if o, ok := op.(Overlay); ok && o.Src == ovl {
+				ovlOp = &o
+			}
+		}
+		if ovlOp == nil || ovlOp.FD == nil {
+			t.Fatalf("no pinned overlay op for %s in the spec", ovl)
+		}
+		if fp.specs[0].OverlayStoreSize != cliutil.DefaultOverlaySize {
+			t.Errorf("OverlayStoreSize = %d, want the default", fp.specs[0].OverlayStoreSize)
+		}
+		// the cwd (not covered by the overlay) mounted read-only, loudly
+		cwd, _ := sup.Getwd()
+		ro := false
+		for _, op := range fp.specs[0].Ops {
+			if m, ok := op.(Mount); ok && m.Src == cwd && m.Dst == cwd && !m.RW {
+				ro = true
+			}
+		}
+		if !ro {
+			t.Errorf("cwd %s was not auto-mounted read-only with overlays in use", cwd)
+		}
+		found := false
+		for _, n := range notes {
+			if strings.Contains(n, "cwd is mounted read-only because --overlay") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no read-only cwd note: %v", notes)
+		}
+	})
 }
 
 // --- signals -----------------------------------------------------------

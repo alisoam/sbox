@@ -13,7 +13,7 @@ import (
 
 // fmtOps renders ops compactly for goldens: setenv NAME=VALUE,
 // proc/dev paths, rw|ro[|-try] src->dst[ fd], tmpfs/dir path perms,
-// share-net, chdir path.
+// overlay src=>dst fd, share-net, chdir path.
 func fmtOps(ops []Op) []string {
 	out := make([]string, 0, len(ops))
 	for _, op := range ops {
@@ -32,6 +32,12 @@ func fmtOps(ops []Op) []string {
 			out = append(out, "dir "+o.Path)
 		case Chdir:
 			out = append(out, "chdir "+o.Dir)
+		case Overlay:
+			s := "overlay " + o.Src + "=>" + o.Dst
+			if o.FD != nil {
+				s += " fd"
+			}
+			out = append(out, s)
 		case Mount:
 			mode := "ro"
 			if o.RW {
@@ -87,7 +93,7 @@ func TestBuildSpecPlain(t *testing.T) {
 
 	var warns []string
 	spec, err := BuildSpec(&cliutil.Options{}, cwd, sand, sock, home,
-		nil, "", sshCfg, nil, func(w string) { warns = append(warns, w) })
+		nil, nil, "", sshCfg, nil, func(w string) { warns = append(warns, w) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +155,7 @@ func TestBuildSpecNetBranch(t *testing.T) {
 	}
 	spec, err := BuildSpec(&cliutil.Options{Net: true}, cwd,
 		filepath.Join(dir, "sand"), filepath.Join(dir, "sock"), filepath.Join(dir, "home"),
-		nil, "", "", nil, nil)
+		nil, nil, "", "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +223,7 @@ func TestBuildSpecHomeGuiAgent(t *testing.T) {
 	var warns []string
 	spec, err := BuildSpec(&cliutil.Options{Home: true, Gui: true}, cwd,
 		filepath.Join(dir, "sand"), filepath.Join(dir, "sock"), home,
-		nil, agentSock, "", pinner, func(w string) { warns = append(warns, w) })
+		nil, nil, agentSock, "", pinner, func(w string) { warns = append(warns, w) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +276,7 @@ func TestBuildSpecCwdCases(t *testing.T) {
 		var warns []string
 		spec, err := BuildSpec(&cliutil.Options{}, inHome,
 			filepath.Join(dir, "sand"), filepath.Join(dir, "sock"), home,
-			nil, "", "", nil, func(w string) { warns = append(warns, w) })
+			nil, nil, "", "", nil, func(w string) { warns = append(warns, w) })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,7 +296,7 @@ func TestBuildSpecCwdCases(t *testing.T) {
 		defer pinner.Close()
 		spec, err := BuildSpec(&cliutil.Options{}, filepath.Join(rt, "sub"),
 			filepath.Join(dir, "sand"), filepath.Join(dir, "sock"), home,
-			nil, "", "", pinner, func(w string) { warns = append(warns, w) })
+			nil, nil, "", "", pinner, func(w string) { warns = append(warns, w) })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -324,7 +330,7 @@ func TestBuildSpecCwdCases(t *testing.T) {
 		spec, err := BuildSpec(&cliutil.Options{}, cwd,
 			filepath.Join(dir, "sand"), filepath.Join(dir, "sock"), home,
 			[]bindpolicy.Bind{{Flag: "--bind", Path: bear}},
-			"", "", nil, func(w string) { warns = append(warns, w) })
+			nil, "", "", nil, func(w string) { warns = append(warns, w) })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -346,7 +352,7 @@ func TestBuildSpecCwdCases(t *testing.T) {
 		spec, err := BuildSpec(&cliutil.Options{RoCwd: true}, clean,
 			filepath.Join(dir, "sand"), filepath.Join(dir, "sock"), home,
 			[]bindpolicy.Bind{{Flag: "--ro-bind", Path: clean}, {Flag: "--bind", Path: bear}},
-			"", "", nil, nil)
+			nil, "", "", nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -456,5 +462,123 @@ func TestSSHClientConfigGolden(t *testing.T) {
 	}
 	if SSHClientConfig != string(want) {
 		t.Errorf("SSH client config changed: got %q, want %q", SSHClientConfig, want)
+	}
+}
+
+// overlaySpec is the shared fixture for the --overlay BuildSpec rules:
+// a home, a project dir (cwd) and one or two validated-style overlay
+// pairs (a real pin from an open dir fd stands in for the pinner's).
+func overlaySpec(t *testing.T) (dir, home, proj, other string) {
+	t.Helper()
+	t.Setenv("USER", "tester")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	dir = t.TempDir()
+	home = filepath.Join(dir, "home")
+	proj = filepath.Join(dir, "proj")
+	other = filepath.Join(dir, "other")
+	for _, d := range []string{home, proj, other} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir, home, proj, other
+}
+
+func overlayPairs(t *testing.T, paths ...string) []bindpolicy.Overlay {
+	t.Helper()
+	var out []bindpolicy.Overlay
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		out = append(out, bindpolicy.Overlay{Path: p, FD: f})
+	}
+	return out
+}
+
+func TestBuildSpecOverlayCoveringCwd(t *testing.T) {
+	_, home, proj, _ := overlaySpec(t)
+	var warns []string
+	spec, err := BuildSpec(&cliutil.Options{Overlay: []string{proj}},
+		proj, filepath.Join(proj, "sand"), filepath.Join(proj, "sock"), home,
+		nil, overlayPairs(t, proj), "", "", nil, func(w string) { warns = append(warns, w) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmtOps(spec.Ops)
+	// the overlay's merged view replaces the automatic cwd mount: no
+	// cwd bind, no read-only downgrade note, chdir still lands there.
+	requireOps(t, got[len(got)-2:], []string{
+		"overlay " + proj + "=>" + proj + " fd",
+		"chdir " + proj,
+	})
+	if len(warns) != 0 {
+		t.Errorf("an overlay-covered cwd must be silent: %q", warns)
+	}
+	if spec.OverlayStoreSize != cliutil.DefaultOverlaySize {
+		t.Errorf("OverlayStoreSize = %d, want the default", spec.OverlayStoreSize)
+	}
+}
+
+func TestBuildSpecOverlayForcesReadOnlyCwd(t *testing.T) {
+	_, home, proj, other := overlaySpec(t)
+	var warns []string
+	spec, err := BuildSpec(&cliutil.Options{Overlay: []string{other}},
+		proj, filepath.Join(proj, "sand"), filepath.Join(proj, "sock"), home,
+		nil, overlayPairs(t, other), "", "", nil, func(w string) { warns = append(warns, w) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmtOps(spec.Ops)
+	requireOps(t, got[len(got)-3:], []string{
+		"ro " + proj + "->" + proj, // read-only automatic cwd mount
+		"overlay " + other + "=>" + other + " fd",
+		"chdir " + proj,
+	})
+	if len(warns) != 1 || !strings.Contains(warns[0], "cwd is mounted read-only because --overlay") {
+		t.Errorf("warnings = %q, want the read-only cwd note", warns)
+	}
+
+	// --ro-cwd with overlays stays silent (the mode did not change) —
+	// conflict rules for overlapping binds live in bindpolicy, not here.
+	warns = nil
+	spec, err = BuildSpec(&cliutil.Options{RoCwd: true, Overlay: []string{other}},
+		proj, filepath.Join(proj, "sand"), filepath.Join(proj, "sock"), home,
+		nil, overlayPairs(t, other), "", "", nil, func(w string) { warns = append(warns, w) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warns) != 0 {
+		t.Errorf("--ro-cwd + overlays must not warn: %q", warns)
+	}
+}
+
+func TestBuildSpecOverlayOrderAndSize(t *testing.T) {
+	_, home, proj, other := overlaySpec(t)
+	bear := filepath.Join(proj, "out")
+	if err := os.Mkdir(bear, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := BuildSpec(&cliutil.Options{Overlay: []string{other, proj},
+		OverlaySize: 2 << 30},
+		proj, filepath.Join(proj, "sand"), filepath.Join(proj, "sock"), home,
+		[]bindpolicy.Bind{{Flag: "--bind", Path: bear}},
+		overlayPairs(t, other, proj), "", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmtOps(spec.Ops)
+	// overlays follow the user binds (later mounts shadow earlier
+	// ones), in CLI order, with the explicit store size carried.
+	requireOps(t, got[len(got)-4:], []string{
+		"rw " + bear + "->" + bear,
+		"overlay " + other + "=>" + other + " fd",
+		"overlay " + proj + "=>" + proj + " fd",
+		"chdir " + proj,
+	})
+	if spec.OverlayStoreSize != 2<<30 {
+		t.Errorf("OverlayStoreSize = %d, want the parsed 2GiB", spec.OverlayStoreSize)
 	}
 }

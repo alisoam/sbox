@@ -1,6 +1,6 @@
-// Package bindpolicy validates -b/-r/--bind-socket sources and the automatic
-// cwd mount, pins their descriptors, scans for sockets and warns when
-// writable binds cover host persistence paths.
+// Package bindpolicy validates -b/-r/--bind-socket sources, --overlay
+// sources and the automatic cwd mount, pins their descriptors, scans for
+// sockets and warns when writable binds cover host persistence paths.
 // Validation rules and mount modes are covered by native contract tests.
 //
 // Security model (fd-first, fail-closed):
@@ -36,7 +36,11 @@
 //     With pinning unavailable (old bwrap) every check runs on the path
 //     instead — the documented TOCTOU fallback. A missing -b/-r source
 //     dies; --bind-socket of a not-yet-created runtime path keeps the
-//     path form (bwrap's own not-found error preserved).
+//     path form (bwrap's own not-found error preserved). --overlay
+//     sources are ALWAYS pinned (nil pin = refusal): bwrap resolves
+//     overlay lower paths by NAME, so the pinned object is what a
+//     private staging namespace must re-mount for the swap protection to
+//     survive (see internal/sandbox/bwrap).
 //   - Read-write -b binds covering $HOME persistence paths (shell rc and
 //     session files, ~/.ssh/authorized_keys, systemd user units, XDG
 //     autostart, environment.d, ~/.local/bin, ~/.cargo/bin, ~/go/bin,

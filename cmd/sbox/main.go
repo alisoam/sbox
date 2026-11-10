@@ -46,13 +46,17 @@ func run(argv []string) int {
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	if _, err := exec.LookPath("bwrap"); err != nil {
+	bin, err := exec.LookPath("bwrap")
+	if err != nil {
 		return die("missing dependency: bwrap (needed on the host)")
 	}
 	// Probe bwrap's capabilities ONCE here (never lazily inside the
 	// supervisor: a test shim on $PATH would not survive a second
-	// `bwrap --help`); the provider carries the cached result.
-	backend := bwrap.New("")
+	// `bwrap --help`); the provider carries the cached result. The
+	// resolved absolute path matters for --overlay: the staging
+	// arrangement re-execs bwrap inside a private sandbox that has no
+	// $PATH.
+	backend := bwrap.New(bin)
 	_, probeErr := backend.Probe()
 	// Warn when capability probing fails. A successful probe lacking seccomp
 	// gets the dedicated fail-closed error when the supervisor checks it.

@@ -9,6 +9,7 @@ $ sbox -a pypi.org -a files.pythonhosted.org -- pip install requests
 $ sbox -a github.com -- git clone https://github.com/torvalds/linux
 $ sbox -a example.com -v -- curl -sI https://example.com
 $ sbox --ssh-agent -a github.com -- git clone git@github.com:me/repo.git
+$ sbox --overlay "$PWD" --overlay-size 1GiB -- make
 ```
 
 Why not just `bwrap` alone? Namespaces hide the network but give you no
@@ -31,6 +32,11 @@ standard library.
   `>= 0.10` mounts binds from pinned fds (no check-to-mount race). Older
   bwrap degrades with a loud note; without seccomp support the launcher
   refuses to run unless `--no-seccomp` is passed explicitly.
+- `--overlay` additionally needs `bwrap >= 0.11` in non-setuid mode (the
+  overlay options are refused by setuid bwrap), the pinned-fd binds of
+  `>= 0.10`, and a kernel with unprivileged overlayfs (Linux >= 5.11);
+  hosts that fail a live probe of the complete arrangement refuse the
+  launch rather than mount unverified sources.
 
 ## Install
 
@@ -60,6 +66,8 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `-b, --bind PATH` | Bind `PATH` read-write into the sandbox. Repeatable. |
 | `-r, --ro-bind PATH` | Bind `PATH` read-only. Repeatable. |
 | `--bind-socket PATH` | Explicit opt-in to bind a socket, a runtime-dir path, or a socket-bearing directory that `-b`/`-r` refuse by default. **Read-only** for socket files and `/run`/`$XDG_RUNTIME_DIR` paths (connect-only — *never* read-write: `-b PATH --bind-socket PATH` is refused too); **read-write** for a plain directory (socket-bearing project dirs — `puma.sock`, `.s.PGSQL.5432`, `.git/fsmonitor--daemon.ipc`; combine with `-r PATH` for read-only; rw does let the sandbox replace the sockets inside it — the intended trade-off, since such dirs need writes). Repeatable; known control sockets, protected paths and anything inside `/proc`, `/sys` or `/dev` stay refused. |
+| `--overlay PATH` | Mount `PATH` (an existing directory) at its own resolved path as a **disposable writable view of itself**: reads see the real tree; writes (creates, edits, deletes, renames, chmods, symlinks, hard links) land in a private bounded store that vanishes when the sandbox exits — the source tree is never modified. Repeatable; all overlays share one `--overlay-size` budget. Sources are validated like binds (protected paths, control sockets, socket-bearing trees and runtime dirs are refused — **no opt-in**), may not overlap `--home` or any `-b`/`-r`/`--bind-socket` mount, and duplicate or nested overlays are refused. An overlay covering the cwd replaces the automatic cwd mount with its merged view; a cwd outside every overlay is auto-mounted **read-only** while overlays are in use (`-b "$PWD"` opts back in). Needs bwrap >= 0.11 (non-setuid) plus fd binds and a kernel with unprivileged overlayfs (>= 5.11); the complete staging arrangement is probed before launch and the launcher refuses rather than fall back to unverified sources. |
+| `--overlay-size SIZE` | Combined storage cap for every overlay's writable layer: `1GiB` (the default), `500MB`, `1073741824` — bounds 1MiB..16TiB. Writes past the cap fail with `ENOSPC` inside the sandbox; they never fall back to the host tree. The cap bounds the overlay store only, not total process memory, CPU or PIDs. |
 | `--ro-cwd` | Mount the current directory read-only (default: read-write). |
 | `--home` | Bind the real `$HOME` (default: private tmpfs home). |
 | `--gui` | Pass through Wayland (preferred) and X11 sockets. |
@@ -139,6 +147,33 @@ Everything after the first positional (or `--`) is the sandboxed command.
 - **Lifecycle:** if any component dies, everything dies (supervisor loop,
   `--die-with-parent`, and the in-process proxy) — even a SIGKILLed
   launcher takes the proxy with it.
+- **Disposable overlays (`--overlay`):** bwrap (0.11) resolves overlay
+  *sources* by **pathname** in its parent mount namespace, which would
+  throw away the fd-pinning guarantee binds rely on — and its
+  `--size` only applies to `--tmpfs`, not to overlay backing stores. sbox
+  therefore launches a two-level arrangement. An unprivileged **staging
+  bwrap** mirrors the host root read-only for its trusted setup runtime and
+  mounts a private tmpfs at `/tmp`. Every mount source gets an independent
+  mountpoint under `/tmp/sbox-stage`: validated pins are mounted from their
+  descriptors, overlay lowers are read-only, and ordinary binds retain their
+  requested modes. Host-side renames cannot redirect these mountpoints.
+  A separate **size-bounded tmpfs** (the shared `--overlay-size` budget) holds
+  fresh upper/work directories per overlay. The **real sandbox bwrap** builds
+  the final root from these staged sources and overlays the staged lowers.
+  Overlay writes disappear with the sandbox; explicit writable binds still
+  persist writes to their host sources. This is not a snapshot: host edits
+  within a source remain visible.
+  The seccomp filter travels as staged bytes (`--file`); a fixed trusted
+  shell bridge opens them as fd 3, and the real bwrap installs the filter as
+  its last step before exec. The payload shell, proxy bridge, command and
+  descendants are filtered from their first instruction, with `--as-pid-1`
+  and `--new-session` retained. Staging paths (`/tmp/sbox-stage`, the pivot
+  leftovers) and setup descriptors never reach the payload. The complete
+  arrangement is probed once per launch using the same system runtime mounts,
+  network mode, namespace flags and seccomp filter. Hosts that cannot run it
+  (including blocked nested user namespaces or unavailable unprivileged
+  overlayfs) get a hard refusal with probe diagnostics, never a path-based
+  fallback.
 - **Output filtering (`--filter-output`):** the sandbox normally shares the
   host terminal, and a payload can print escape sequences the terminal
   *emulator executes* — OSC 52 rewrites the clipboard, device queries elicit
@@ -288,6 +323,22 @@ Everything after the first positional (or `--`) is the sandboxed command.
 - `--net` shares the host network namespace: the allowlist is **not** enforced,
   and host loopback services and abstract Unix sockets (D-Bus, X11, ...) become
   reachable. Only use it for trusted work.
+- **`--overlay` protects integrity, not confidentiality.** The overlaid tree
+  stays fully *readable* — an overlay only stops *writes* from reaching it —
+  and it is **not a snapshot**: the pinned lower layer keeps working if the
+  source is renamed or deleted on the host mid-run, but concurrent host edits
+  *inside* the source tree are visible through the merged view with undefined
+  behavior, so keep the underlying tree stable while the sandbox runs. The
+  writable layer lives on one size-bounded tmpfs shared by all overlays
+  (`--overlay-size`, default 1 GiB): past the cap, writes fail with `ENOSPC`
+  — they can never fall back onto the host tree, which is only ever mounted
+  read-only in the whole arrangement. The cap does not limit total process
+  memory, CPU or PIDs. Overlays are refused on protected paths, control
+  sockets, socket-bearing trees and runtime dirs (no `--bind-socket`-style
+  opt-in exists for them), on duplicates or nesting, and when they overlap
+  `--home` or any explicit bind — one view per path. Persistence and
+  exporting changes out of an overlay are deliberately out of scope for this
+  first version.
 
 ## Known limits
 
@@ -299,7 +350,8 @@ Design trade-offs, not bugs:
   requested — including the launcher's `/tmp/sbox.*` work directory. Upstream
   credentials remain in memory.
 - No resource limits (CPU/memory/PID/fds) inside the sandbox; the boundary is
-  bwrap's namespaces plus the seccomp deny-list.
+  bwrap's namespaces plus the seccomp deny-list. `--overlay-size` bounds only
+  the overlay writable store, not process memory.
 - No domain-fronting protection: an allowed CDN host may serve many origins.
 - With `--upstream`, the destination reaches the upstream as a literal IP
   (`CONNECT 1.2.3.4:443`), never the hostname — hostname-based policy on that
@@ -336,7 +388,10 @@ go test -race ./...
 
 The race detector needs a C toolchain; the installed static binary does not.
 Tests use local TCP/Unix sockets and PTYs. Namespace smoke tests need a host
-that permits unprivileged user namespaces. The syscall cross-checks skip
+that permits unprivileged user namespaces; the live overlay boundary tests
+additionally need bwrap >= 0.11 and a kernel with unprivileged overlayfs
+(>= 5.11) — they skip elsewhere, so run them on a capable host before
+shipping overlay changes. The syscall cross-checks skip
 unavailable foreign architecture headers or `ausyscall`; the golden bytecode,
 interpreter and native policy tests always run. No external reference
 implementation is required.

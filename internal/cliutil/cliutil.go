@@ -14,6 +14,7 @@ package cliutil
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -29,6 +30,8 @@ var OptsWithValue = []string{
 	"-b", "--bind",
 	"-r", "--ro-bind",
 	"--bind-socket",
+	"--overlay",
+	"--overlay-size",
 	"--upstream",
 }
 
@@ -96,6 +99,8 @@ type Options struct {
 	Bind             []string
 	RoBind           []string
 	BindSocket       []string
+	Overlay          []string
+	OverlaySize      int64 // parsed bytes; DefaultOverlaySize when unset
 	RoCwd            bool
 	Home             bool
 	Gui              bool
@@ -116,12 +121,14 @@ type Options struct {
 // display names for option error messages
 var (
 	longDisplay = map[string]string{
-		"allow":       "-a/--allow",
-		"allow-file":  "-A/--allow-file",
-		"bind":        "-b/--bind",
-		"ro-bind":     "-r/--ro-bind",
-		"bind-socket": "--bind-socket",
-		"upstream":    "--upstream",
+		"allow":        "-a/--allow",
+		"allow-file":   "-A/--allow-file",
+		"bind":         "-b/--bind",
+		"ro-bind":      "-r/--ro-bind",
+		"bind-socket":  "--bind-socket",
+		"overlay":      "--overlay",
+		"overlay-size": "--overlay-size",
+		"upstream":     "--upstream",
 	}
 	shortDisplay = map[byte]string{
 		'a': "-a/--allow",
@@ -154,12 +161,22 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 				name = name[:j]
 			}
 			switch name {
-			case "allow", "allow-file", "bind", "ro-bind", "bind-socket", "upstream":
+			case "allow", "allow-file", "bind", "ro-bind", "bind-socket", "overlay", "upstream":
 				val, err := takeValue(pre, &i, hasInline, inline, longDisplay[name])
 				if err != nil {
 					return nil, nil, err
 				}
 				applyValue(opts, name, val)
+			case "overlay-size":
+				val, err := takeValue(pre, &i, hasInline, inline, longDisplay[name])
+				if err != nil {
+					return nil, nil, err
+				}
+				n, err := ParseSizeBytes(val)
+				if err != nil {
+					return nil, nil, fmt.Errorf("argument --overlay-size: %v", err)
+				}
+				opts.OverlaySize = n
 			case "ro-cwd", "home", "gui", "ssh-agent", "upstream-insecure", "net", "no-seccomp",
 				"filter-output", "strict-crlf", "verbose", "shell", "_selfprobe", "help":
 				if hasInline {
@@ -203,6 +220,69 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 		opts.FilterOutput = true
 	}
 	return opts, command, nil
+}
+
+// DefaultOverlaySize is the shared storage budget for --overlay writable
+// layers when --overlay-size is not given: 1 GiB, covering all overlays
+// combined.
+const DefaultOverlaySize = 1 << 30
+
+// Overlay size bounds: smaller than 1 MiB cannot even hold a workdir in
+// practice, larger than 16 TiB is meaningless for a tmpfs (bwrap itself
+// caps tmpfs sizes at SIZE_MAX>>1; this stays well under).
+const (
+	minOverlaySize = 1 << 20
+	maxOverlaySize = 1 << 44
+)
+
+// sizeUnits maps a size suffix to its multiplier. Both spellings ("MB",
+// "MiB") are accepted case-insensitively; decimal units are powers of 1000
+// and IEC units powers of 1024, matching tools like systemd and GNU.
+var sizeUnits = map[string]int64{
+	"B":  1,
+	"KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15,
+	"KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40, "PIB": 1 << 50,
+}
+
+// ParseSizeBytes parses a --overlay-size value: an unsigned decimal byte
+// count with an optional unit suffix ("1073741824", "1GiB", "500MB",
+// "16TiB"). No signs, no fractions (write 1536MiB instead of 1.5GiB). The
+// result is clamped to the documented bounds by the caller-facing error.
+func ParseSizeBytes(s string) (int64, error) {
+	fail := func(why string) (int64, error) {
+		return 0, fmt.Errorf("invalid size %q (%s) — expected bytes with an optional unit, "+
+			"e.g. 1GiB, 500MB, 1073741824; bounds %d..%d", s, why, minOverlaySize, maxOverlaySize)
+	}
+	if s == "" {
+		return fail("empty")
+	}
+	digits := 0
+	for digits < len(s) && s[digits] >= '0' && s[digits] <= '9' {
+		digits++
+	}
+	if digits == 0 {
+		return fail("no leading digits")
+	}
+	n, err := strconv.ParseInt(s[:digits], 10, 64)
+	if err != nil {
+		return fail("out of range")
+	}
+	unit := strings.ToUpper(s[digits:])
+	if unit == "" {
+		unit = "B"
+	}
+	mult, ok := sizeUnits[unit]
+	if !ok {
+		return fail("unknown unit " + strconv.Quote(s[digits:]))
+	}
+	if n > maxOverlaySize/mult {
+		return fail("out of range")
+	}
+	n *= mult
+	if n < minOverlaySize || n > maxOverlaySize {
+		return fail("out of range")
+	}
+	return n, nil
 }
 
 // takeValue resolves a value-taking option's value: an attached remainder
@@ -288,6 +368,8 @@ func applyValue(o *Options, name, val string) {
 		o.RoBind = append(o.RoBind, val)
 	case "bind-socket":
 		o.BindSocket = append(o.BindSocket, val)
+	case "overlay":
+		o.Overlay = append(o.Overlay, val)
 	case "upstream":
 		o.Upstream = val
 		o.HasUpstream = true
@@ -374,6 +456,33 @@ Notes:
     puma.sock, .s.PGSQL.5432, .git/fsmonitor--daemon.ipc; combine with
     -r PATH for read-only; rw does let the sandbox replace the sockets
     inside it — the intended trade-off, since such dirs need writes).
+  - Overlays (--overlay PATH): the command sees a writable, disposable view
+    of PATH — writes land in a bounded private store (1 GiB by default,
+    shared by all overlays, --overlay-size) that disappears when the sandbox
+    exits; the source tree is never modified. An overlay covering the cwd
+    replaces the automatic cwd mount with its merged view; a cwd outside
+    every overlay is auto-mounted READ-ONLY while overlays are in use (a
+    writable cwd bind would silently persist exactly what --overlay asks to
+    avoid — pass an explicit -b "$PWD" to opt back in). Overlays reuse the
+    bind validation (protected paths, control sockets, socket-bearing trees,
+    runtime dirs: refused, with NO --bind-socket-style opt-in) and are
+    rejected when they overlap --home, each other (duplicate or nested), or
+    any -b/-r/--bind-socket mount. bwrap resolves overlay sources by PATH,
+    so sbox stages them fd-first: a private, unprivileged staging sandbox
+    mounts every source at an independent path on a private staging tmpfs.
+    Validated sources come from PINNED descriptors; overlay lowers are
+    read-only, and ordinary binds keep their requested modes. A separate
+    size-bounded tmpfs holds all upper/work directories. Host-side path
+    swaps cannot redirect these staged mounts. The launch probe uses the
+    same system runtime mounts, network mode, namespace flags and filter. Staging is invisible to the payload: the sandbox gets a
+    fresh root, and only the fds the argv names cross any exec boundary.
+    Limits: an overlay is NOT a snapshot — host edits inside the source
+    tree during the run are visible and behavior for them is undefined, so
+    keep the underlying tree stable while the sandbox runs (a renamed or
+    deleted source keeps working through its pinned descriptor); readable
+    data is still exposed (overlays protect integrity, not
+    confidentiality); the storage cap does not limit total process memory,
+    CPU or PIDs.
   - With --as-pid-1 your command IS pid 1 of the sandbox: long-lived
     commands that spawn and abandon children will see zombies (nothing
     reaps orphans), and signals sent to pid 1 from inside (kill -TERM 1)
@@ -496,13 +605,14 @@ Examples:
   sbox -a example.com -v -- curl -sI https://example.com
   sbox -a example.com --filter-output -- curl -s https://example.com
   sbox --ssh-agent -a github.com -- git clone git@github.com:me/repo.git
+  sbox --overlay "$PWD" --overlay-size 1GiB -- make
 `
 
 // Usage is the complete fixed-width help text.
 const Usage = `usage: sbox [-h] [-a HOST] [-A FILE] [-b PATH] [-r PATH] [--bind-socket PATH]
-            [--ro-cwd] [--home] [--gui] [--ssh-agent] [--filter-output]
-            [--strict-crlf] [--upstream URL] [--upstream-insecure] [--net]
-            [--no-seccomp] [-v] [--shell]
+            [--overlay PATH] [--overlay-size SIZE] [--ro-cwd] [--home] [--gui]
+            [--ssh-agent] [--filter-output] [--strict-crlf] [--upstream URL]
+            [--upstream-insecure] [--net] [--no-seccomp] [-v] [--shell]
 
 ` + Description + `
 
@@ -531,6 +641,29 @@ options:
                         read-only. Known control sockets, protected paths and
                         anything inside /proc, /sys or /dev are still refused.
                         Repeatable.
+  --overlay PATH        Mount PATH (an existing directory) at its own
+                        resolved path as a DISPOSABLE WRITABLE overlay: reads
+                        see the real tree, writes (creates, edits, deletes,
+                        renames, chmods, symlinks, hard links) land in a
+                        private bounded store that vanishes when the sandbox
+                        exits — the source tree itself is never written.
+                        Repeatable; all overlays share one --overlay-size
+                        budget. Sources are validated like binds (protected
+                        paths, control sockets, socket-bearing trees and
+                        runtime dirs are refused — no opt-in) and may not
+                        overlap --home or any -b/-r/--bind-socket mount. An
+                        overlay covering the cwd replaces the automatic cwd
+                        mount; a cwd outside every overlay mounts READ-ONLY
+                        while overlays are in use. Needs bwrap >= 0.11 with
+                        fd binds and a kernel supporting unprivileged
+                        overlayfs (>= 5.11); the full arrangement is probed
+                        before launch and refused when it cannot run.
+  --overlay-size SIZE   Combined storage cap for every overlay writable layer:
+                        1GiB (the default), 500MB, 1073741824 ... Bounds
+                        1MiB..16TiB. Hitting the cap fails writes (ENOSPC)
+                        inside the sandbox — they never fall back to the host
+                        tree. The cap bounds the overlay store only, not
+                        total process memory, CPU or PIDs.
   --ro-cwd              Mount the current directory read-only (default: rw).
   --home                Bind the real $HOME (default: private tmpfs home).
   --gui                 Pass through Wayland/X11 sockets. X11 is effectively

@@ -49,7 +49,10 @@ short flags; attached short values such as `-bPATH` remain supported.
   `/run/proxy.sock`; the sandbox's socat bridge exposes `127.0.0.1:1080`.
 - `internal/sandbox`: backend-neutral mount specification and supervisor.
   Only `internal/sandbox/bwrap` knows bwrap flag spellings and fd numbering.
-- `internal/bindpolicy`: path protection, fd-first validation, and pinned mounts.
+  Overlay ops render as a TWO-LEVEL launch there (trusted staging sandbox +
+  the real sandbox); staging is invisible to the payload.
+- `internal/bindpolicy`: path protection, fd-first validation, pinned mounts,
+  and overlay validation.
 - `internal/outputfilter`: sanitizer, PTY, and input/output pump.
 - `internal/seccomp`: syscall tables, cBPF compiler, and launch-time self-probe.
 - `internal/notes`: advisory notes suppressed for 24 hours under the cache dir.
@@ -115,6 +118,32 @@ short flags; attached short values such as `-bPATH` remain supported.
   the fallback warning would be wrong). Cwd under HOME requires --home or an
   explicit bind. --home exposure and -b HOME --home get appropriate notes.
 - Emit automatic cwd mounts BEFORE explicit user binds, so -r "$PWD" wins.
+- --overlay sources reuse the whole bind validation (protected paths,
+  control sockets, socket shape, bounded scan) with NO opt-in, must be
+  pinned directories (a nil pin refuses — never a path-based overlay),
+  and may not overlap each other, --home, or any explicit bind. An
+  overlay covering cwd replaces the automatic cwd mount (chdir lands in
+  the merged view); a cwd outside every overlay auto-mounts READ-ONLY
+  while overlays are in use — that downgrade is noted loudly.
+- bwrap (0.11) resolves overlay sources by PATHNAME and its --size only
+  bounds --tmpfs. Overlays therefore launch as a two-level arrangement:
+  an unprivileged STAGING bwrap (fresh pid/ipc/uts/net namespaces, own
+  /proc and /dev, host root mirrored read-only) creates a private staging
+  tmpfs at /tmp. ALL mount sources get independent staging paths: validated
+  pins mount from their fds, overlay lowers are read-only, and ordinary
+  binds retain their requested modes. Never reuse original host paths as
+  staging destinations: even a read-only host-root mirror follows renames.
+  A separate single size-bounded tmpfs holds fresh upper/work dirs per
+  overlay; the staging payload is the real
+  sandbox bwrap, which re-binds the staged paths and overlays them. The
+  seccomp filter rides along as staged bytes (--file) that a FIXED
+  shell bridge opens as fd 3; the real bwrap still installs it as its
+  last step before exec. Staging paths, pivot leftovers and setup
+  descriptors must never reach the payload. A bounded runtime probe
+  runs the complete arrangement with the production system runtime mounts,
+  network mode, namespace flags and filter before any overlay launch;
+  on failure REFUSE — never substitute path-based
+  overlay sources.
 - Warn on read-write mounts overlapping known home persistence paths in BOTH
   directions, including --bind-socket directories. Read-only binds stay silent.
   These warnings are keyed on final mount mode, not the CLI label.
