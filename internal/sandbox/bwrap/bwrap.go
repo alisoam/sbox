@@ -50,6 +50,12 @@
 // source. This is not a content snapshot: host edits within a source remain
 // visible. Overlay writes go only to the bounded store and fail with ENOSPC
 // when full. Explicit writable binds continue to write to their host sources.
+//
+// Explicit --overlay-mode single uses PathOverlay and --tmp-overlay in one
+// launch. Its sources are reopened by pathname after validation and its backing
+// tmpfs has only the kernel default limit, not sbox's overlay-size budget. It is
+// never selected as a fallback. No overlay source fd is passed to that child;
+// seccomp, ordinary fd binds and the final namespace/session policy still apply.
 package bwrap
 
 import (
@@ -147,7 +153,8 @@ func ParseCaps(text string) sandbox.Caps {
 		// --overlay alone (no way to name a source) is useless here.
 		// NOTE: bwrap refuses these options in setuid mode; the runtime
 		// overlay probe is what actually decides the host can run one.
-		Overlay: hasOpt(text, "--overlay-src") && hasOpt(text, "--overlay"),
+		Overlay:    hasOpt(text, "--overlay-src") && hasOpt(text, "--overlay"),
+		TmpOverlay: hasOpt(text, "--overlay-src") && hasOpt(text, "--tmp-overlay"),
 	}
 }
 
@@ -230,6 +237,17 @@ func (p *Provider) runOk(argv []string) bool {
 // write did NOT reach the host source (an overlay silently mounted
 // read-write onto the source itself would "pass" every other check).
 func (p *Provider) OverlayProbe(shareNet, hardenUserns bool, filter []byte) error {
+	return p.probeOverlay(shareNet, hardenUserns, filter, false)
+}
+
+// SingleOverlayProbe exercises the explicit one-launch mode without running a
+// staging bwrap. Its source is private test data; it makes no pinning or size
+// guarantee beyond validating that writes never reach that source.
+func (p *Provider) SingleOverlayProbe(shareNet, hardenUserns bool, filter []byte) error {
+	return p.probeOverlay(shareNet, hardenUserns, filter, true)
+}
+
+func (p *Provider) probeOverlay(shareNet, hardenUserns bool, filter []byte, single bool) error {
 	root, err := os.MkdirTemp("/tmp", "sboxovl.")
 	if err != nil {
 		return err
@@ -253,6 +271,14 @@ func (p *Provider) OverlayProbe(shareNet, hardenUserns bool, filter []byte) erro
 	}
 
 	spec := overlayProbeSpec(src, sand, fd, shareNet, hardenUserns, filter)
+	if single {
+		for i, op := range spec.Ops {
+			if o, ok := op.(sandbox.Overlay); ok {
+				spec.Ops[i] = sandbox.PathOverlay{Src: o.Src, Dst: o.Dst}
+			}
+		}
+		spec.OverlayStoreSize = 0
+	}
 
 	launch, err := p.Build(spec)
 	if err != nil {
@@ -277,8 +303,8 @@ func (p *Provider) OverlayProbe(shareNet, hardenUserns bool, filter []byte) erro
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, launch.Bin, argv...)
-	// The staging argv names its fds (--file, staged binds): hand them
-	// over exactly like the supervisor does.
+	// Both modes name every inherited fd in argv: hand them over exactly
+	// like the supervisor does, without unused overlay validation pins.
 	cmd.ExtraFiles = launch.PassFDs
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("overlay probe: %w (output %q)", err, out)
@@ -425,13 +451,28 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 	}
 
 	hasOverlay := false
+	hasPathOverlay := false
 	shareNet := false
 	for _, op := range spec.Ops {
 		if _, ok := op.(sandbox.Overlay); ok {
 			hasOverlay = true
 		}
+		if _, ok := op.(sandbox.PathOverlay); ok {
+			hasPathOverlay = true
+		}
 		if _, ok := op.(sandbox.ShareNet); ok {
 			shareNet = true
+		}
+	}
+	if hasPathOverlay {
+		if hasOverlay {
+			return nil, errors.New("cannot mix staged and single-launch overlay operations")
+		}
+		if !p.Caps.TmpOverlay {
+			return nil, errors.New("--overlay-mode single requires --overlay-src/--tmp-overlay support")
+		}
+		if spec.OverlayStoreSize != 0 {
+			return nil, errors.New("single-launch overlays do not support a configurable storage cap")
 		}
 	}
 	if hasOverlay {
@@ -586,6 +627,11 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 					inner = append(inner, base, o.Src, o.Dst)
 				}
 			}
+		case sandbox.PathOverlay:
+			// These are deliberately host pathnames, not /proc/self/fd
+			// strings: bwrap realpaths overlay sources and would neither
+			// pin nor consume a descriptor supplied through such a string.
+			inner = append(inner, "--overlay-src", o.Src, "--tmp-overlay", o.Dst)
 		case sandbox.Overlay:
 			// The lower layer MUST be the pinned object: bwrap resolves
 			// overlay sources by pathname, so the pin is re-mounted

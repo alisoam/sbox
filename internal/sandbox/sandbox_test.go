@@ -38,6 +38,8 @@ func fmtOps(ops []Op) []string {
 				s += " fd"
 			}
 			out = append(out, s)
+		case PathOverlay:
+			out = append(out, "path-overlay "+o.Src+"=>"+o.Dst)
 		case Mount:
 			mode := "ro"
 			if o.RW {

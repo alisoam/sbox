@@ -101,15 +101,17 @@ func TestCheckOverlaysRefusals(t *testing.T) {
 		{"runtime dir ground", filepath.Join(rt, "app"), "lives under a runtime dir"},
 		{"contains a socket", sockdir, "contains a Unix socket"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			pinner := NewPinner(true)
-			defer pinner.Close()
-			_, err := CheckOverlays(&cliutil.Options{Overlay: []string{tc.path}},
-				home, pinner, nil, func(string) {})
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("err = %v, want it to mention %q", err, tc.want)
-			}
-		})
+		for _, mode := range []string{"staged", "single"} {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				pinner := NewPinner(true)
+				defer pinner.Close()
+				_, err := CheckOverlays(&cliutil.Options{Overlay: []string{tc.path}, OverlaySingle: mode == "single"},
+					home, pinner, nil, func(string) {})
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("err = %v, want it to mention %q", err, tc.want)
+				}
+			})
+		}
 	}
 
 	pinner := NewPinner(true)

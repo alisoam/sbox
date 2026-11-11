@@ -35,8 +35,9 @@ standard library.
 - `--overlay` additionally needs `bwrap >= 0.11` in non-setuid mode (the
   overlay options are refused by setuid bwrap), the pinned-fd binds of
   `>= 0.10`, and a kernel with unprivileged overlayfs (Linux >= 5.11);
-  hosts that fail a live probe of the complete arrangement refuse the
-  launch rather than mount unverified sources.
+  hosts that fail a live probe of the selected arrangement refuse the launch.
+  The default staged mode also needs nested namespaces. Explicit
+  `--overlay-mode single` avoids nesting with the trade-offs described below.
 
 ## Install
 
@@ -66,8 +67,10 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `-b, --bind PATH` | Bind `PATH` read-write into the sandbox. Repeatable. |
 | `-r, --ro-bind PATH` | Bind `PATH` read-only. Repeatable. |
 | `--bind-socket PATH` | Explicit opt-in to bind a socket, a runtime-dir path, or a socket-bearing directory that `-b`/`-r` refuse by default. **Read-only** for socket files and `/run`/`$XDG_RUNTIME_DIR` paths (connect-only — *never* read-write: `-b PATH --bind-socket PATH` is refused too); **read-write** for a plain directory (socket-bearing project dirs — `puma.sock`, `.s.PGSQL.5432`, `.git/fsmonitor--daemon.ipc`; combine with `-r PATH` for read-only; rw does let the sandbox replace the sockets inside it — the intended trade-off, since such dirs need writes). Repeatable; known control sockets, protected paths and anything inside `/proc`, `/sys` or `/dev` stay refused. |
-| `--overlay PATH` | Mount `PATH` (an existing directory) at its own resolved path as a **disposable writable view of itself**: reads see the real tree; writes (creates, edits, deletes, renames, chmods, symlinks, hard links) land in a private bounded store that vanishes when the sandbox exits — the source tree is never modified. Repeatable; all overlays share one `--overlay-size` budget. Sources are validated like binds (protected paths, control sockets, socket-bearing trees and runtime dirs are refused — **no opt-in**), may not overlap `--home` or any `-b`/`-r`/`--bind-socket` mount, and duplicate or nested overlays are refused. An overlay covering the cwd replaces the automatic cwd mount with its merged view; a cwd outside every overlay is auto-mounted **read-only** while overlays are in use (`-b "$PWD"` opts back in). Needs bwrap >= 0.11 (non-setuid) plus fd binds and a kernel with unprivileged overlayfs (>= 5.11); the complete staging arrangement is probed before launch and the launcher refuses rather than fall back to unverified sources. |
-| `--overlay-size SIZE` | Combined storage cap for every overlay's writable layer: `1GiB` (the default), `500MB`, `1073741824` — bounds 1MiB..16TiB. Writes past the cap fail with `ENOSPC` inside the sandbox; they never fall back to the host tree. The cap bounds the overlay store only, not total process memory, CPU or PIDs. |
+| `--overlay PATH` | Mount an existing directory at its resolved path as a **disposable writable view**: reads see the real tree; creates, edits, deletes, renames, chmods and links stay in private storage that vanishes on exit. Repeatable. Sources use bind validation (protected paths, control sockets, socket-bearing trees and runtime dirs are refused, with **no opt-in**), cannot overlap `--home` or explicit binds, and cannot duplicate or nest. An overlay covering cwd replaces its automatic mount; cwd outside all overlays mounts **read-only** (`-b "$PWD"` opts back in). Requires non-setuid bwrap with overlay and fd-bind support, plus unprivileged overlayfs. The selected mode is probed before launch. |
+| `--overlay-mode MODE` | `staged` (default): two bwrap levels, sources pinned through mount time, shared storage cap. `single`: one bwrap using `--tmp-overlay`; sources are validated but **reopened by pathname**, so concurrent host swaps can redirect a mount. Single mode warns on each run and has only the kernel default tmpfs limit; it rejects `--overlay-size`. Applies to all overlays. Neither mode falls back to the other. |
+| `--overlay-size SIZE` | **Staged mode only.** Combined storage cap for every overlay's writable layer: `1GiB` (the default), `500MB`, `1073741824` — bounds 1MiB..16TiB. Writes past the cap fail with `ENOSPC`; they never fall back to the host tree. The cap bounds the overlay store only, not total process memory, CPU or PIDs. |
+| `--env NAME[=VALUE]` | Forward one host variable (`--env API_TOKEN`) or set a literal value (`--env EDITOR=nvim`). `NAME=` sets an empty string; forwarding an unset host name is an error. Repeatable; the last value wins over sandbox defaults. Names must match `[A-Za-z_][A-Za-z0-9_]*`. |
 | `--ro-cwd` | Mount the current directory read-only (default: read-write). |
 | `--home` | Bind the real `$HOME` (default: private tmpfs home). |
 | `--gui` | Pass through Wayland (preferred) and X11 sockets. |
@@ -81,8 +84,91 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `-v, --verbose` | Log every allow/deny decision to stderr. |
 | `--shell` | Run an interactive shell (`$SHELL` if usable, else bash). |
 
+### Environment variables
+
+The sandbox starts with a cleared environment plus `HOME`, `USER`, `TERM`, `PATH`,
+`LANG`, the generated proxy settings, and variables enabled by `--gui` or `--ssh-agent`.
+Use `--env` before the command separator to add or override values:
+
+```sh
+./sbox --overlay "$PWD" --overlay-mode single \
+  --env API_TOKEN --env EDITOR=nvim --env 'MY_MESSAGE=hello world' \
+  -- /bin/zsh -i
+```
+
+`API_TOKEN` must be set in the host environment. Explicit values are passed verbatim;
+sbox does not evaluate shell expressions in them. Quote values in your host shell as
+needed. Repeating a name selects the last value, including an empty value (`--env NAME=`).
+These options change only the sandbox environment: `--env HOME=/tmp/custom` does not
+change the home mount, and `--env https_proxy=...` does not configure the host-side
+upstream proxy (use `--upstream` for that).
+
+### Development shell
+
+For an existing zsh/Neovim/OpenCode setup, [`examples/configured-shell.sh`](examples/configured-shell.sh)
+mounts the configuration read-only and overlays the cache, language/plugin data, application
+state, and current project. It adds read-only Homebrew and `~/.local/bin` mounts, forwards
+the SSH agent, and allows `github.com` and `git.divar.cloud`:
+
+```sh
+./examples/configured-shell.sh
+# Or run a tool directly, without shell aliases:
+./examples/configured-shell.sh nvim
+./examples/configured-shell.sh tmux new-session
+```
+
+The listed config/state paths must already exist. Changes to overlaid state disappear on exit.
+The script loads your existing shell configuration; aliases that themselves launch bwrap
+still attempt another sandbox. Use the actual command (for example `command nvim`) inside
+the shell, or invoke the tool directly through the script as shown above.
+
+[`examples/dev-shell.sh`](examples/dev-shell.sh) opens zsh with tmux and Neovim
+available, forwards the SSH agent, and allows `github.com` and `git.divar.cloud`.
+It binds the current directory read-write, so project edits persist on the host,
+while the home and `/tmp` remain private. Set `SBOX_WORKSPACE_MODE=readonly` to
+prevent project writes or `SBOX_WORKSPACE_MODE=overlay` for disposable edits.
+Use `SBOX_WORKSPACE_MODE=overlay-single` for disposable edits with one bwrap,
+accepting pathname races and no configurable storage cap.
+
+```sh
+CGO_ENABLED=0 go build -o sbox ./cmd/sbox
+SBOX_BIN=./sbox ./examples/dev-shell.sh
+# Or run a specific command in the same environment:
+SBOX_BIN=./sbox ./examples/dev-shell.sh tmux new-session
+# Optional workspace modes:
+SBOX_WORKSPACE_MODE=readonly SBOX_BIN=./sbox ./examples/dev-shell.sh
+SBOX_WORKSPACE_MODE=overlay SBOX_BIN=./sbox ./examples/dev-shell.sh
+SBOX_WORKSPACE_MODE=overlay-single SBOX_BIN=./sbox ./examples/dev-shell.sh
+```
+
+The launcher mounts the whole Homebrew prefix (`$HOMEBREW_PREFIX`, default
+`/home/linuxbrew/.linuxbrew`), `~/.local/bin`, and `~/.ssh/authorized_keys`
+read-only. It also mounts `~/.ssh/known_hosts` read-only when present for SSH
+server verification. `/usr` (including `/usr/bin`) and `/bin` are already
+read-only system mounts. Homebrew's `bin` and `sbin`, `~/.local/bin`, and the
+system binary directories form the sandbox PATH. Install zsh, tmux, Neovim,
+Git, and OpenSSH in those locations first, and load your keys into an SSH agent.
+The script checks these prerequisites before launching.
+
+The private `.ssh` directory gets mode `0700`; the script does not change host
+ownership or run as root. Full-screen tmux and Neovim need terminal cursor
+controls, so this example leaves output filtering off. It retains sbox's
+seccomp filter and network restrictions. The current directory must pass bind
+validation. Overlay mode additionally requires non-overlapping mounts and a
+successful overlay probe; Ubuntu's AppArmor policy can block staged mode's nested
+bwrap setup even when single mode works. The script never changes host policy
+or silently falls back to a different workspace mode.
+
 ## How it works
 
+- **Interactive terminals:** when stdin, stdout, and stderr are terminals, sbox automatically
+  forwards them through a private PTY. A read-only copy of its terminal helper runs after
+  bwrap installs seccomp, attaches the PTY as the sandbox's controlling terminal, and execs
+  the bridge/command as PID 1. The host terminal descriptor stays outside the sandbox.
+  Shell job control, Ctrl-C, resizing, tmux, and full-screen editors work without a `script`
+  wrapper. Terminal settings are restored on exit. Output control sequences are preserved
+  unless `--filter-output` is enabled; that filter is intentionally unsuitable for full-screen
+  tools. Pipes and redirected streams retain direct I/O unless filtering is requested.
 - **No network stack in the sandbox.** `bwrap --unshare-all` removes it; the
   only egress is a Unix socket passed in at `/run/proxy.sock`.
 - **The launcher hosts the proxy.** A goroutine serves SOCKS5 and HTTP CONNECT
@@ -97,9 +183,9 @@ Everything after the first positional (or `--`) is the sandboxed command.
 - **ssh** ignores proxy env vars, so proxied mode injects `/etc/ssh/ssh_config`
   with a `ProxyCommand` through the bridge: `ssh`/`scp`/`sftp` and
   git-over-ssh ride the same allowlist-checked proxy. `~/.ssh/config` still
-  wins per-option. No `known_hosts` is injected: host-key verification
-  fails closed (tmpfs home, no TTY) — pass `-r ~/.ssh/known_hosts` or pin
-  hosts yourself.
+  wins per-option. No `known_hosts` is injected: pass `-r ~/.ssh/known_hosts`
+  or verify host keys interactively. Noninteractive launches fail closed if
+  no trusted key is available.
 - **Startup self-test:** before the sandbox starts, a non-allowed destination
   is probed on the real socket and must be refused on both protocols — the
   fail-closed guarantee is checked, not assumed.
@@ -147,7 +233,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
 - **Lifecycle:** if any component dies, everything dies (supervisor loop,
   `--die-with-parent`, and the in-process proxy) — even a SIGKILLed
   launcher takes the proxy with it.
-- **Disposable overlays (`--overlay`):** bwrap (0.11) resolves overlay
+- **Staged overlays (`--overlay`, the default):** bwrap (0.11) resolves overlay
   *sources* by **pathname** in its parent mount namespace, which would
   throw away the fd-pinning guarantee binds rely on — and its
   `--size` only applies to `--tmpfs`, not to overlay backing stores. sbox
@@ -174,8 +260,20 @@ Everything after the first positional (or `--`) is the sandboxed command.
   (including blocked nested user namespaces or unavailable unprivileged
   overlayfs) get a hard refusal with probe diagnostics, never a path-based
   fallback.
-- **Output filtering (`--filter-output`):** the sandbox normally shares the
-  host terminal, and a payload can print escape sequences the terminal
+- **Single-bwrap overlays (`--overlay-mode single`):** the same source validation
+  runs first, then a single bwrap uses `--overlay-src PATH --tmp-overlay PATH`.
+  It reopens the source pathname: a host process replacing or renaming that path
+  between validation and mounting can expose a different, unvalidated tree.
+  Use this mode only with a trusted, stable source path. Validation descriptors
+  are released and never passed to the child; ordinary binds still use pinned
+  descriptors. Writes remain disposable. The backing tmpfs uses the kernel's
+  default limit, with **no sbox storage budget**; `--overlay-size` is rejected.
+  Seccomp, namespace/session flags and network policy remain enabled. This mode
+  has its own launch probe and warning on every run. It avoids the second bwrap
+  namespace setup, without changing host policy or using sudo. It is never an
+  automatic fallback from staged mode.
+- **Output filtering (`--filter-output`):** raw sandbox output normally reaches
+  the host terminal, and a payload can print escape sequences the terminal
   *emulator executes* — OSC 52 rewrites the clipboard, device queries elicit
   answerback replies, cursor/erase sequences can forge already-reviewed
   output, SGR 8 (conceal) hides text. With the flag, bwrap's stdin/stdout/
@@ -294,8 +392,8 @@ Everything after the first positional (or `--`) is the sandboxed command.
   (`ssh-add -D`/`-x`) — a DoS on your agent, not a key leak. Prefer a
   dedicated agent holding only the needed key, loaded with `ssh-add -c`
   (confirm each use) or `-h` (destination constraint), for untrusted work.
-- ssh destinations need `known_hosts`: with a tmpfs home and no TTY
-  (`--new-session`), host-key prompting fails closed — pass
+- ssh destinations need `known_hosts`: with a tmpfs home and no interactive
+  terminal, host-key prompting fails closed — pass
   `-r ~/.ssh/known_hosts` (or pin hosts in your own `~/.ssh/config`, which
   wins per-option).
 - `--gui` passes through Wayland and X11. **X11 is effectively an escape**:
@@ -325,15 +423,16 @@ Everything after the first positional (or `--`) is the sandboxed command.
   reachable. Only use it for trusted work.
 - **`--overlay` protects integrity, not confidentiality.** The overlaid tree
   stays fully *readable* — an overlay only stops *writes* from reaching it —
-  and it is **not a snapshot**: the pinned lower layer keeps working if the
-  source is renamed or deleted on the host mid-run, but concurrent host edits
+  and it is **not a snapshot**. In staged mode, the pinned lower layer keeps
+  working if the source is renamed or deleted on the host mid-run, but concurrent host edits
   *inside* the source tree are visible through the merged view with undefined
   behavior, so keep the underlying tree stable while the sandbox runs. The
-  writable layer lives on one size-bounded tmpfs shared by all overlays
+  staged mode's writable layer lives on one size-bounded tmpfs shared by all overlays
   (`--overlay-size`, default 1 GiB): past the cap, writes fail with `ENOSPC`
   — they can never fall back onto the host tree, which is only ever mounted
   read-only in the whole arrangement. The cap does not limit total process
-  memory, CPU or PIDs. Overlays are refused on protected paths, control
+  memory, CPU or PIDs. Single mode has no configurable cap and accepts a
+  check-to-mount pathname race, as described above. Both modes refuse protected paths, control
   sockets, socket-bearing trees and runtime dirs (no `--bind-socket`-style
   opt-in exists for them), on duplicates or nesting, and when they overlap
   `--home` or any explicit bind — one view per path. Persistence and
@@ -360,11 +459,10 @@ Design trade-offs, not bugs:
   CONNECT/SOCKS tunnels have no TCP half-close (the forwarded plain-http
   path *is* one-shot — declared body, then a half-close except through TLS).
   Only the first resolved address is tried when chaining through an upstream.
-- `--filter-output`: the pty slave is an inherited fd and cannot become the
-  sandbox's controlling terminal, so job control inside is limited; with the
-  host tty raw, Ctrl-C is delivered to the sandbox as a **byte** — a command
-  that never reads stdin cannot be interrupted from the keyboard (kill sbox
-  from another shell). The filter is an allowlist: other non-printable
+- `--filter-output` removes cursor positioning and other controls used by full-screen
+  editors and tmux, so leave it off for those applications. The private controlling
+  terminal supports job control and Ctrl-C; an application that disables terminal
+  signal handling receives Ctrl-C as input instead. The filter is an allowlist: other non-printable
   characters (NBSP, soft hyphen, ...) are dropped too, and an unterminated
   OSC/DCS swallows following output until its terminator or the 4096-byte cap
   (fail-safe: less is displayed, never more). Hidden text is **not** prevented

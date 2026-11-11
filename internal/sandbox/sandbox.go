@@ -43,6 +43,17 @@
 // sandbox bwrap overlays the staged lowers. Staging and its descriptors are
 // invisible to the payload (the sandbox pivots to a fresh root; seccomp
 // and --as-pid-1 semantics are unchanged; see internal/sandbox/bwrap).
+// Explicit --overlay-mode single uses PathOverlay ops instead: sources are
+// pinned for validation but reopened by pathname at mount time, with no
+// configured storage cap. Validation pins never enter that child. It retains
+// the normal namespace, seccomp and network policy, without staging or fallback.
+// Explicit --env values override the sandbox environment defaults in CLI order.
+// They affect only the sandbox: host configuration and mount selection still use
+// the launcher's environment, and no values are interpolated into shell code.
+// Interactive stdio automatically uses a private PTY. The supervisor mounts a
+// private copy of this executable read-only; after bwrap installs seccomp, its
+// terminal entry claims that PTY and execs the bridge/payload as PID 1. No extra
+// unfiltered helper, host tty descriptor or reaper is exposed to the payload.
 package sandbox
 
 import (
@@ -68,6 +79,7 @@ type Caps struct {
 	LegacySeccomp bool // --seccomp (bwrap >= 0.4.1, same wire format)
 	DisableUserns bool // --disable-userns AND --assert-userns-disabled
 	Overlay       bool // --overlay-src + --overlay (bwrap >= 0.11, unprivileged only)
+	TmpOverlay    bool // --overlay-src + --tmp-overlay (single-launch alternative)
 }
 
 // SeccompFlag is the option the filter is handed through, "" when this
@@ -144,6 +156,13 @@ type Overlay struct {
 	FD  *os.File
 }
 
+// PathOverlay is the explicit single-launch alternative. Src was validated
+// through a pin, but the backend reopens this pathname: a concurrent host swap
+// can redirect it after validation. Writes use private temporary storage with
+// no configured cap. It deliberately carries NO fd: passing a source descriptor
+// as a pathname neither pins an overlay nor ensures bwrap consumes that fd.
+type PathOverlay struct{ Src, Dst string }
+
 // ShareNet keeps the HOST network namespace (only meaningful with an
 // otherwise fully unshared sandbox). NOTE: sharing the netns also
 // exposes host loopback services and abstract Unix sockets.
@@ -153,15 +172,16 @@ type ShareNet struct{}
 // apply it after all mounts, wherever it sits in their argv.
 type Chdir struct{ Dir string }
 
-func (Setenv) isOp()   {}
-func (Mount) isOp()    {}
-func (Tmpfs) isOp()    {}
-func (Mkdir) isOp()    {}
-func (ProcFS) isOp()   {}
-func (DevFS) isOp()    {}
-func (Overlay) isOp()  {}
-func (ShareNet) isOp() {}
-func (Chdir) isOp()    {}
+func (Setenv) isOp()      {}
+func (Mount) isOp()       {}
+func (Tmpfs) isOp()       {}
+func (Mkdir) isOp()       {}
+func (ProcFS) isOp()      {}
+func (DevFS) isOp()       {}
+func (Overlay) isOp()     {}
+func (PathOverlay) isOp() {}
+func (ShareNet) isOp()    {}
+func (Chdir) isOp()       {}
 
 // Spec is everything the launcher decided, validated, in emission
 // order. Bridge is the in-sandbox sh script (socat bridge + readiness
@@ -182,6 +202,7 @@ type Spec struct {
 	// OverlayStoreSize is the combined byte budget of every Overlay's
 	// writable layer (one shared store). 0 ⇒ cliutil.DefaultOverlaySize.
 	// Backend-neutral: a backend without overlays errors on Overlay ops.
+	// Must be zero for PathOverlay ops, which have no configurable cap.
 	OverlayStoreSize int64
 }
 
@@ -227,6 +248,9 @@ type Provider interface {
 	// answer. It uses the launch's network mode and filter bytes; nil means
 	// --no-seccomp. Bounded; an error makes the launcher refuse overlays.
 	OverlayProbe(shareNet, hardenUserns bool, filter []byte) error
+	// SingleOverlayProbe tests the explicit pathname-based mode with the same
+	// network, namespace and seccomp settings, and verifies writes stay private.
+	SingleOverlayProbe(shareNet, hardenUserns bool, filter []byte) error
 	Build(spec *Spec) (*Launch, error)
 }
 
@@ -492,6 +516,13 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 		)
 	}
 
+	// Explicit values override defaults (including the generated proxy/agent
+	// environment). They are sandbox ops, never host os.Setenv calls or shell
+	// assignments. Repeated names are applied in order, so the last value wins.
+	for _, env := range opts.Env {
+		ops = append(ops, Setenv{Name: env.Name, Value: env.Value})
+	}
+
 	// Current directory: bind it (rw unless --ro-cwd) through the SAME
 	// fd-first validator as -b/-r (bindpolicy.ValidateBindSource):
 	// protected paths, CONTROL_SOCKETS, the socket-shape rules and the
@@ -609,7 +640,16 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 	// (read-only) automatic cwd mount it replaces in part — overlapping
 	// binds and overlays were already refused by bindpolicy.
 	for _, o := range overlays {
-		ops = append(ops, Overlay{Src: o.Path, Dst: o.Path, FD: o.FD})
+		if opts.OverlaySingle {
+			// CheckOverlays pinned and validated this source. Single mode
+			// knowingly reopens its pathname; never pass the validation fd.
+			if pinner != nil {
+				pinner.Release(o.Path)
+			}
+			ops = append(ops, PathOverlay{Src: o.Path, Dst: o.Path})
+		} else {
+			ops = append(ops, Overlay{Src: o.Path, Dst: o.Path, FD: o.FD})
+		}
 	}
 
 	// Backends apply the chdir after all mounts, wherever it sits in
@@ -625,6 +665,12 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 	size := opts.OverlaySize
 	if size == 0 {
 		size = cliutil.DefaultOverlaySize
+	}
+	if opts.OverlaySingle {
+		if opts.OverlaySize != 0 {
+			return nil, fmt.Errorf("--overlay-size is not supported with --overlay-mode single")
+		}
+		size = 0
 	}
 	return &Spec{Ops: ops, Bridge: bridge, OverlayStoreSize: size}, nil
 }

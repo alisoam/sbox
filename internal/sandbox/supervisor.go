@@ -79,7 +79,7 @@ type Supervisor struct {
 	// Home is the $HOME the launcher resolved (main verified it is set).
 	Home string
 
-	// Out receives --filter-output's sanitized sandbox output; nil ⇒
+	// Out receives the PTY's forwarded (optionally sanitized) output; nil ⇒
 	// the host terminal (outputfilter.EmitFiltered → stdout).
 	Out io.Writer
 
@@ -105,6 +105,7 @@ func (s *Supervisor) Run() int {
 	if s.Opts == nil {
 		s.Opts = &cliutil.Options{}
 	}
+	terminal := outputfilter.IsTTY(os.Stdin) && (s.Opts.FilterOutput || outputfilter.InteractiveStdio())
 	// Fail fast, before anything spawns: an unrawable terminal stdin
 	// under --filter-output is a hard error (the cheap tcgetattr half
 	// of the check depends on nothing below — the pty, the proxy and
@@ -131,7 +132,7 @@ func (s *Supervisor) Run() int {
 		work     string
 		proxySrv *proxy.Server
 		proxyLog *filteredProxyLog  // --filter-output proxy log
-		pump     *outputfilter.Pump // --filter-output pty pump
+		pump     *outputfilter.Pump // interactive / --filter-output pty pump
 		pinner   *bindpolicy.Pinner
 		held     []*os.File // parent copies of everything handed to the child
 		cmd      *exec.Cmd
@@ -144,7 +145,7 @@ func (s *Supervisor) Run() int {
 		// The hub keeps catching signals during cleanup but no longer
 		// forwards them. No ignored disposition reaches child processes.
 		hub.done()
-		// --filter-output teardown FIRST after the ignore phase: the
+		// Terminal teardown FIRST after the ignore phase: the
 		// host terminal must be restored before anything below blocks
 		// (a raw terminal is unusable meanwhile). Restore termios and
 		// SIGWINCH, then close the pty before killing anything else.
@@ -248,16 +249,24 @@ func (s *Supervisor) Run() int {
 		return 1
 	}
 	// Overlays: validated like binds (fd-first, no opt-ins), then the
-	// capability and runtime gates. Nothing below may degrade silently:
-	// a host that cannot run the full staging arrangement refuses the
-	// launch rather than mounting an unverified overlay source.
+	// capability and runtime gates for the explicitly selected mode.
+	// A host that cannot run the selected arrangement refuses the launch;
+	// neither mode may silently fall back to the other.
 	overlays, err := bindpolicy.CheckOverlays(s.Opts, s.Home, pinner, userBinds, warn)
 	if err != nil {
 		warn(err.Error())
 		return 1
 	}
 	if len(overlays) > 0 {
-		if !caps.Overlay {
+		if s.Opts.OverlaySingle && s.Opts.OverlaySize != 0 {
+			warn("--overlay-size is not supported with --overlay-mode single")
+			return 1
+		}
+		if s.Opts.OverlaySingle && !caps.TmpOverlay {
+			warn("--overlay-mode single requires bwrap --overlay-src/--tmp-overlay support — refusing")
+			return 1
+		}
+		if !s.Opts.OverlaySingle && !caps.Overlay {
 			warn("--overlay requires bwrap >= 0.11 (--overlay-src/--overlay support) — refusing")
 			return 1
 		}
@@ -349,7 +358,16 @@ func (s *Supervisor) Run() int {
 	}
 
 	if len(overlays) > 0 {
-		if err := s.Provider.OverlayProbe(s.Opts.Net, hardenUserns, bpf); err != nil {
+		if s.Opts.OverlaySingle {
+			warn("warning: --overlay-mode single reopens validated sources by pathname at mount time; " +
+				"concurrent source replacement can redirect the mount. No sbox storage cap applies " +
+				"(only the kernel's default tmpfs limit); --overlay-size is unsupported")
+			if err := s.Provider.SingleOverlayProbe(s.Opts.Net, hardenUserns, bpf); err != nil {
+				warn("--overlay-mode single: this bwrap/kernel cannot run the single-launch overlay " +
+					"(probed with the same flags as the launch) — refusing: " + err.Error())
+				return 1
+			}
+		} else if err := s.Provider.OverlayProbe(s.Opts.Net, hardenUserns, bpf); err != nil {
 			// The COMPLETE arrangement ran and failed: setuid bwrap (which
 			// refuses the overlay options), a kernel without unprivileged
 			// overlayfs, blocked namespace nesting, or a staging detail the
@@ -361,7 +379,7 @@ func (s *Supervisor) Run() int {
 			return 1
 		}
 	}
-	if len(overlays) > 0 && s.Opts.Verbose {
+	if len(overlays) > 0 && s.Opts.Verbose && !s.Opts.OverlaySingle {
 		warn(fmt.Sprintf("overlay: %d source(s) staged; shared writable layer capped at %d bytes",
 			len(overlays), overlayStoreSize(s.Opts)))
 	}
@@ -435,6 +453,14 @@ func (s *Supervisor) Run() int {
 	}
 	spec.Seccomp = bpf // nil ⇒ --no-seccomp, the explicit opt-out
 	spec.DisableUserns = hardenUserns
+	if terminal {
+		helper, err := terminalHelper(work)
+		if err != nil {
+			warn(fmt.Sprintf("cannot prepare interactive terminal helper: %v", err))
+			return 1
+		}
+		spec.Ops = append(spec.Ops, Mount{Src: helper, Dst: terminalHelperPath})
+	}
 	if rc, dead := earlyExit(); dead {
 		return rc
 	}
@@ -454,15 +480,18 @@ func (s *Supervisor) Run() int {
 
 	held = append(append(held, launch.PassFDs...), launch.CloseAfterSpawn...)
 
-	// --filter-output setup (fail closed at every step: without a pty
-	// there is no host-side filtering, and an untameable host tty is
-	// never handed to the sandbox raw). The returned childStdin is the
+	// Terminal setup fails closed: an untameable host tty is never
+	// passed into a launch that requires a private PTY. childStdin is the
 	// slave for a real (raw-mode) host tty, the exact non-tty stdin
 	// fd otherwise — never a blind inherit of fd 0.
 	var childStdin *os.File
-	if s.Opts.FilterOutput {
+	if s.Opts.FilterOutput || terminal {
 		var err error
-		pump, childStdin, err = outputfilter.Setup(s.Opts.StrictCrlf)
+		if s.Opts.FilterOutput {
+			pump, childStdin, err = outputfilter.Setup(s.Opts.StrictCrlf)
+		} else {
+			pump, childStdin, err = outputfilter.SetupTerminal()
+		}
 		if err != nil {
 			warn(err.Error())
 			return 1
@@ -472,11 +501,15 @@ func (s *Supervisor) Run() int {
 
 	// argv = backend argv + "--" + /bin/sh -c BRIDGE sbox-sh COMMAND...
 	// The backend installs the seccomp filter (when enabled) as the very
-	// last step before exec'ing THAT shell, so the shell, the socat
-	// bridge AND the command inherit the filter from their first
+	// last step before exec'ing the terminal helper (when needed) or
+	// THAT shell, so the helper, shell, socat bridge AND command inherit
+	// the filter from their first
 	// instruction — see PayloadArgv for why the ordering is
 	// load-bearing.
 	argv := append(append([]string{}, launch.Argv...), "--")
+	if terminal {
+		argv = append(argv, terminalHelperPath, "--_terminal-exec")
+	}
 	argv = append(argv, PayloadArgv(spec.Bridge, s.Command)...)
 	cmd = exec.Command(launch.Bin, argv...)
 	if pump != nil {
@@ -534,7 +567,7 @@ func (s *Supervisor) Run() int {
 
 	rc := <-waitCh
 	reaped = true
-	// --filter-output drain: final output may still be in flight while the
+	// PTY drain: final output may still be in flight while the
 	// payload dies a beat later, but a daemonized child holding the
 	// slave open forever bounds the wait to half a second.
 	if pump != nil {

@@ -1,8 +1,8 @@
-// Package outputfilter is the --filter-output half of the launcher
-// with a host-side pty whose slave is
-// the sandbox's ONLY stdio (the real host terminal fd never enters the
-// sandbox), and the stateful allowlist sanitizer every byte read from
-// the master passes before it reaches the host terminal.
+// Package outputfilter owns the launcher's terminal forwarding and optional
+// --filter-output sanitizer. Interactive stdio uses a private PTY, with raw
+// output preserved for shells and full-screen applications. Under --filter-output,
+// every output byte passes the stateful allowlist sanitizer. The real host
+// terminal fd never enters a sandbox using either PTY mode.
 //
 // WHY a filter at all: the sandbox shares the host terminal, and output
 // is INPUT to the terminal emulator — OSC 52 rewrites the clipboard,

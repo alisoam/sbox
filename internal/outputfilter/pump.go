@@ -1,4 +1,4 @@
-// The --filter-output pump: master→sanitizer→stdout, the raw host tty→master
+// The terminal pump: master→optional sanitizer→stdout, the raw host tty→master
 // with backpressure instead of drops, SIGWINCH→TIOCSWINSZ, and the
 // bounded post-exit drain. Teardown order is load-bearing: termios
 // restore FIRST (the rest can block for seconds and a raw terminal is
@@ -24,7 +24,7 @@ import (
 // some) instead of dropping bytes.
 const maxPendingInput = 262144
 
-// Pump drives one --filter-output run. Construct via Setup (which owns
+// Pump drives one terminal run. Construct via Setup or SetupTerminal (which own
 // the pty/raw-mode/child-stdin decisions), wire the returned childStdin
 // plus Pump.Slave into the sandbox spawn, then Start after the spawn,
 // Stop when the sandbox exits, Close in the teardown. All methods are
@@ -42,6 +42,9 @@ type Pump struct {
 	Slave *os.File
 	// Sanitizer filters master bytes; nil ⇒ a default Sanitizer.
 	Sanitizer *Sanitizer
+	// RawOutput preserves terminal control sequences for interactive shells
+	// and full-screen tools. The zero value retains output filtering.
+	RawOutput bool
 	// Stdin is the host tty put in raw mode (nil ⇒ nothing forwarded:
 	// non-tty stdin is inherited by the sandbox directly, exactly and
 	// unfiltered — see FilterChildStdin).
@@ -54,7 +57,7 @@ type Pump struct {
 	// pump arms its own signal.Notify(SIGWINCH) at Start and Stops it
 	// at Close, restoring the previous disposition.
 	Winch <-chan os.Signal
-	// Out receives the filtered output; nil ⇒ EmitFiltered (stdout).
+	// Out receives the forwarded output; nil ⇒ EmitFiltered (stdout).
 
 	Out io.Writer
 
@@ -89,12 +92,28 @@ type Pump struct {
 // owns the master/slave pair and the raw-mode restore (Close); even on
 // error a non-nil Pump comes back for exactly that cleanup.
 func Setup(strictCr bool) (p *Pump, childStdin *os.File, err error) {
+	return setup(strictCr, false)
+}
+
+// SetupTerminal creates a private interactive terminal without sanitizing its
+// output. The host tty never enters the sandbox. Caller must supply tty stdin.
+func SetupTerminal() (p *Pump, childStdin *os.File, err error) {
+	return setup(false, true)
+}
+
+func setup(strictCr, rawOutput bool) (p *Pump, childStdin *os.File, err error) {
 	master, slave, err := OpenPty()
 	if err != nil {
+		if rawOutput {
+			return nil, nil, fmt.Errorf("interactive terminal: cannot allocate a pty: %w", err)
+		}
 		return nil, nil, fmt.Errorf(
 			"--filter-output: cannot allocate a pty (%v) — refusing to run unfiltered", err)
 	}
-	p = &Pump{Master: master, Slave: slave, Sanitizer: NewSanitizer(strictCr)}
+	p = &Pump{Master: master, Slave: slave, RawOutput: rawOutput}
+	if !rawOutput {
+		p.Sanitizer = NewSanitizer(strictCr)
+	}
 	p.TtySource = HostTTY()
 	if p.TtySource != nil {
 		CopyWinsize(p.TtySource, master) // initial size for the pair
@@ -109,6 +128,9 @@ func Setup(strictCr bool) (p *Pump, childStdin *os.File, err error) {
 	// over unfiltered).
 	p.rawFD, p.saved = EnterRawMode()
 	p.Stdin = p.rawFD
+	if rawOutput && p.rawFD == nil {
+		return p, nil, fmt.Errorf("interactive terminal: cannot put stdin into raw mode")
+	}
 	childStdin, err = FilterChildStdin(slave, p.rawFD)
 	if err != nil {
 		return p, nil, err
@@ -127,7 +149,7 @@ func (p *Pump) Start() {
 	p.work = sync.NewCond(&p.mu)
 	p.done = make(chan struct{})
 	p.quit = make(chan struct{})
-	if p.Sanitizer == nil {
+	if p.Sanitizer == nil && !p.RawOutput {
 		p.Sanitizer = NewSanitizer(false)
 	}
 
@@ -140,10 +162,14 @@ func (p *Pump) Start() {
 		for {
 			n, err := p.Master.Read(buf)
 			if n > 0 {
-				p.emit(p.Sanitizer.Feed(buf[:n]))
+				if p.RawOutput {
+					p.emit(string(buf[:n]))
+				} else {
+					p.emit(p.Sanitizer.Feed(buf[:n]))
+				}
 			}
 			if err != nil {
-				if p.draining.Load() {
+				if p.draining.Load() && !p.RawOutput {
 					p.emit(p.Sanitizer.Flush())
 				}
 				return
@@ -211,7 +237,7 @@ func (p *Pump) Stop(drain time.Duration) {
 	timer.Stop()
 }
 
-// Close tears down --filter-output: restore the host terminal FIRST, clear the raw
+// Close tears down terminal forwarding: restore the host terminal FIRST, clear the raw
 // diagnostic flag, release SIGWINCH, wake and drop the pending stdin
 // backlog, then close the fds (closing the master evicts the parked
 // reader/writer through the runtime poller). Idempotent.

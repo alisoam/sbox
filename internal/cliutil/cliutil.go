@@ -2,6 +2,10 @@
 // parses the options without abbreviation. Clustered short flags are rejected;
 // attached values such as -aexample.com remain supported. The hidden
 // --_selfprobe flag dispatches the seccomp probe child and takes no value.
+// Overlay mode defaults to staged (pinned mounts and a bounded store); single
+// is an explicit pathname-based alternative without a configured cap, never a fallback.
+// Repeated --env flags select host variables or literal values for the sandbox;
+// values are resolved at parse time without changing the launcher's environment.
 //
 // OPTS_WITH_VALUE trap: every option that consumes a separate value token
 // MUST appear in OptsWithValue below — SplitArgv finds the first
@@ -30,7 +34,9 @@ var OptsWithValue = []string{
 	"-b", "--bind",
 	"-r", "--ro-bind",
 	"--bind-socket",
+	"--env",
 	"--overlay",
+	"--overlay-mode",
 	"--overlay-size",
 	"--upstream",
 }
@@ -99,8 +105,10 @@ type Options struct {
 	Bind             []string
 	RoBind           []string
 	BindSocket       []string
+	Env              []EnvVar
 	Overlay          []string
-	OverlaySize      int64 // parsed bytes; DefaultOverlaySize when unset
+	OverlaySingle    bool  // --overlay-mode single; default is staged
+	OverlaySize      int64 // parsed bytes; zero when unset (staged uses DefaultOverlaySize)
 	RoCwd            bool
 	Home             bool
 	Gui              bool
@@ -126,7 +134,9 @@ var (
 		"bind":         "-b/--bind",
 		"ro-bind":      "-r/--ro-bind",
 		"bind-socket":  "--bind-socket",
+		"env":          "--env",
 		"overlay":      "--overlay",
+		"overlay-mode": "--overlay-mode",
 		"overlay-size": "--overlay-size",
 		"upstream":     "--upstream",
 	}
@@ -167,6 +177,27 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 					return nil, nil, err
 				}
 				applyValue(opts, name, val)
+			case "env":
+				val, err := takeValue(pre, &i, hasInline, inline, longDisplay[name])
+				if err != nil {
+					return nil, nil, err
+				}
+				env, err := parseEnv(val)
+				if err != nil {
+					return nil, nil, err
+				}
+				opts.Env = append(opts.Env, env)
+			case "overlay-mode":
+				val, err := takeValue(pre, &i, hasInline, inline, longDisplay[name])
+				if err != nil {
+					return nil, nil, err
+				}
+				switch val {
+				case "staged", "single":
+					opts.OverlaySingle = val == "single"
+				default:
+					return nil, nil, fmt.Errorf("argument --overlay-mode: invalid mode %q (expected staged or single)", val)
+				}
 			case "overlay-size":
 				val, err := takeValue(pre, &i, hasInline, inline, longDisplay[name])
 				if err != nil {
@@ -219,10 +250,16 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 	if opts.StrictCrlf {
 		opts.FilterOutput = true
 	}
+	if opts.OverlaySingle && len(opts.Overlay) == 0 {
+		return nil, nil, fmt.Errorf("--overlay-mode single requires --overlay PATH")
+	}
+	if opts.OverlaySingle && opts.OverlaySize != 0 {
+		return nil, nil, fmt.Errorf("--overlay-size is not supported with --overlay-mode single (no configurable storage cap)")
+	}
 	return opts, command, nil
 }
 
-// DefaultOverlaySize is the shared storage budget for --overlay writable
+// DefaultOverlaySize is the shared storage budget for staged --overlay writable
 // layers when --overlay-size is not given: 1 GiB, covering all overlays
 // combined.
 const DefaultOverlaySize = 1 << 30
@@ -436,6 +473,21 @@ destinations only) or '*'.
 --net drops the proxy and shares the host network namespace instead.
 
 Notes:
+  - When stdin/stdout/stderr are terminals, sbox automatically provides a
+    private controlling terminal: shell job control, Ctrl-C, resizing and
+    full-screen tools work without a wrapper. The host tty stays outside
+    the sandbox, and its settings are restored on exit. Redirected streams
+    keep direct I/O unless --filter-output explicitly selects a PTY.
+    The terminal helper is filtered before its first instruction and execs
+    the bridge/command as PID 1; --new-session remains enabled.
+  - --env NAME forwards a host variable; --env NAME=VALUE sets a literal
+    value (NAME= sets an empty string). Repeatable; the last value wins,
+    overriding sandbox defaults. Unset host names are errors. Names must
+    match [A-Za-z_][A-Za-z0-9_]*. Quote values in your host shell as needed;
+    sbox does not evaluate them. These flags affect only the sandbox's
+    environment, not host proxy configuration or filesystem mounts.
+    Other host variables remain cleared except the usual HOME, USER,
+    TERM, PATH and LANG defaults and variables set by --gui/--ssh-agent.
   - --net also exposes host loopback services and abstract Unix sockets
     (D-Bus, X11, ...) to the sandbox; only use it for trusted work.
   - --gui passes through Wayland (preferred) and X11. X11 is effectively an
@@ -457,8 +509,8 @@ Notes:
     -r PATH for read-only; rw does let the sandbox replace the sockets
     inside it — the intended trade-off, since such dirs need writes).
   - Overlays (--overlay PATH): the command sees a writable, disposable view
-    of PATH — writes land in a bounded private store (1 GiB by default,
-    shared by all overlays, --overlay-size) that disappears when the sandbox
+    of PATH. In the default staged mode, writes land in a bounded private
+    store (1 GiB by default, shared by all overlays, --overlay-size) that disappears when the sandbox
     exits; the source tree is never modified. An overlay covering the cwd
     replaces the automatic cwd mount with its merged view; a cwd outside
     every overlay is auto-mounted READ-ONLY while overlays are in use (a
@@ -468,14 +520,16 @@ Notes:
     runtime dirs: refused, with NO --bind-socket-style opt-in) and are
     rejected when they overlap --home, each other (duplicate or nested), or
     any -b/-r/--bind-socket mount. bwrap resolves overlay sources by PATH,
-    so sbox stages them fd-first: a private, unprivileged staging sandbox
-    mounts every source at an independent path on a private staging tmpfs.
+    so --overlay-mode staged (the default) mounts them fd-first in a private,
+    unprivileged staging sandbox. Every source gets an independent path on
+    a private staging tmpfs.
     Validated sources come from PINNED descriptors; overlay lowers are
     read-only, and ordinary binds keep their requested modes. A separate
     size-bounded tmpfs holds all upper/work directories. Host-side path
     swaps cannot redirect these staged mounts. The launch probe uses the
-    same system runtime mounts, network mode, namespace flags and filter. Staging is invisible to the payload: the sandbox gets a
-    fresh root, and only the fds the argv names cross any exec boundary.
+    same system runtime mounts, network mode, namespace flags and filter.
+    Staging is invisible to the payload: the sandbox gets a fresh root, and
+    only the fds the argv names cross any exec boundary.
     Limits: an overlay is NOT a snapshot — host edits inside the source
     tree during the run are visible and behavior for them is undefined, so
     keep the underlying tree stable while the sandbox runs (a renamed or
@@ -483,6 +537,14 @@ Notes:
     data is still exposed (overlays protect integrity, not
     confidentiality); the storage cap does not limit total process memory,
     CPU or PIDs.
+  - --overlay-mode single uses one bwrap with --tmp-overlay. It keeps the
+    source validation, network policy and seccomp, but bwrap REOPENS the
+    validated pathname at mount time: a concurrent host rename or swap can
+    redirect the mount to an unvalidated tree. Validation fds never enter
+    the payload. The backing tmpfs has only the kernel default limit;
+    --overlay-size is rejected. Use with a trusted, stable source path.
+    This mode has its own launch probe and a warning on every run. It is
+    explicit, never an automatic fallback when staged mode fails.
   - With --as-pid-1 your command IS pid 1 of the sandbox: long-lived
     commands that spawn and abandon children will see zombies (nothing
     reaps orphans), and signals sent to pid 1 from inside (kill -TERM 1)
@@ -500,8 +562,8 @@ Notes:
     allowlist without extra flags. ~/.ssh/config is read first and wins
     per-option; ssh -o ProxyCommand=none opts out (and usually fails,
     fail-closed). --net installs nothing (direct egress, no allowlist).
-    No known_hosts is injected: host-key verification fails closed (tmpfs
-    home, no TTY) — pass -r ~/.ssh/known_hosts or pin hosts yourself.
+    No known_hosts is injected: pass -r ~/.ssh/known_hosts or verify keys
+    interactively. Without an interactive terminal, unknown keys fail closed.
   - The cwd is mounted read-write when it is a normal directory: sandboxed
     code can plant .git/hooks, Makefiles, .envrc or package.json scripts
     that execute on the HOST later — that is the default persistence
@@ -594,9 +656,10 @@ Notes:
     --strict-crlf (implies --filter-output) additionally drops \r
     not followed by \n: a bare \r lets payload output visually overwrite
     the current line after you read it (progress bars break). Known
-    limits: Ctrl-C reaches the sandbox as a byte — a command that never
-    reads stdin cannot be interrupted from the keyboard (kill sbox
-    from another shell); hidden text is not prevented beyond SGR 8
+    limits: filtering removes the cursor controls needed by tmux and
+    full-screen editors. Leave it off for those tools. The private terminal
+    supports job control and Ctrl-C; applications disabling terminal signal
+    handling receive Ctrl-C as input. Hidden text is not prevented beyond SGR 8
     conceal (matching fg/bg colors hide text just as well).
 
 Examples:
@@ -606,11 +669,15 @@ Examples:
   sbox -a example.com --filter-output -- curl -s https://example.com
   sbox --ssh-agent -a github.com -- git clone git@github.com:me/repo.git
   sbox --overlay "$PWD" --overlay-size 1GiB -- make
+  sbox --overlay "$PWD" --overlay-mode single -- /bin/zsh -i
+  sbox --env API_TOKEN --env EDITOR=nvim -- /bin/zsh -i
 `
 
 // Usage is the complete fixed-width help text.
 const Usage = `usage: sbox [-h] [-a HOST] [-A FILE] [-b PATH] [-r PATH] [--bind-socket PATH]
-            [--overlay PATH] [--overlay-size SIZE] [--ro-cwd] [--home] [--gui]
+            [--env NAME[=VALUE]]
+            [--overlay PATH] [--overlay-mode MODE] [--overlay-size SIZE]
+            [--ro-cwd] [--home] [--gui]
             [--ssh-agent] [--filter-output] [--strict-crlf] [--upstream URL]
             [--upstream-insecure] [--net] [--no-seccomp] [-v] [--shell]
 
@@ -645,11 +712,11 @@ options:
                         resolved path as a DISPOSABLE WRITABLE overlay: reads
                         see the real tree, writes (creates, edits, deletes,
                         renames, chmods, symlinks, hard links) land in a
-                        private bounded store that vanishes when the sandbox
+                        private store that vanishes when the sandbox
                         exits — the source tree itself is never written.
-                        Repeatable; all overlays share one --overlay-size
-                        budget. Sources are validated like binds (protected
-                        paths, control sockets, socket-bearing trees and
+                        Repeatable; in staged mode all overlays share one
+                        --overlay-size budget. Sources are validated like
+                        binds (protected paths, control sockets, socket-bearing trees and
                         runtime dirs are refused — no opt-in) and may not
                         overlap --home or any -b/-r/--bind-socket mount. An
                         overlay covering the cwd replaces the automatic cwd
@@ -658,13 +725,24 @@ options:
                         fd binds and a kernel supporting unprivileged
                         overlayfs (>= 5.11); the full arrangement is probed
                         before launch and refused when it cannot run.
-  --overlay-size SIZE   Combined storage cap for every overlay writable layer:
+  --overlay-mode MODE   staged (default): two bwrap levels, pinned sources and
+                        a shared storage cap. single: one bwrap, pathname
+                        sources reopened after validation, no configurable
+                        cap. Single warns about source-swap races and rejects
+                        --overlay-size. Applies to all --overlay paths;
+                        neither mode falls back to the other.
+  --overlay-size SIZE   Staged mode only. Shared writable storage cap:
                         1GiB (the default), 500MB, 1073741824 ... Bounds
                         1MiB..16TiB. Hitting the cap fails writes (ENOSPC)
                         inside the sandbox — they never fall back to the host
                         tree. The cap bounds the overlay store only, not
                         total process memory, CPU or PIDs.
   --ro-cwd              Mount the current directory read-only (default: rw).
+  --env NAME[=VALUE]     Forward a host variable, or set a literal value.
+                        NAME= sets an empty string; an unset host NAME is an
+                        error. Repeatable; last value wins over defaults.
+                        Changes sandbox environment only, not host settings
+                        or mounts. Names: [A-Za-z_][A-Za-z0-9_]*.
   --home                Bind the real $HOME (default: private tmpfs home).
   --gui                 Pass through Wayland/X11 sockets. X11 is effectively
                         an escape: clients can log keys, capture the screen

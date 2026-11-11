@@ -26,10 +26,16 @@ import (
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "--_selfprobe":
+		case "--_selfprobe", "--_terminal-exec":
 			os.Exit(run(os.Args[1:]))
 		case "--_test-launch":
 			os.Exit(run(os.Args[2:]))
+		case "--_test-terminal":
+			if err := liveTerminalPayload(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			os.Exit(0)
 		case "--_test-payload":
 			if err := livePayload(os.Args[2:]); err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -278,6 +284,10 @@ func livePayload(args []string) error {
 // namespaces the plain boundary test also needs. Returns the test
 // binary (symlinks resolved).
 func overlayPreflight(t *testing.T) string {
+	return overlayModePreflight(t, false)
+}
+
+func overlayModePreflight(t *testing.T, single bool) string {
 	t.Helper()
 	bwrapBin, err := exec.LookPath("bwrap")
 	if err != nil {
@@ -313,24 +323,26 @@ func overlayPreflight(t *testing.T) string {
 	}
 	// This independent preflight uses no sbox-generated mount arrangement.
 	// A failure here identifies a host namespace restriction, not a launch bug.
-	nested := exec.CommandContext(ctx, bwrapBin,
-		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-		"--unshare-net", "--die-with-parent", "--ro-bind", "/", "/",
-		"--proc", "/proc", "--dev", "/dev", "--", bwrapBin,
-		"--unshare-all", "--die-with-parent", "--new-session", "--as-pid-1",
-		"--ro-bind", "/", "/", "--", "/bin/true")
-	if out, err := nested.CombinedOutput(); err != nil {
-		for _, reason := range []string{
-			"No permissions to create a new namespace",
-			"Creating new namespace failed: Operation not permitted",
-			"Creating new namespace failed: Permission denied",
-			"setting up uid map: Permission denied",
-		} {
-			if strings.Contains(string(out), reason) {
-				t.Skipf("overlay boundary: host blocks nested namespaces: %s", out)
+	if !single {
+		nested := exec.CommandContext(ctx, bwrapBin,
+			"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+			"--unshare-net", "--die-with-parent", "--ro-bind", "/", "/",
+			"--proc", "/proc", "--dev", "/dev", "--", bwrapBin,
+			"--unshare-all", "--die-with-parent", "--new-session", "--as-pid-1",
+			"--ro-bind", "/", "/", "--", "/bin/true")
+		if out, err := nested.CombinedOutput(); err != nil {
+			for _, reason := range []string{
+				"No permissions to create a new namespace",
+				"Creating new namespace failed: Operation not permitted",
+				"Creating new namespace failed: Permission denied",
+				"setting up uid map: Permission denied",
+			} {
+				if strings.Contains(string(out), reason) {
+					t.Skipf("overlay boundary: host blocks nested namespaces: %s", out)
+				}
 			}
+			t.Fatalf("overlay boundary: nested namespace preflight: %v\n%s", err, out)
 		}
-		t.Fatalf("overlay boundary: nested namespace preflight: %v\n%s", err, out)
 	}
 
 	exe, err := os.Executable()
@@ -555,9 +567,10 @@ func noOPathFDs() error {
 // liveOverlayPayload runs as pid 1 inside the overlay sandbox and hammers
 // the merged views: create/overwrite/delete/rename/chmod/symlink/
 // hardlink, staging invisibility, fd closure, filter coverage of a
-// descendant, and the storage cap. args: src1 src2 cwd
+// descendant, and the storage cap. args: src1 src2 cwd [single]
 func liveOverlayPayload(args []string) error {
-	if len(args) != 3 {
+	single := len(args) == 4 && args[3] == "single"
+	if len(args) != 3 && !single {
 		return fmt.Errorf("payload wants src1 src2 cwd, got %q", args)
 	}
 	if os.Getpid() != 1 {
@@ -652,8 +665,12 @@ func liveOverlayPayload(args []string) error {
 	// the storage cap: a 2MiB write into the 1MiB shared store must
 	// FAIL — never fall back onto the host tree.
 	big := make([]byte, 2<<20)
-	if err := os.WriteFile(filepath.Join(args[0], "big.bin"), big, 0o644); err == nil {
-		return fmt.Errorf("2MiB write into a 1MiB overlay store succeeded — the cap is not enforced")
+	err = os.WriteFile(filepath.Join(args[0], "big.bin"), big, 0o644)
+	if single && err != nil {
+		return fmt.Errorf("single overlay 2MiB write failed: %w", err)
+	}
+	if !single && !errors.Is(err, syscall.ENOSPC) {
+		return fmt.Errorf("2MiB write into a 1MiB overlay store: %v; want ENOSPC", err)
 	}
 
 	// a descendant inherits the filter and the same constraints
@@ -700,6 +717,29 @@ func liveOverlayHold(args []string) error {
 // and setup descriptors must be unreachable, a renamed source keeps
 // working through its pin, and SIGTERM/SIGKILL teardown leaves nothing
 // behind.
+func TestRealBwrapSingleOverlayBoundary(t *testing.T) {
+	exe := overlayModePreflight(t, true)
+	dir := t.TempDir()
+	home, src1, src2 := filepath.Join(dir, "home"), filepath.Join(dir, "proj1"), filepath.Join(dir, "proj2")
+	for _, p := range []string{home, src1, src2} {
+		if err := os.Mkdir(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snap1, snap2 := plantTree(t, src1), plantTree(t, src2)
+	out, rc := overlayLaunch(t, src1, home, 60*time.Second,
+		[]string{"--overlay", src1, "--overlay", src2, "--overlay-mode", "single"},
+		exe, "--_test-ovl-payload", src1, src2, src1, "single")
+	if rc != 0 || !strings.Contains(out, "overlay probe passed") {
+		t.Fatalf("rc %d out %q", rc, out)
+	}
+	if !strings.Contains(out, "No sbox storage cap") {
+		t.Fatalf("missing mode warning: %q", out)
+	}
+	requireTreeUnchanged(t, src1, snap1, "src1")
+	requireTreeUnchanged(t, src2, snap2, "src2")
+}
+
 func TestRealBwrapOverlayBoundary(t *testing.T) {
 	exe := overlayPreflight(t)
 

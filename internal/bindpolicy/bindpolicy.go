@@ -2,6 +2,8 @@
 // sources and the automatic cwd mount, pins their descriptors, scans for
 // sockets and warns when writable binds cover host persistence paths.
 // Validation rules and mount modes are covered by native contract tests.
+// Explicit single-launch overlays share the pinned source validation, but
+// knowingly reopen paths at mount time; their validation fds stay host-side.
 //
 // Security model (fd-first, fail-closed):
 //
@@ -40,7 +42,8 @@
 //     sources are ALWAYS pinned (nil pin = refusal): bwrap resolves
 //     overlay lower paths by NAME, so the pinned object is what a
 //     private staging namespace must re-mount for the swap protection to
-//     survive (see internal/sandbox/bwrap).
+//     survive (see internal/sandbox/bwrap). Explicit --overlay-mode single
+//     keeps fd-first validation but accepts pathname reopening at mount time.
 //   - Read-write -b binds covering $HOME persistence paths (shell rc and
 //     session files, ~/.ssh/authorized_keys, systemd user units, XDG
 //     autostart, environment.d, ~/.local/bin, ~/.cargo/bin, ~/go/bin,

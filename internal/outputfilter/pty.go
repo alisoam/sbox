@@ -52,6 +52,16 @@ func isTTY(fd uintptr) bool {
 	return tcgetattr(fd, &t) == nil
 }
 
+// IsTTY reports whether f is an open terminal. It also handles absent stdio.
+func IsTTY(f *os.File) bool { return f != nil && isTTY(f.Fd()) }
+
+// InteractiveStdio selects automatic terminal forwarding only when all three
+// streams are terminals. Redirected output and piped input keep their byte-exact
+// direct-stream behavior unless --filter-output explicitly selects a PTY.
+func InteractiveStdio() bool {
+	return IsTTY(os.Stdin) && IsTTY(os.Stdout) && IsTTY(os.Stderr)
+}
+
 // OpenPty allocates a fresh pty pair (pty.openpty): a non-blocking
 // master (poller-registered by os.OpenFile, so the pump can evict a
 // parked Read with a read deadline) and a blocking slave (the

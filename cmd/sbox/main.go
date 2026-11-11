@@ -1,6 +1,8 @@
 // Command sbox validates CLI options and dependencies, probes the sandbox
 // backend, and starts the supervisor. The hidden --_selfprobe entry re-executes
 // the binary to verify seccomp in an isolated child before launching a payload.
+// --_terminal-exec runs after bwrap installs seccomp, attaches the private
+// controlling terminal, and execs the sandbox bridge/payload in place.
 package main
 
 import (
@@ -23,6 +25,12 @@ import (
 func main() { os.Exit(run(os.Args[1:])) }
 
 func run(argv []string) int {
+	if len(argv) > 0 && argv[0] == "--_terminal-exec" {
+		if err := sandbox.TerminalExec(argv[1:]); err != nil {
+			return die(err.Error())
+		}
+		return 0 // successful exec does not return
+	}
 	// The ONLY legitimate --_selfprobe caller is this binary re-executing
 	// itself as the host-side seccomp probe child with exactly this argv
 	// shape (the filter bytes arrive on stdin).

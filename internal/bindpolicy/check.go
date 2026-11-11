@@ -308,7 +308,9 @@ func anyCovers(roots []string, p string) bool {
 }
 
 // Overlay is one validated --overlay source returned by CheckOverlays for
-// staging: the resolved realpath plus its PINNED descriptor. Overlays keep
+// staging: the resolved realpath plus its PINNED descriptor. Explicit single
+// mode uses the same pinned validation, then releases the pin and knowingly
+// reopens the pathname at mount time. Overlays keep
 // no mount-mode decision — the writable layer is always the private store,
 // never the source, which is exactly why the source can be pinned read-only.
 type Overlay struct {
@@ -332,6 +334,8 @@ type Overlay struct {
 //     sources by PATH, so the launcher can only keep its swap protection
 //     by re-mounting the pinned object in a private staging namespace.
 //     Without fd binds (bwrap < 0.10) overlays refuse to run at all.
+//     --overlay-mode single keeps this validation requirement, but explicitly
+//     gives up the pin at mount time; BuildSpec releases those validation fds.
 //
 // Overlays are ephemeral by design (writes never reach the source tree),
 // so persistence warnings do not apply. Cross-checks: duplicate or nested

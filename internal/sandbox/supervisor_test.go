@@ -105,14 +105,16 @@ func TestFilteredProxyLogCloseWithBlockedSink(t *testing.T) {
 // recording userns probe, an overlay probe, and Build returning a
 // Launch for a shim binary.
 type fakeProvider struct {
-	caps      Caps
-	bin       string
-	userns    int
-	usernsOK  bool
-	overlay   int
-	overlayOK bool
-	specs     []*Spec
-	build     func(*Spec) (*Launch, error)
+	caps            Caps
+	bin             string
+	userns          int
+	usernsOK        bool
+	overlay         int
+	overlayOK       bool
+	singleOverlay   int
+	singleOverlayOK bool
+	specs           []*Spec
+	build           func(*Spec) (*Launch, error)
 }
 
 func (f *fakeProvider) Name() string          { return "fake" }
@@ -131,6 +133,14 @@ func (f *fakeProvider) Build(spec *Spec) (*Launch, error) {
 		return f.build(spec)
 	}
 	return &Launch{Bin: f.bin}, nil
+}
+
+func (f *fakeProvider) SingleOverlayProbe(bool, bool, []byte) error {
+	f.singleOverlay++
+	if !f.singleOverlayOK {
+		return fmt.Errorf("single overlay probe failed")
+	}
+	return nil
 }
 
 // writeShim writes an executable /bin/sh script.
@@ -447,8 +457,9 @@ func TestSupervisorOverlay(t *testing.T) {
 	t.Run("failing arrangement probe refuses", func(t *testing.T) {
 		sup, fp, root := newTestSupervisor(t)
 		sup.Opts.Overlay = []string{overlayable(t, root)}
-		fp.caps = Caps{BindFD: true, Overlay: true}
+		fp.caps = Caps{BindFD: true, Overlay: true, TmpOverlay: true}
 		fp.overlayOK = false
+		fp.singleOverlayOK = true // single would work, but must not be a fallback
 		var notes []string
 		sup.Warn = func(w string) { notes = append(notes, w) }
 		if rc := sup.Run(); rc != 1 {
@@ -456,6 +467,9 @@ func TestSupervisorOverlay(t *testing.T) {
 		}
 		if fp.overlay != 1 {
 			t.Errorf("probe runs = %d, want 1", fp.overlay)
+		}
+		if fp.singleOverlay != 0 || len(fp.specs) != 0 {
+			t.Fatal("failed staged probe fell back to single mode")
 		}
 		if len(notes) != 1 || !strings.Contains(notes[0], "cannot run the overlay staging arrangement") {
 			t.Errorf("notes = %v, want the probe refusal", notes)

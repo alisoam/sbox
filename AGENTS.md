@@ -49,8 +49,10 @@ short flags; attached short values such as `-bPATH` remain supported.
   `/run/proxy.sock`; the sandbox's socat bridge exposes `127.0.0.1:1080`.
 - `internal/sandbox`: backend-neutral mount specification and supervisor.
   Only `internal/sandbox/bwrap` knows bwrap flag spellings and fd numbering.
-  Overlay ops render as a TWO-LEVEL launch there (trusted staging sandbox +
-  the real sandbox); staging is invisible to the payload.
+  Default Overlay ops render as a TWO-LEVEL launch there (trusted staging
+  sandbox + the real sandbox); staging is invisible to the payload.
+  Explicit --overlay-mode single uses PathOverlay ops with documented source
+  races and no configurable storage cap; never select it as a fallback.
 - `internal/bindpolicy`: path protection, fd-first validation, pinned mounts,
   and overlay validation.
 - `internal/outputfilter`: sanitizer, PTY, and input/output pump.
@@ -120,13 +122,13 @@ short flags; attached short values such as `-bPATH` remain supported.
 - Emit automatic cwd mounts BEFORE explicit user binds, so -r "$PWD" wins.
 - --overlay sources reuse the whole bind validation (protected paths,
   control sockets, socket shape, bounded scan) with NO opt-in, must be
-  pinned directories (a nil pin refuses — never a path-based overlay),
+  pinned directories for validation (a nil pin refuses),
   and may not overlap each other, --home, or any explicit bind. An
   overlay covering cwd replaces the automatic cwd mount (chdir lands in
   the merged view); a cwd outside every overlay auto-mounts READ-ONLY
   while overlays are in use — that downgrade is noted loudly.
 - bwrap (0.11) resolves overlay sources by PATHNAME and its --size only
-  bounds --tmpfs. Overlays therefore launch as a two-level arrangement:
+  bounds --tmpfs. Default --overlay-mode staged launches a two-level arrangement:
   an unprivileged STAGING bwrap (fresh pid/ipc/uts/net namespaces, own
   /proc and /dev, host root mirrored read-only) creates a private staging
   tmpfs at /tmp. ALL mount sources get independent staging paths: validated
@@ -144,6 +146,15 @@ short flags; attached short values such as `-bPATH` remain supported.
   network mode, namespace flags and filter before any overlay launch;
   on failure REFUSE — never substitute path-based
   overlay sources.
+- Explicit --overlay-mode single is the only exception to overlay mount pinning:
+  retain fd-first validation, then release overlay pins and emit PathOverlay ops.
+  A single bwrap reopens these sources by pathname with --tmp-overlay; warn on
+  EVERY run that a concurrent host swap can redirect the mount to unvalidated
+  ground and that only the kernel default tmpfs limit applies. Reject explicit
+  --overlay-size in this mode. Never pass overlay source fds into the child.
+  Ordinary bind pins, seccomp, namespace/session flags and network policy stay
+  intact. Probe this exact mode with production mounts/flags/filter and refuse
+  on failure. Neither mode may fall back to the other.
 - Warn on read-write mounts overlapping known home persistence paths in BOTH
   directions, including --bind-socket directories. Read-only binds stay silent.
   These warnings are keyed on final mount mode, not the CLI label.
@@ -172,6 +183,13 @@ short flags; attached short values such as `-bPATH` remain supported.
 
 ## Output and lifecycle
 
+- Interactive stdin/stdout/stderr automatically use a private PTY with raw output.
+  A private read-only copy of sbox runs --_terminal-exec after bwrap installs
+  seccomp, claims the fresh slave as its controlling terminal, then execs the
+  bridge/payload in place as PID 1. Keep --new-session and --as-pid-1; do not
+  introduce an unfiltered helper or reaper. No host terminal descriptor may
+  enter this mode. Forward input/resizes and restore host termios on every exit.
+  Preserve direct I/O for pipes/redirections unless --filter-output is explicit.
 - Under --filter-output, stdout/stderr are a PTY slave; the host terminal fd must
   NEVER enter the sandbox. Stdin uses that slave only for a host tty successfully
   put in raw mode; non-tty input is inherited byte-exact. An untameable tty is a
