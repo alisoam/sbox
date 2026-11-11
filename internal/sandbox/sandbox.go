@@ -50,10 +50,17 @@
 // Explicit --env values override the sandbox environment defaults in CLI order.
 // They affect only the sandbox: host configuration and mount selection still use
 // the launcher's environment, and no values are interpolated into shell code.
-// Interactive stdio automatically uses a private PTY. The supervisor mounts a
-// private copy of this executable read-only; after bwrap installs seccomp, its
-// terminal entry claims that PTY and execs the bridge/payload as PID 1. No extra
-// unfiltered helper, host tty descriptor or reaper is exposed to the payload.
+// The values never appear in the sandbox process's argv (/proc/<pid>/cmdline is
+// world-readable): they ride an fd handoff the backend materializes inside the
+// sandbox and a private helper applies before exec'ing the bridge.
+// Interactive stdio automatically uses a private PTY; --filter-output
+// sessions with a host tty on stdin are PTY sessions too. The supervisor
+// mounts a private copy of this executable read-only; after bwrap installs
+// seccomp, its terminal entry claims that PTY and execs the bridge as PID 1,
+// which in terminal sessions runs the payload as its foreground child (PID 1
+// itself drops default-disposition tty signals such as Ctrl-C's SIGINT). No
+// extra unfiltered helper, host tty descriptor or reaper is exposed to the
+// payload.
 package sandbox
 
 import (
@@ -80,6 +87,7 @@ type Caps struct {
 	DisableUserns bool // --disable-userns AND --assert-userns-disabled
 	Overlay       bool // --overlay-src + --overlay (bwrap >= 0.11, unprivileged only)
 	TmpOverlay    bool // --overlay-src + --tmp-overlay (single-launch alternative)
+	BindData      bool // --ro-bind-data (fd-based file handoff for --env)
 }
 
 // SeccompFlag is the option the filter is handed through, "" when this
@@ -99,7 +107,9 @@ func (c Caps) SeccompFlag() string {
 type Op interface{ isOp() }
 
 // Setenv exports one environment variable into the sandbox
-// (bwrap --setenv; the environment is cleared first).
+// (bwrap --setenv; the environment is cleared first). Only launcher
+// DEFAULTS ride this op: explicit --env values must never be rendered
+// into the backend's world-readable argv — they travel as Spec.EnvData.
 type Setenv struct{ Name, Value string }
 
 // Mount is one bind: Src host-side, Dst in-sandbox. RW is the FINAL
@@ -186,7 +196,10 @@ func (Chdir) isOp()       {}
 // Spec is everything the launcher decided, validated, in emission
 // order. Bridge is the in-sandbox sh script (socat bridge + readiness
 // loop + `exec "$@"` — backend-neutral text; the supervisor runs it as
-// /bin/sh -c BRIDGE sbox-sh CMD...). Seccomp is the raw sock_filter
+// /bin/sh -c BRIDGE sbox-sh CMD...). Terminal sessions rewrite the
+// tail via PayloadAsChild so the shell runs the payload as its
+// foreground child (PID 1 drops default-disposition tty signals).
+// Seccomp is the raw sock_filter
 // bytes for the deny-list filter (a multiple of 8, no length prefix;
 // nil ⇒ --no-seccomp, the explicit opt-out). DisableUserns asks for the
 // kernel-level nested-userns kill (--disable-userns +
@@ -204,6 +217,13 @@ type Spec struct {
 	// Backend-neutral: a backend without overlays errors on Overlay ops.
 	// Must be zero for PathOverlay ops, which have no configurable cap.
 	OverlayStoreSize int64
+	// EnvData carries the explicit --env records (NUL-separated
+	// NAME\0VALUE\0, CLI order) for an out-of-band handoff: the backend
+	// materializes the bytes INSIDE the sandbox (bwrap --ro-bind-data
+	// from a launcher fd) and a private helper applies them before the
+	// bridge runs, so no value ever appears in the backend's
+	// world-readable /proc/<pid>/cmdline. nil ⇒ no explicit --env.
+	EnvData []byte
 }
 
 // Launch is the provider's rendered spawn plan. Bin is the backend
@@ -291,6 +311,35 @@ Host *
 // unfiltered bridge would be a syscall-injection escape hatch).
 func PayloadArgv(bridge string, command []string) []string {
 	return append([]string{"/bin/sh", "-c", bridge, "sbox-sh"}, command...)
+}
+
+// PayloadAsChild rewrites a built bridge's `exec "$@"` tail into a plain
+// foreground run whose STATUS IS ECHOED (`"$@"` followed by
+// `status=$?; exit "$status"`): the bridge shell STAYS PID 1 and waits on
+// the command instead of exec'ing it in place. Needed for terminal
+// sessions: the kernel drops default-disposition tty signals (VINTR →
+// SIGINT) delivered to PID 1, so an exec'd payload with no SIGINT
+// handler — `sbox -- sleep 30` — silently ignored Ctrl-C. With the
+// child form the foreground process group is the shell's, the CHILD
+// (not PID 1) receives the SIGINT and dies, and the shell exits with
+// its 128+signal status; payloads that install their own handlers
+// (interactive shells, editors) see exactly the same signals as before.
+// The status echo is load-bearing: dash AND bash in sh mode may replace
+// themselves with a script's final simple command, which would restore
+// the PID-1 payload through the back door — a trailing assignment
+// defeats that tail-exec optimization while preserving the exit status
+// (signal deaths surface as the shell's usual 128+n). The whole chain
+// stays seccomp-filtered and PID 1 remains the bridge shell, so no
+// unfiltered reaper appears. The second return is false when the tail
+// is not the expected exec form (the bridge is returned unchanged,
+// preserving the old behavior).
+func PayloadAsChild(bridge string) (string, bool) {
+	const execTail = "exec \"$@\"\n"
+	if !strings.HasSuffix(bridge, execTail) {
+		return bridge, false
+	}
+	return strings.TrimSuffix(bridge, execTail) +
+		"\"$@\"\nstatus=$?\nexit \"$status\"\n", true
 }
 
 // AgentSocketPath resolves $SSH_AUTH_SOCK for --ssh-agent
@@ -516,11 +565,16 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 		)
 	}
 
-	// Explicit values override defaults (including the generated proxy/agent
-	// environment). They are sandbox ops, never host os.Setenv calls or shell
-	// assignments. Repeated names are applied in order, so the last value wins.
-	for _, env := range opts.Env {
-		ops = append(ops, Setenv{Name: env.Name, Value: env.Value})
+	// Explicit values ride the fd handoff (Spec.EnvData +
+	// --ro-bind-data + the --_env-exec helper): a --setenv VALUE would
+	// sit in the backend's /proc/<pid>/cmdline for the sandbox's whole
+	// lifetime, world-readable — and `--env NAME` (forwarding a host
+	// variable) would publish a value no command line ever carried.
+	// The helper applies the records AFTER these defaults, in CLI
+	// order, so the last value still wins for repeated names.
+	envData, err := composeEnvData(opts.Env)
+	if err != nil {
+		return nil, err
 	}
 
 	// Current directory: bind it (rw unless --ro-cwd) through the SAME
@@ -672,7 +726,7 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 		}
 		size = 0
 	}
-	return &Spec{Ops: ops, Bridge: bridge, OverlayStoreSize: size}, nil
+	return &Spec{Ops: ops, Bridge: bridge, OverlayStoreSize: size, EnvData: envData}, nil
 }
 
 // anyCovers reports whether any bind's resolved path is equal to or an

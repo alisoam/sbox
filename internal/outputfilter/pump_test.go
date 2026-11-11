@@ -362,3 +362,53 @@ func TestPumpCloseRestoresTermiosFirst(t *testing.T) {
 	}
 	_ = master
 }
+
+// A blocked output sink must not make Stop unbounded: the drain
+// deadline evicts the master read, but nothing but this test's release
+// channel ever frees the WRITE — Stop has to abandon that reader so
+// the terminal restore behind it still runs.
+func TestPumpStopWithBlockedSink(t *testing.T) {
+	master, slave := requirePty(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	p := &Pump{
+		Master:    master,
+		Sanitizer: NewSanitizer(false),
+		Out: writerFunc(func(b []byte) (int, error) {
+			once.Do(func() { close(entered) }) // the first write parks here
+			<-release
+			return len(b), nil
+		}),
+	}
+	p.Start()
+	defer p.Close()
+	if _, err := slave.Write([]byte("hello\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the reader never reached the blocked sink")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		p.Stop(50 * time.Millisecond)
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		// bounded: Stop returned while the sink was still blocked
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("Stop waited for a blocked output sink")
+	}
+	close(release) // let the abandoned reader finish before Close
+	deadline := time.After(3 * time.Second)
+	select {
+	case <-p.done:
+	case <-deadline:
+		t.Fatal("the abandoned reader never exited after the sink freed")
+	}
+}

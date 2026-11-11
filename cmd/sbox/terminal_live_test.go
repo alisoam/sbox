@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,8 +30,21 @@ func terminalIOCTL(fd uintptr, request uintptr, value unsafe.Pointer) error {
 }
 
 func liveTerminalPayload(args []string) error {
-	if len(args) != 1 || os.Getpid() != 1 {
-		return fmt.Errorf("terminal payload requires PID 1 and host tty identity")
+	if len(args) != 1 || os.Getpid() == 1 {
+		return fmt.Errorf("terminal payload requires a foreground child of the PID-1 bridge")
+	}
+	// The bridge shell must be PID 1 and this payload its foreground
+	// child (exec-in-place would make the payload PID 1, which drops
+	// default-disposition tty signals such as Ctrl-C's SIGINT).
+	if os.Getppid() != 1 {
+		return fmt.Errorf("payload ppid = %d, want the PID-1 bridge shell", os.Getppid())
+	}
+	pid1, err := os.ReadFile("/proc/1/cmdline")
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(pid1, []byte("sbox-sh")) {
+		return fmt.Errorf("PID 1 is not the sbox bridge shell: %q", pid1)
 	}
 	if err := liveFilterCheck(); err != nil {
 		return err
@@ -133,6 +148,40 @@ func TestRealBwrapInteractiveInterrupt(t *testing.T) {
 	p.send(t, "printf 'survived-%s\\n' interrupt; exit\n")
 	p.until(t, "survived-interrupt")
 	p.wait(t)
+}
+
+// A DIRECT command (no interactive shell around it) used to be exec'd
+// as PID 1, and the kernel drops default-disposition SIGINTs to PID 1 —
+// Ctrl-C did nothing. The bridge must run it as a foreground child so
+// the signal lands, and the sandbox must exit with the child's
+// 128+SIGINT status. Readiness is signaled by the payload itself: a
+// fixed delay would race slow starts (the race build caught exactly
+// that), and an interrupt landing before the exec still kills the
+// wrapper shell, which reports the same status.
+func TestRealBwrapInteractiveInterruptDirectCommand(t *testing.T) {
+	exe := overlayModePreflight(t, true)
+	p := startTerminalTest(t, exe, []string{"--overlay-mode", "single"}, true, func(uint64) []string {
+		return []string{"/bin/sh", "-c", `printf 'direct-ready\n'; exec /bin/sleep 30`}
+	})
+	p.until(t, "direct-ready")
+	p.send(t, "\x03")
+	select {
+	case err := <-p.done:
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != 128+int(syscall.SIGINT) {
+			t.Fatalf("exit = %v, want status 130 (128+SIGINT)", err)
+		}
+	case <-time.After(10 * time.Second):
+		p.cmd.Process.Kill()
+		t.Fatal("Ctrl-C did not stop a direct PID-1 command")
+	}
+	var after syscall.Termios
+	if err := terminalIOCTL(p.slave.Fd(), syscall.TCGETS, unsafe.Pointer(&after)); err != nil {
+		t.Fatal(err)
+	}
+	if after != p.before {
+		t.Fatal("host terminal settings were not restored")
+	}
 }
 
 type terminalTestProcess struct {

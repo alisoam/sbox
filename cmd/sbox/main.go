@@ -3,6 +3,8 @@
 // the binary to verify seccomp in an isolated child before launching a payload.
 // --_terminal-exec runs after bwrap installs seccomp, attaches the private
 // controlling terminal, and execs the sandbox bridge/payload in place.
+// --_env-exec (inside the sandbox) applies the fd-handed --env records and
+// execs the bridge in place, keeping the values out of every command line.
 package main
 
 import (
@@ -27,6 +29,15 @@ func main() { os.Exit(run(os.Args[1:])) }
 func run(argv []string) int {
 	if len(argv) > 0 && argv[0] == "--_terminal-exec" {
 		if err := sandbox.TerminalExec(argv[1:]); err != nil {
+			return die(err.Error())
+		}
+		return 0 // successful exec does not return
+	}
+	// --_env-exec runs inside the sandbox: apply the fd-handed --env
+	// records over the backend's --setenv defaults, then exec the
+	// bridge in place (still PID 1, still filtered).
+	if len(argv) > 0 && argv[0] == "--_env-exec" {
+		if err := sandbox.EnvExec(argv[1:]); err != nil {
 			return die(err.Error())
 		}
 		return 0 // successful exec does not return

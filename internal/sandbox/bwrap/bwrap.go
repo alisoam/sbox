@@ -68,6 +68,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -155,6 +156,10 @@ func ParseCaps(text string) sandbox.Caps {
 		// overlay probe is what actually decides the host can run one.
 		Overlay:    hasOpt(text, "--overlay-src") && hasOpt(text, "--overlay"),
 		TmpOverlay: hasOpt(text, "--overlay-src") && hasOpt(text, "--tmp-overlay"),
+		// --ro-bind-data (bwrap >= 0.2, older than the seccomp floor):
+		// copies a launcher fd into a sandbox file — the out-of-band
+		// --env handoff that keeps values out of /proc/<pid>/cmdline.
+		BindData: hasOpt(text, "--ro-bind-data"),
 	}
 }
 
@@ -355,6 +360,7 @@ const (
 	stageDir      = "/tmp/sbox-stage"
 	stageBinary   = stageDir + "/bwrap"
 	stageSeccomp  = stageDir + "/seccomp.bpf" // the filter bytes, staged for the inner bwrap
+	stageEnv      = stageDir + "/env"         // the --env handoff, staged the same way
 	stageStore    = stageDir + "/st"          // the ONE size-bounded tmpfs (all overlays)
 	stageMountFmt = stageDir + "/mounts/%d"   // ordinary mounts, with their requested mode
 	stageSrcFmt   = stageDir + "/src/%d"      // pinned overlay sources, ro
@@ -362,14 +368,26 @@ const (
 	stageWorkFmt  = stageStore + "/w%d"
 )
 
-// stageSeccompBridge is the staging payload when seccomp is enabled:
-// bwrap closes every fd its argv does not name, so the filter cannot
-// ride an inherited descriptor into the inner bwrap. The staging sandbox
-// materializes the bytes host-side (--file), this fixed script opens
-// them as fd 3, and `exec "$@"` hands control to the inner bwrap with
-// its options expanded VERBATIM from argv (never re-parsed by the
-// shell). The script is a constant: no untrusted bytes reach it.
-const stageSeccompBridge = "exec 3<" + stageSeccomp + "\nexec \"$@\""
+// stageBridgeScript renders the staging payload script used whenever a
+// setup file must reach the inner bwrap as a descriptor: bwrap closes
+// every fd its argv does not name, so the staging sandbox materializes
+// the bytes host-side (--file) and this fixed script re-opens them
+// (`exec N<PATH`), handing the descriptors to the inner bwrap whose
+// options name them. `exec "$@"` passes the inner argv VERBATIM —
+// never re-parsed by the shell. The script is built from fixed strings
+// only; no untrusted bytes reach it. seccompFD is fd 3 when a filter
+// applies; envFD (set only for an --env handoff) takes the next slot.
+func stageBridgeScript(seccompFD, envFD string) string {
+	var b strings.Builder
+	if seccompFD != "" {
+		b.WriteString("exec " + seccompFD + "<" + stageSeccomp + "\n")
+	}
+	if envFD != "" {
+		b.WriteString("exec " + envFD + "<" + stageEnv + "\n")
+	}
+	b.WriteString(`exec "$@"`)
+	return b.String()
+}
 
 // stageBin resolves the host binary to bind at stageBinary. Staging the
 // executable also preserves binaries located under the host's /tmp, which
@@ -500,6 +518,8 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 	var stagedMounts []string // all mount sources, on independent private paths
 	var stagedDirs []string   // per-overlay upper/work dir creations
 	var seccompFD string      // the staging --file fd number, "" when unfiltered
+	var envFD string          // the --env handoff fd number, "" without --env
+	var envInner []string     // --ro-bind-data tokens, appended AFTER the ops loop
 
 	if spec.Seccomp != nil {
 		// Fail-closed: this mirrors seccomp_fd_args' die — the filter
@@ -529,10 +549,40 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 					"staged filter (this bwrap only offers --seccomp)")
 			}
 			seccompFD = nameFD(r)
-			inner = append(inner, "--add-seccomp-fd", "3")
+			inner = append(inner, "--add-seccomp-fd", seccompFD)
 		} else {
 			inner = append(inner, flag, nameFD(r))
 		}
+	}
+	// The --env handoff rides a pipe fd, never argv: bwrap copies the
+	// bytes into the sandbox (--ro-bind-data) and the --_env-exec
+	// helper applies them before the bridge runs. A --setenv VALUE
+	// here would publish every forwarded secret in this process's
+	// world-readable /proc/<pid>/cmdline for the whole sandbox run.
+	// Named AFTER the seccomp fd so the numbers stay stable (3, then 4).
+	if spec.EnvData != nil {
+		if !p.Caps.BindData {
+			return nil, errors.New("this bwrap lacks --ro-bind-data — cannot hand --env " +
+				"values to the sandbox out-of-band, and the backend argv is world-readable")
+		}
+		r, w, err := os.Pipe()
+		if err != nil {
+			return nil, fmt.Errorf("--env: cannot create the handoff pipe: %v", err)
+		}
+		owned = append(owned, r)
+		// Complete the write concurrently: more than a pipe buffer of
+		// environment blocks until bwrap reads the fd at its startup.
+		// Closing bwrap's read end (spawn done or launch failed) unblocks
+		// it with EPIPE.
+		go func() {
+			_, _ = w.Write(spec.EnvData)
+			_ = w.Close()
+		}()
+		envFD = nameFD(r)
+		// The tokens are appended AFTER the ops loop: --ro-bind-data
+		// creates a file under /run, which the Tmpfs op must already
+		// have mounted by then.
+		envInner = []string{"--ro-bind-data", envFD, sandbox.EnvFileDst}
 	}
 	if spec.DisableUserns {
 		// Kernel-level: bwrap sets max_user_namespaces=1 in a nested
@@ -660,6 +710,10 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 		}
 	}
 
+	// The env handoff rides AFTER every mount op (its file lives under
+	// /run), then the launch shape splits: one bwrap, or staging + inner.
+	inner = append(inner, envInner...)
+
 	if !hasOverlay {
 		l.Argv = inner
 		built = true
@@ -700,13 +754,21 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 	if seccompFD != "" {
 		staging = append(staging, "--perms", perms(0o400), "--file", seccompFD, stageSeccomp)
 	}
+	if envFD != "" {
+		// Same staging treatment as the filter: bwrap #1 copies the
+		// handoff pipe into the staging sandbox, the bridge re-opens it
+		// as a fixed descriptor, and the INNER --ro-bind-data above
+		// materializes it inside the real sandbox.
+		staging = append(staging, "--perms", perms(0o400), "--file", envFD, stageEnv)
+	}
 	staging = append(staging, stagedMounts...)
 	staging = append(staging, "--perms", perms(0o700),
 		"--size", strconv.FormatInt(spec.OverlayStoreSize, 10), "--tmpfs", stageStore)
 	staging = append(staging, stagedDirs...)
 	staging = append(staging, "--")
-	if seccompFD != "" {
-		staging = append(staging, "/bin/sh", "-c", stageSeccompBridge, "sbox-stage", stageBinary)
+	if seccompFD != "" || envFD != "" {
+		staging = append(staging, "/bin/sh", "-c",
+			stageBridgeScript(seccompFD, envFD), "sbox-stage", stageBinary)
 	} else {
 		staging = append(staging, stageBinary)
 	}
@@ -714,8 +776,8 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 
 	// The fd invariant still holds, with staging as the consumer: every
 	// ExtraFiles slot is named by the STAGING argv (--file, the staged
-	// --*-bind-fd ops); the inner argv names only fd 3, which the
-	// staging bridge opened from the staged file — never a launcher fd.
+	// --*-bind-fd ops); the inner argv names only the descriptors the
+	// staging bridge opened from the staged files — never a launcher fd.
 	l.Argv = staging
 	built = true
 	return l, nil

@@ -479,13 +479,18 @@ Notes:
     the sandbox, and its settings are restored on exit. Redirected streams
     keep direct I/O unless --filter-output explicitly selects a PTY.
     The terminal helper is filtered before its first instruction and execs
-    the bridge/command as PID 1; --new-session remains enabled.
+    the bridge as PID 1; in terminal sessions (interactive and
+    --filter-output with a tty on stdin) the bridge runs the command as
+    its foreground child so Ctrl-C reaches it even with default signal
+    handling (PID 1 drops those signals); --new-session remains enabled.
   - --env NAME forwards a host variable; --env NAME=VALUE sets a literal
     value (NAME= sets an empty string). Repeatable; the last value wins,
     overriding sandbox defaults. Unset host names are errors. Names must
     match [A-Za-z_][A-Za-z0-9_]*. Quote values in your host shell as needed;
     sbox does not evaluate them. These flags affect only the sandbox's
     environment, not host proxy configuration or filesystem mounts.
+    Values are handed over by file descriptor and applied inside the
+    sandbox — they never appear in the sandbox processes' argv.
     Other host variables remain cleared except the usual HOME, USER,
     TERM, PATH and LANG defaults and variables set by --gui/--ssh-agent.
   - --net also exposes host loopback services and abstract Unix sockets
@@ -742,7 +747,9 @@ options:
                         NAME= sets an empty string; an unset host NAME is an
                         error. Repeatable; last value wins over defaults.
                         Changes sandbox environment only, not host settings
-                        or mounts. Names: [A-Za-z_][A-Za-z0-9_]*.
+                        or mounts. Names: [A-Za-z_][A-Za-z0-9_]*. Values are
+                        handed over by fd, never in the sandbox processes'
+                        argv (/proc/<pid>/cmdline is world-readable).
   --home                Bind the real $HOME (default: private tmpfs home).
   --gui                 Pass through Wayland/X11 sockets. X11 is effectively
                         an escape: clients can log keys, capture the screen

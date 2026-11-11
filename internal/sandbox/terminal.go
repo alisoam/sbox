@@ -15,13 +15,22 @@ const terminalHelperPath = "/run/sbox-terminal"
 // terminalHelper copies the running executable, not a pathname that can be
 // replaced, into the launcher's private work directory. This also supports
 // bwrap versions without fd binds. The sandbox only receives a read-only mount.
-func terminalHelper(work string) (path string, err error) {
+func terminalHelper(work string) (string, error) {
+	return helperCopy(work, "terminal")
+}
+
+// helperCopy copies the running executable into the launcher's private
+// work directory under name (0500): the copy is bound read-only into
+// the sandbox, where it runs after the backend installed the seccomp
+// filter. The work directory is 0700 launcher-owned ground, so nothing
+// can race or replace the bytes between copy and mount.
+func helperCopy(work, name string) (string, error) {
 	src, err := os.Open("/proc/self/exe")
 	if err != nil {
 		return "", err
 	}
 	defer src.Close()
-	path = filepath.Join(work, "terminal")
+	path := filepath.Join(work, name)
 	dst, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o500)
 	if err != nil {
 		return "", err

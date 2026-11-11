@@ -451,6 +451,24 @@ func (s *Supervisor) Run() int {
 		warn(err.Error())
 		return 1
 	}
+	// Terminal sessions (the automatic interactive PTY and
+	// --filter-output with a host tty on stdin) run the payload as the
+	// bridge shell's foreground CHILD instead of exec'ing it in place:
+	// bwrap's --new-session child — the PID the payload would exec into
+	// — is the session leader, and the kernel drops
+	// default-disposition tty signals for PID 1, so an exec'd
+	// `sleep 30` silently ignored Ctrl-C in BOTH modes (the filtered
+	// slave does become a controlling terminal). The shell (still PID
+	// 1, still filtered) survives the group SIGINT by the same rule
+	// and reports the child's status.
+	if terminal {
+		if child, ok := PayloadAsChild(spec.Bridge); ok {
+			spec.Bridge = child
+		} else {
+			warn("internal: the bridge has no exec tail — the payload runs with exec " +
+				"(Ctrl-C may be ignored by commands that do not handle SIGINT)")
+		}
+	}
 	spec.Seccomp = bpf // nil ⇒ --no-seccomp, the explicit opt-out
 	spec.DisableUserns = hardenUserns
 	if terminal {
@@ -460,6 +478,18 @@ func (s *Supervisor) Run() int {
 			return 1
 		}
 		spec.Ops = append(spec.Ops, Mount{Src: helper, Dst: terminalHelperPath})
+	}
+	if spec.EnvData != nil {
+		// The --env values must stay out of every argv (the backend's
+		// /proc/<pid>/cmdline is world-readable for the whole run): a
+		// read-only copy of this binary reads the fd-handed records
+		// inside the sandbox and execs the bridge with them applied.
+		helper, err := helperCopy(work, "envexec")
+		if err != nil {
+			warn(fmt.Sprintf("cannot prepare the environment handoff helper: %v", err))
+			return 1
+		}
+		spec.Ops = append(spec.Ops, Mount{Src: helper, Dst: envExecHelperPath})
 	}
 	if rc, dead := earlyExit(); dead {
 		return rc
@@ -499,16 +529,22 @@ func (s *Supervisor) Run() int {
 		pump.Out = s.Out
 	}
 
-	// argv = backend argv + "--" + /bin/sh -c BRIDGE sbox-sh COMMAND...
+	// argv = backend argv + "--" + [/run/sbox-terminal --_terminal-exec]
+	// + [/run/sbox-envexec --_env-exec] + /bin/sh -c BRIDGE sbox-sh COMMAND...
 	// The backend installs the seccomp filter (when enabled) as the very
 	// last step before exec'ing the terminal helper (when needed) or
 	// THAT shell, so the helper, shell, socat bridge AND command inherit
 	// the filter from their first
 	// instruction — see PayloadArgv for why the ordering is
-	// load-bearing.
+	// load-bearing. The env helper (when --env values ride the fd
+	// handoff) execs the bridge in place after applying them — still
+	// PID 1, still filtered, no value in any argv.
 	argv := append(append([]string{}, launch.Argv...), "--")
 	if terminal {
 		argv = append(argv, terminalHelperPath, "--_terminal-exec")
+	}
+	if spec.EnvData != nil {
+		argv = append(argv, envExecHelperPath, "--_env-exec")
 	}
 	argv = append(argv, PayloadArgv(spec.Bridge, s.Command)...)
 	cmd = exec.Command(launch.Bin, argv...)

@@ -119,7 +119,7 @@ func TestBuildOverlayStagingSeccomp(t *testing.T) {
 		"--perms", "0700", "--dir", "/tmp/sbox-stage/st/u0",
 		"--perms", "0700", "--dir", "/tmp/sbox-stage/st/w0",
 		"--",
-		"/bin/sh", "-c", stageSeccompBridge, "sbox-stage", stageBinary,
+		"/bin/sh", "-c", stageBridgeScript("3", ""), "sbox-stage", stageBinary,
 		"--add-seccomp-fd", "3",
 		"--unshare-user", "--disable-userns", "--assert-userns-disabled",
 		"--unshare-all", "--die-with-parent", "--new-session", "--as-pid-1", "--clearenv",
@@ -179,7 +179,7 @@ func TestBuildOverlayNoSeccomp(t *testing.T) {
 	}
 	// no filter: the inner bwrap is the staging payload DIRECTLY — no
 	// shell bridge, no --file, no fd 3.
-	if strings.Contains(strings.Join(l.Argv, " "), stageSeccompBridge) {
+	if strings.Contains(strings.Join(l.Argv, " "), stageBridgeScript("3", "")) {
 		t.Error("unfiltered launch must not use the staging bridge")
 	}
 	if strings.Contains(strings.Join(l.Argv, " "), "--file") {

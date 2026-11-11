@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"sbox/internal/sandbox"
 )
 
 // Reuse the test executable as the real launcher and sandbox payload. This
@@ -26,8 +28,16 @@ import (
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "--_selfprobe", "--_terminal-exec":
+		case "--_selfprobe", "--_terminal-exec", "--_env-exec":
 			os.Exit(run(os.Args[1:]))
+		case "--_test-envexec":
+			// Drive sandbox.EnvExecFile against an explicit handoff
+			// file: the production apply-and-exec path without bwrap.
+			if err := sandbox.EnvExecFile(os.Args[2], os.Args[3:]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			os.Exit(0) // successful exec does not return
 		case "--_test-launch":
 			os.Exit(run(os.Args[2:]))
 		case "--_test-terminal":

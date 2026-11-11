@@ -1,6 +1,8 @@
 // The terminal pump: master→optional sanitizer→stdout, the raw host tty→master
 // with backpressure instead of drops, SIGWINCH→TIOCSWINSZ, and the
-// bounded post-exit drain. Teardown order is load-bearing: termios
+// bounded post-exit drain. Stop is bounded end to end: a reader parked
+// on a blocked OUTPUT sink is abandoned rather than waited for.
+// Teardown order is load-bearing: termios
 // restore FIRST (the rest can block for seconds and a raw terminal is
 // unusable meanwhile), then the winch channel, then the fds.
 
@@ -222,6 +224,11 @@ func (p *Pump) Start() {
 // daemonized child can hold the slave open forever — so the drain is
 // bounded. The deadline evicts the parked master read (poller
 // deadline); the reader then flushes the sanitizer on its way out.
+// The ENTIRE wait is bounded, not just the read side: a reader blocked
+// writing to a blocked output sink is never waited for — no deadline
+// reaches that write — it is abandoned here, so Close (and the termios
+// restore it performs first) always runs in bounded time. The
+// goroutine dies with the process or finishes whenever the sink frees.
 // If EOF already happened during the run, the drain and its flush
 // are skipped; an incomplete tail is dropped.
 func (p *Pump) Stop(drain time.Duration) {
@@ -233,9 +240,19 @@ func (p *Pump) Stop(drain time.Duration) {
 	timer := time.AfterFunc(drain, func() {
 		_ = p.Master.SetReadDeadline(time.Unix(0, 1)) // evict the parked read
 	})
-	<-p.done
-	timer.Stop()
+	defer timer.Stop()
+	select {
+	case <-p.done:
+	case <-time.After(drain + stopSinkGrace):
+		// The reader is stuck on the SINK, not the master. Do not hold
+		// the exit path (and the terminal restore behind it) hostage.
+	}
 }
+
+// stopSinkGrace is the extra budget Stop grants a reader that already
+// read its final bytes but has not managed to write them to the output
+// sink: it bounds the whole teardown even when the sink is blocked.
+const stopSinkGrace = 500 * time.Millisecond
 
 // Close tears down terminal forwarding: restore the host terminal FIRST, clear the raw
 // diagnostic flag, release SIGWINCH, wake and drop the pending stdin

@@ -812,3 +812,40 @@ func TestSupervisorFilterOutputDrainTail(t *testing.T) {
 	}
 	requireEmptyDir(t, sup.TempRoot)
 }
+
+// The explicit --env pairs ride the fd handoff: the supervisor mounts a
+// private helper copy, wraps the payload argv with it, and NOTHING the
+// backend argv records carries a value.
+func TestSupervisorEnvHandoff(t *testing.T) {
+	sup, fp, root := newTestSupervisor(t)
+	sup.Opts.Env = []cliutil.EnvVar{{Name: "API_TOKEN", Value: "shh-secret-42"}}
+
+	if rc := sup.Run(); rc != 42 {
+		t.Fatalf("rc = %d, want 42", rc)
+	}
+	spec := fp.specs[0]
+	if spec.EnvData == nil || !strings.Contains(string(spec.EnvData), "shh-secret-42") {
+		t.Fatal("spec.EnvData does not carry the explicit pair")
+	}
+	foundMount := false
+	for _, op := range spec.Ops {
+		if m, ok := op.(Mount); ok && m.Dst == envExecHelperPath && !m.RW {
+			foundMount = true
+		}
+	}
+	if !foundMount {
+		t.Fatal("the environment helper is not mounted read-only at its fixed path")
+	}
+
+	rec, err := os.ReadFile(filepath.Join(root, "argv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !argvContains(string(rec), envExecHelperPath, "--_env-exec", "/bin/sh") {
+		t.Fatalf("payload argv missing the env helper wrap:\n%s", rec)
+	}
+	if strings.Contains(string(rec), "shh-secret-42") {
+		t.Fatal("an explicit --env value leaked into the backend argv")
+	}
+	requireEmptyDir(t, filepath.Join(root, "tmp"))
+}

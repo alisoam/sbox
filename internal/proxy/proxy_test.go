@@ -1186,3 +1186,43 @@ func TestRedactUserinfo(t *testing.T) {
 		}
 	}
 }
+
+func TestLineReaderEnforcesLimitWhileReading(t *testing.T) {
+	// An unterminated request past the 64 KiB cap must be refused while
+	// it is being read, never buffered without bound waiting for a
+	// newline (or an EOF) that never comes.
+	lr := &lineReader{r: bufio.NewReaderSize(strings.NewReader(strings.Repeat("a", 512*1024)), 128*1024)}
+	if _, err := lr.readLine(); err != errLineTooLong {
+		t.Fatalf("unterminated 512 KiB request: err = %v, want errLineTooLong", err)
+	}
+
+	// A terminated line past the cap is refused as well.
+	lr = &lineReader{r: bufio.NewReaderSize(
+		strings.NewReader(strings.Repeat("a", maxLine+1)+"\n"), 128*1024)}
+	if _, err := lr.readLine(); err != errLineTooLong {
+		t.Fatalf("terminated over-long line: err = %v, want errLineTooLong", err)
+	}
+
+	// An EOF tail past the cap used to bypass the check entirely.
+	lr = &lineReader{r: bufio.NewReaderSize(
+		strings.NewReader(strings.Repeat("a", maxLine+1)), 128*1024)}
+	if _, err := lr.readLine(); err != errLineTooLong {
+		t.Fatalf("EOF tail past the cap: err = %v, want errLineTooLong", err)
+	}
+
+	// Normal lines keep their terminator; buffered bytes beyond the
+	// line stay available to the tunnel through Read.
+	lr = &lineReader{r: bufio.NewReaderSize(
+		strings.NewReader("GET / HTTP/1.1\r\nTUNNEL-BYTES"), 128*1024)}
+	line, err := lr.readLine()
+	if err != nil || line != "GET / HTTP/1.1\r\n" {
+		t.Fatalf("line = %q err = %v", line, err)
+	}
+	rest := make([]byte, len("TUNNEL-BYTES"))
+	if _, err := io.ReadFull(lr, rest); err != nil || string(rest) != "TUNNEL-BYTES" {
+		t.Fatalf("buffered tail = %q err = %v", rest, err)
+	}
+	if line, err := lr.readLine(); err != nil || line != "" {
+		t.Fatalf("read after EOF tail = %q err = %v, want empty", line, err)
+	}
+}

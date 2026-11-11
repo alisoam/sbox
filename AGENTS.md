@@ -186,10 +186,23 @@ short flags; attached short values such as `-bPATH` remain supported.
 - Interactive stdin/stdout/stderr automatically use a private PTY with raw output.
   A private read-only copy of sbox runs --_terminal-exec after bwrap installs
   seccomp, claims the fresh slave as its controlling terminal, then execs the
-  bridge/payload in place as PID 1. Keep --new-session and --as-pid-1; do not
-  introduce an unfiltered helper or reaper. No host terminal descriptor may
-  enter this mode. Forward input/resizes and restore host termios on every exit.
+  bridge in place as PID 1. Terminal sessions (automatic interactive and
+  --filter-output with a host tty on stdin) run the payload as the bridge's
+  foreground child instead of exec'ing it (PID 1 drops default-disposition tty
+  signals; exec-in-place silently swallowed Ctrl-C for direct commands; the
+  child tail also echoes the status so dash/bash cannot tail-exec the payload
+  back into PID 1). Keep --new-session and --as-pid-1; do not introduce an
+  unfiltered helper or reaper. No host terminal descriptor may enter this mode.
+  Forward input/resizes and restore host termios on every exit.
   Preserve direct I/O for pipes/redirections unless --filter-output is explicit.
+- Explicit --env values never appear in argv: the bwrap backend receives them
+  as Spec.EnvData and hands them over by fd (--ro-bind-data; staged overlays
+  ferry the pipe through the staging sandbox like the seccomp filter). A
+  read-only helper copy (/run/sbox-envexec --_env-exec) applies the
+  NUL-framed records over the --setenv defaults and execs the bridge in place,
+  still PID 1 and filtered. A --setenv VALUE would publish forwarded secrets
+  in the world-readable /proc/<pid>/cmdline for the whole sandbox run; fail
+  closed when bwrap lacks --ro-bind-data.
 - Under --filter-output, stdout/stderr are a PTY slave; the host terminal fd must
   NEVER enter the sandbox. Stdin uses that slave only for a host tty successfully
   put in raw mode; non-tty input is inherited byte-exact. An untameable tty is a

@@ -50,6 +50,9 @@ func TestParseCaps(t *testing.T) {
 		{"--overlay alone is not enough", "--overlay RWSRC WORKDIR DEST", sandbox.Caps{}},
 		{"--overlay-src alone is not enough", "--overlay-src SRC", sandbox.Caps{}},
 		{"--overlay2 is not --overlay", "--overlay-src S\n--overlay2 A B C", sandbox.Caps{}},
+		{"ro-bind-data", "--ro-bind-data FD DEST", sandbox.Caps{BindData: true}},
+		{"--ro-bind-data2 is not --ro-bind-data", "--ro-bind-data2 FD DEST", sandbox.Caps{}},
+		{"--bind-data is not --ro-bind-data", "--bind-data FD DEST", sandbox.Caps{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := ParseCaps(tc.text); got != tc.want {
@@ -377,5 +380,118 @@ func TestPermsSpelling(t *testing.T) {
 		if got := perms(tc.in); got != tc.want {
 			t.Errorf("perms(%o) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// The --env handoff must render as an fd-based --ro-bind-data: the
+// VALUE never appears in the backend argv (bwrap's /proc/<pid>/cmdline
+// is world-readable), and the pipe read end carries exactly the
+// composed records.
+func TestBuildEnvHandoffFD(t *testing.T) {
+	secret := "s3cr3t-tok3n with spaces\nand=equals"
+	spec := plainSpec(t)
+	spec.EnvData = []byte("API_TOKEN\x00" + secret + "\x00")
+
+	p := New("")
+	p.Caps = sandbox.Caps{BindFD: true, AddSeccompFD: true, BindData: true}
+	l, err := p.Build(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for _, f := range l.PassFDs {
+			f.Close()
+		}
+		for _, f := range l.CloseAfterSpawn {
+			f.Close()
+		}
+	}()
+	joined := strings.Join(l.Argv, "\x00")
+	if strings.Contains(joined, secret) || strings.Contains(joined, "API_TOKEN") {
+		t.Fatalf("env handoff leaked into the backend argv:\n%s", joined)
+	}
+	// --ro-bind-data sits AFTER the /run tmpfs op and names the handoff fd.
+	i := indexOfArgv(l.Argv, "--ro-bind-data")
+	if i < 0 {
+		t.Fatalf("no --ro-bind-data in argv:\n%s", joined)
+	}
+	if l.Argv[i+2] != sandbox.EnvFileDst {
+		t.Errorf("--ro-bind-data destination = %q, want %q", l.Argv[i+2], sandbox.EnvFileDst)
+	}
+	if l.Argv[i+1] != "3" {
+		t.Errorf("--ro-bind-data fd = %q, want the first ExtraFiles slot 3", l.Argv[i+1])
+	}
+	j := indexOfArgv(l.Argv, "--tmpfs")
+	if j >= 0 && j > i {
+		t.Error("--ro-bind-data must come after the /run tmpfs it lives under")
+	}
+	if len(l.PassFDs) != 1 {
+		t.Fatalf("PassFDs = %d, want the handoff read end only", len(l.PassFDs))
+	}
+	got, err := io.ReadAll(l.PassFDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(spec.EnvData) {
+		t.Fatalf("handoff pipe yields %q, want the exact records", got)
+	}
+
+	// fail closed without --ro-bind-data support: never --setenv.
+	p2 := New("")
+	p2.Caps = sandbox.Caps{BindFD: true, AddSeccompFD: true}
+	l2, err := p2.Build(spec)
+	if err == nil || l2 != nil {
+		t.Fatal("Build must fail closed when bwrap lacks --ro-bind-data")
+	}
+	if !strings.Contains(err.Error(), "--ro-bind-data") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// The staged overlay launch ferries the handoff through the staging
+// sandbox (--file), the staging bridge re-opens it as fd 4 (fd 3 is
+// the filter), and the INNER bwrap materializes it with
+// --ro-bind-data. The value stays out of every argv.
+func TestBuildOverlayEnvHandoffStaged(t *testing.T) {
+	spec, _, _, _, _ := overlaySpec(t)
+	secret := "staged-s3cr3t '=$(injected)"
+	bpf, err := seccomp.BuildBPF("x86_64")
+	if err != nil {
+		t.Skip("no x86_64 filter table")
+	}
+	spec.Seccomp = bpf
+	spec.EnvData = []byte("API_TOKEN\x00" + secret + "\x00")
+
+	p := New(fakeBwrap(t, "exit 0"))
+	p.Caps = overlayCaps()
+	p.Caps.BindData = true
+	l, err := p.Build(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOverlayLaunch(t, l)
+
+	joined := strings.Join(l.Argv, "\x00")
+	if strings.Contains(joined, secret) || strings.Contains(joined, "API_TOKEN") {
+		t.Fatalf("env handoff leaked into the staged argv:\n%s", joined)
+	}
+	// staging materializes the records next to the filter...
+	requireArgv(t, l.Argv, "--perms", "0400", "--file", "3", stageSeccomp)
+	requireArgv(t, l.Argv, "--perms", "0400", "--file", "4", stageEnv)
+	// ...the bridge opens both descriptors...
+	requireArgv(t, l.Argv, "/bin/sh", "-c",
+		stageBridgeScript("3", "4"), "sbox-stage", stageBinary,
+		"--add-seccomp-fd", "3")
+	// ...and the inner bwrap binds them into the real sandbox AFTER /run.
+	requireArgv(t, l.Argv, "--ro-bind-data", "4", sandbox.EnvFileDst)
+	if len(l.PassFDs) != 4 { // filter, env, the bind pin, the overlay pin
+		t.Fatalf("PassFDs = %d, want 4", len(l.PassFDs))
+	}
+	got, err := io.ReadAll(l.PassFDs[1]) // the env fd is named second
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(spec.EnvData) {
+		t.Fatalf("staged handoff pipe yields %q", got)
 	}
 }

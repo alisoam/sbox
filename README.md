@@ -70,7 +70,7 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `--overlay PATH` | Mount an existing directory at its resolved path as a **disposable writable view**: reads see the real tree; creates, edits, deletes, renames, chmods and links stay in private storage that vanishes on exit. Repeatable. Sources use bind validation (protected paths, control sockets, socket-bearing trees and runtime dirs are refused, with **no opt-in**), cannot overlap `--home` or explicit binds, and cannot duplicate or nest. An overlay covering cwd replaces its automatic mount; cwd outside all overlays mounts **read-only** (`-b "$PWD"` opts back in). Requires non-setuid bwrap with overlay and fd-bind support, plus unprivileged overlayfs. The selected mode is probed before launch. |
 | `--overlay-mode MODE` | `staged` (default): two bwrap levels, sources pinned through mount time, shared storage cap. `single`: one bwrap using `--tmp-overlay`; sources are validated but **reopened by pathname**, so concurrent host swaps can redirect a mount. Single mode warns on each run and has only the kernel default tmpfs limit; it rejects `--overlay-size`. Applies to all overlays. Neither mode falls back to the other. |
 | `--overlay-size SIZE` | **Staged mode only.** Combined storage cap for every overlay's writable layer: `1GiB` (the default), `500MB`, `1073741824` — bounds 1MiB..16TiB. Writes past the cap fail with `ENOSPC`; they never fall back to the host tree. The cap bounds the overlay store only, not total process memory, CPU or PIDs. |
-| `--env NAME[=VALUE]` | Forward one host variable (`--env API_TOKEN`) or set a literal value (`--env EDITOR=nvim`). `NAME=` sets an empty string; forwarding an unset host name is an error. Repeatable; the last value wins over sandbox defaults. Names must match `[A-Za-z_][A-Za-z0-9_]*`. |
+| `--env NAME[=VALUE]` | Forward one host variable (`--env API_TOKEN`) or set a literal value (`--env EDITOR=nvim`). `NAME=` sets an empty string; forwarding an unset host name is an error. Repeatable; the last value wins over sandbox defaults. Names must match `[A-Za-z_][A-Za-z0-9_]*`. Values are handed over by file descriptor and applied inside the sandbox — they never appear in the sandbox processes' command lines (`/proc/<pid>/cmdline` is world-readable). |
 | `--ro-cwd` | Mount the current directory read-only (default: read-write). |
 | `--home` | Bind the real `$HOME` (default: private tmpfs home). |
 | `--gui` | Pass through Wayland (preferred) and X11 sockets. |
@@ -101,7 +101,10 @@ sbox does not evaluate shell expressions in them. Quote values in your host shel
 needed. Repeating a name selects the last value, including an empty value (`--env NAME=`).
 These options change only the sandbox environment: `--env HOME=/tmp/custom` does not
 change the home mount, and `--env https_proxy=...` does not configure the host-side
-upstream proxy (use `--upstream` for that).
+upstream proxy (use `--upstream` for that). Values travel to the sandbox by file
+descriptor (bwrap `--ro-bind-data` plus a filtered in-sandbox helper that applies them
+before exec'ing the bridge), so a forwarded secret never lands in any sandbox
+process's world-readable `/proc/<pid>/cmdline`.
 
 ### Development shell
 
@@ -164,7 +167,10 @@ or silently falls back to a different workspace mode.
 - **Interactive terminals:** when stdin, stdout, and stderr are terminals, sbox automatically
   forwards them through a private PTY. A read-only copy of its terminal helper runs after
   bwrap installs seccomp, attaches the PTY as the sandbox's controlling terminal, and execs
-  the bridge/command as PID 1. The host terminal descriptor stays outside the sandbox.
+  the bridge as PID 1; in terminal sessions (interactive, and `--filter-output` with a tty on
+  stdin) the bridge runs the command as its foreground child, so Ctrl-C reaches direct
+  commands too (PID 1 itself would drop default-disposition signals like SIGINT).
+  The host terminal descriptor stays outside the sandbox.
   Shell job control, Ctrl-C, resizing, tmux, and full-screen editors work without a `script`
   wrapper. Terminal settings are restored on exit. Output control sequences are preserved
   unless `--filter-output` is enabled; that filter is intentionally unsuitable for full-screen
@@ -200,9 +206,12 @@ or silently falls back to a different workspace mode.
   payload (`--add-seccomp-fd`, `--seccomp` on older bwrap): the shell, the
   socat bridge and the command inherit it from their first instruction —
   no in-sandbox helper or pre-filter execution window. The
-  command also runs as pid 1 (`--as-pid-1`), so no unfiltered bwrap
+  filtered process also runs as pid 1 (`--as-pid-1`), so no unfiltered bwrap
   reaper init remains inside (on Yama `ptrace_scope=0` systems that
-  parent could otherwise be `/proc/1/mem`-injected, bypassing the filter).
+  parent could otherwise be `/proc/1/mem`-injected, bypassing the filter);
+  in the automatic terminal mode the pid-1 slot belongs to the bridge
+  shell and the command runs as its filtered foreground child — that is
+  what lets Ctrl-C reach commands with default signal handling.
   Note pid-1 semantics: long-lived commands that abandon children see
   zombies, and `kill 1` from inside is ignored unless handled.
   `socket()` is limited to `AF_UNIX`/`AF_INET`/`AF_INET6`/`AF_NETLINK`

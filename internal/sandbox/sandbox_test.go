@@ -584,3 +584,29 @@ func TestBuildSpecOverlayOrderAndSize(t *testing.T) {
 		t.Errorf("OverlayStoreSize = %d, want the parsed 2GiB", spec.OverlayStoreSize)
 	}
 }
+
+func TestPayloadAsChild(t *testing.T) {
+	const childTail = "\"$@\"\nstatus=$?\nexit \"$status\"\n"
+	for _, bridge := range []string{InnerProxy + "exec \"$@\"\n", "exec \"$@\"\n"} {
+		got, ok := PayloadAsChild(bridge)
+		if !ok {
+			t.Fatalf("PayloadAsChild(%q) did not rewrite", bridge)
+		}
+		if want := strings.TrimSuffix(bridge, "exec \"$@\"\n") + childTail; got != want {
+			t.Errorf("PayloadAsChild(%q) = %q, want %q", bridge, got, want)
+		}
+		// no exec of the payload, and an explicit status echo after it:
+		// dash/bash tail-exec a script's final simple command, which
+		// would put the payload back into the PID-1 slot.
+		if strings.Contains(got, "exec") {
+			t.Errorf("rewritten bridge still execs: %q", got)
+		}
+		if !strings.HasSuffix(got, childTail) {
+			t.Errorf("rewritten bridge lacks the status echo: %q", got)
+		}
+	}
+	got, ok := PayloadAsChild("echo hi\n")
+	if ok || got != "echo hi\n" {
+		t.Errorf("bridge without the exec tail must pass through, got %q ok=%t", got, ok)
+	}
+}

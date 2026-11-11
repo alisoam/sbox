@@ -805,7 +805,11 @@ func (p *Proxy) resolveFiltered(host string, port int) ([]netip.Addr, error) {
 // lineReader reads \n-terminated lines with a 64 KiB cap: a
 // line longer than the limit aborts the connection (the client is not
 // a well-behaved HTTP/SOCKS peer). Buffered bytes beyond the current
-// line stay available — the tunnel must see them.
+// line stay available — the tunnel must see them. The cap is enforced
+// WHILE reading (ReadSlice, not ReadString): an unterminated request
+// can never accumulate more than the bufio buffer in host memory, and
+// an EOF tail past the limit is refused too — it used to bypass the
+// check entirely.
 type lineReader struct {
 	r   *bufio.Reader
 	eof bool
@@ -820,25 +824,31 @@ const maxLine = 64 * 1024
 var errLineTooLong = errors.New("line too long")
 
 // readLine returns the next line INCLUDING its terminator; at EOF it
-// returns the partial tail. errLineTooLong
-// means: give up on this connection silently.
+// returns the partial tail (only while it is under the limit).
+// errLineTooLong means: give up on this connection silently.
 func (lr *lineReader) readLine() (string, error) {
 	if lr.eof {
 		return "", nil
 	}
 	var sb strings.Builder
 	for {
-		chunk, err := lr.r.ReadString('\n')
-		sb.WriteString(chunk)
+		chunk, err := lr.r.ReadSlice('\n')
+		sb.Write(chunk)
+		if sb.Len() > maxLine {
+			return "", errLineTooLong
+		}
+		if err == bufio.ErrBufferFull {
+			// No delimiter in the whole buffer: the cap above already
+			// failed this line (the buffer is twice maxLine), so this
+			// only guards the loop if the buffer size ever changes.
+			continue
+		}
 		if err == io.EOF {
 			lr.eof = true
 			return sb.String(), nil
 		}
 		if err != nil {
 			return "", err
-		}
-		if sb.Len() > maxLine {
-			return "", errLineTooLong
 		}
 		return sb.String(), nil
 	}
