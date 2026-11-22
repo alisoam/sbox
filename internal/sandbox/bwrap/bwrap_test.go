@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"sbox/internal/cliutil"
@@ -340,6 +341,10 @@ func TestBuildFDMountsAndDups(t *testing.T) {
 	}
 	// the dups are real dups: different fd numbers, same object
 	for i, d := range l.CloseAfterSpawn {
+		flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, d.Fd(), syscall.F_GETFD, 0)
+		if errno != 0 || flags&syscall.FD_CLOEXEC == 0 {
+			t.Errorf("parent dup %d must be close-on-exec: flags %d, errno %v", i, flags, errno)
+		}
 		if d.Fd() == pin1.Fd() {
 			t.Errorf("dup %d reuses the original fd", i)
 		}

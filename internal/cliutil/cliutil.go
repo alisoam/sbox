@@ -4,6 +4,8 @@
 // --_selfprobe flag dispatches the seccomp probe child and takes no value.
 // Overlay mode defaults to staged (pinned mounts and a bounded store); single
 // is an explicit pathname-based alternative without a configured cap, never a fallback.
+// -L and -R select fixed TCP endpoints across the network namespace boundary;
+// rule sets that loop back into a listener are rejected at parse time.
 // Repeated --env flags select host variables or literal values for the sandbox;
 // values are resolved at parse time without changing the launcher's environment.
 //
@@ -33,6 +35,8 @@ var OptsWithValue = []string{
 	"-A", "--allow-file",
 	"-b", "--bind",
 	"-r", "--ro-bind",
+	"-L", "--local-forward",
+	"-R", "--remote-forward",
 	"--bind-socket",
 	"--env",
 	"--overlay",
@@ -105,6 +109,7 @@ type Options struct {
 	Bind             []string
 	RoBind           []string
 	BindSocket       []string
+	Forwards         []Forward
 	Env              []EnvVar
 	Overlay          []string
 	OverlaySingle    bool  // --overlay-mode single; default is staged
@@ -129,22 +134,26 @@ type Options struct {
 // display names for option error messages
 var (
 	longDisplay = map[string]string{
-		"allow":        "-a/--allow",
-		"allow-file":   "-A/--allow-file",
-		"bind":         "-b/--bind",
-		"ro-bind":      "-r/--ro-bind",
-		"bind-socket":  "--bind-socket",
-		"env":          "--env",
-		"overlay":      "--overlay",
-		"overlay-mode": "--overlay-mode",
-		"overlay-size": "--overlay-size",
-		"upstream":     "--upstream",
+		"allow":          "-a/--allow",
+		"allow-file":     "-A/--allow-file",
+		"bind":           "-b/--bind",
+		"ro-bind":        "-r/--ro-bind",
+		"bind-socket":    "--bind-socket",
+		"local-forward":  "-L/--local-forward",
+		"remote-forward": "-R/--remote-forward",
+		"env":            "--env",
+		"overlay":        "--overlay",
+		"overlay-mode":   "--overlay-mode",
+		"overlay-size":   "--overlay-size",
+		"upstream":       "--upstream",
 	}
 	shortDisplay = map[byte]string{
 		'a': "-a/--allow",
 		'A': "-A/--allow-file",
 		'b': "-b/--bind",
 		'r': "-r/--ro-bind",
+		'L': "-L/--local-forward",
+		'R': "-R/--remote-forward",
 	}
 )
 
@@ -171,12 +180,14 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 				name = name[:j]
 			}
 			switch name {
-			case "allow", "allow-file", "bind", "ro-bind", "bind-socket", "overlay", "upstream":
+			case "allow", "allow-file", "bind", "ro-bind", "bind-socket", "overlay", "upstream", "local-forward", "remote-forward":
 				val, err := takeValue(pre, &i, hasInline, inline, longDisplay[name])
 				if err != nil {
 					return nil, nil, err
 				}
-				applyValue(opts, name, val)
+				if err := applyValue(opts, name, val); err != nil {
+					return nil, nil, err
+				}
 			case "env":
 				val, err := takeValue(pre, &i, hasInline, inline, longDisplay[name])
 				if err != nil {
@@ -230,7 +241,9 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			applyValue(opts, valueNameForShort(c), val)
+			if err := applyValue(opts, valueNameForShort(c), val); err != nil {
+				return nil, nil, err
+			}
 			continue
 		}
 		if len(tok) > 2 {
@@ -255,6 +268,11 @@ func ParseCLI(argv []string) (*Options, []string, error) {
 	}
 	if opts.OverlaySingle && opts.OverlaySize != 0 {
 		return nil, nil, fmt.Errorf("--overlay-size is not supported with --overlay-mode single (no configurable storage cap)")
+	}
+	// The whole rule set, before anything listens: a single self-dial or a
+	// cycle across rules multiplies connections until fd exhaustion.
+	if err := ValidateForwards(opts.Net, opts.Forwards); err != nil {
+		return nil, nil, err
 	}
 	return opts, command, nil
 }
@@ -381,6 +399,10 @@ func digitsOnly(s string) bool {
 
 func valueNameForShort(c byte) string {
 	switch c {
+	case 'L':
+		return "local-forward"
+	case 'R':
+		return "remote-forward"
 	case 'a':
 		return "allow"
 	case 'A':
@@ -393,8 +415,14 @@ func valueNameForShort(c byte) string {
 	return ""
 }
 
-func applyValue(o *Options, name, val string) {
+func applyValue(o *Options, name, val string) error {
 	switch name {
+	case "local-forward", "remote-forward":
+		f, err := parseForward(val, name == "remote-forward")
+		if err != nil {
+			return fmt.Errorf("argument %s: %w", longDisplay[name], err)
+		}
+		o.Forwards = append(o.Forwards, f)
 	case "allow":
 		o.Allow = append(o.Allow, val)
 	case "allow-file":
@@ -411,6 +439,7 @@ func applyValue(o *Options, name, val string) {
 		o.Upstream = val
 		o.HasUpstream = true
 	}
+	return nil
 }
 
 func applyBool(o *Options, name string) {
@@ -470,6 +499,13 @@ effectively catch-all networks such as 0.0.0.0/1 are refused).
 $NO_PROXY/$no_proxy (lowercase winning, curl semantics) only picks the
 route when chaining; entries are host suffixes, IP literals/CIDRs (literal
 destinations only) or '*'.
+-L listens on the host and connects in the sandbox. -R listens in the sandbox
+and connects directly on the host, independently of --allow and --upstream.
+Each forward grants access to one fixed TCP endpoint over a private Unix socket.
+Rules must not loop: a dial any rule's listener can capture — its own or
+another's, in the listener's namespace, wildcard binds counting for their
+whole port — fails before anything listens. Listeners serve only after the
+sandbox itself reports readiness.
 --net drops the proxy and shares the host network namespace instead.
 
 Notes:
@@ -680,7 +716,7 @@ Examples:
 
 // Usage is the complete fixed-width help text.
 const Usage = `usage: sbox [-h] [-a HOST] [-A FILE] [-b PATH] [-r PATH] [--bind-socket PATH]
-            [--env NAME[=VALUE]]
+            [-L SPEC] [-R SPEC] [--env NAME[=VALUE]]
             [--overlay PATH] [--overlay-mode MODE] [--overlay-size SIZE]
             [--ro-cwd] [--home] [--gui]
             [--ssh-agent] [--filter-output] [--strict-crlf] [--upstream URL]
@@ -699,6 +735,15 @@ options:
   -A, --allow-file FILE
                         File with allow entries (one per line, '#' comments).
                         Repeatable.
+  -L, --local-forward SPEC
+                        Listen on the host and forward TCP into the sandbox.
+  -R, --remote-forward SPEC
+                        Listen in the sandbox and forward TCP to the host.
+                        Both accept [BIND_IP:]PORT:DEST_IP:DEST_PORT or PORT:DEST_PORT.
+                        Omitted IPs and localhost mean 127.0.0.1. Bracket IPv6
+                        literals. Repeat either option for additional ports.
+                        Rule sets that loop back into any listener (wildcards
+                        count for their whole port) are refused.
   -b, --bind PATH       Bind PATH read-write at the same location. Repeatable.
   -r, --ro-bind PATH    Bind PATH read-only at the same location. Repeatable.
   --bind-socket PATH    Bind PATH even though it is a socket or lives under

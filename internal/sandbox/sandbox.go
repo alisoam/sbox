@@ -8,6 +8,12 @@
 // pinned realpath, gui, ssh-agent, the fd-validated cwd mount emitted
 // BEFORE the user binds, --chdir, and the in-sandbox bridge script.
 //
+// Optional -L/-R TCP forwards use dedicated filesystem Unix sockets and fixed
+// destinations. The supervisor reserves every host listener before launch and
+// starts serving only when the sandbox itself reports readiness through a
+// FIFO the bridge writes after its socat listeners are up; rule sets are
+// validated loop-free at parse time and again when the spec is built.
+//
 // supervisor.go is the launch owner: the 0700
 // $WORK, the in-process proxy goroutine with readiness checks and the
 // fail-closed self-test, the seccomp gate, the userns-hardening probe,
@@ -67,6 +73,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -208,6 +215,7 @@ func (Chdir) isOp()       {}
 // unshare/setns deny rules alone. (Stdio lands with the output filter:
 // plain inherit vs pty slave + chosen stdin fd.)
 type Spec struct {
+	forwards      []forwardPlan
 	Ops           []Op
 	Bridge        string
 	Seccomp       []byte
@@ -715,6 +723,37 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 		ops = append(ops, Chdir{Dir: "/tmp"})
 	}
 
+	var forwards []forwardPlan
+	// Backstop: ParseCLI rejects these for CLI runs, but BuildSpec also
+	// serves programmatic Options (tests, future callers) and must never
+	// plan a relay farm that can dial itself into fd exhaustion.
+	if err := cliutil.ValidateForwards(opts.Net, opts.Forwards); err != nil {
+		return nil, err
+	}
+	if len(opts.Forwards) > 0 && !opts.Net {
+		bridge += awaitForward
+	}
+	for i, rule := range opts.Forwards {
+		f := planForward(filepath.Dir(sand), i, rule, opts.Net)
+		forwards = append(forwards, f)
+		if f.bridge != "" {
+			ops = append(ops, f.mount)
+			bridge += f.bridge
+		}
+	}
+	if len(opts.Forwards) > 0 {
+		// The readiness FIFO rides with the forwards: the bridge writes
+		// one byte after its startup (every socat listener included — a
+		// failed one exits the bridge first), and only then does the
+		// supervisor start serving the reserved host listeners. A launch
+		// that fails inside bwrap (mounts, namespaces) must never have
+		// forwarded a byte.
+		ops = append(ops, Mount{
+			Src: filepath.Join(filepath.Dir(sand), forwardReadyName),
+			Dst: ForwardReadyPath, RW: true,
+		})
+		bridge += forwardReadyLine
+	}
 	bridge += "exec \"$@\"\n"
 	size := opts.OverlaySize
 	if size == 0 {
@@ -726,7 +765,7 @@ func BuildSpec(opts *cliutil.Options, cwd, sand, sock, home string,
 		}
 		size = 0
 	}
-	return &Spec{Ops: ops, Bridge: bridge, OverlayStoreSize: size, EnvData: envData}, nil
+	return &Spec{forwards: forwards, Ops: ops, Bridge: bridge, OverlayStoreSize: size, EnvData: envData}, nil
 }
 
 // anyCovers reports whether any bind's resolved path is equal to or an

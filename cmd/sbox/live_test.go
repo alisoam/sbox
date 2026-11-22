@@ -152,7 +152,16 @@ func TestRealBwrapSecurityBoundary(t *testing.T) {
 	defer cancel()
 	// The automatic cwd and explicit bind reuse one validated source. Modern
 	// bwrap must consume both distinct fd slots without leaking either one.
+	// A remote listener leads back to this host port, which is forwarded
+	// to the payload's server. One round trip crosses both Unix sockets.
+	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(reservation.Addr().(*net.TCPAddr).Port)
+	reservation.Close()
 	cmd := exec.CommandContext(ctx, exe, "--_test-launch", "--upstream=",
+		"-L", port+":18081", "-R", "18082:"+port,
 		"-b", binddir, "--bind-socket", socket, "-r", exe, "--",
 		exe, "--_test-payload", binddir, socket)
 	cmd.Dir = binddir
@@ -171,6 +180,33 @@ func TestRealBwrapSecurityBoundary(t *testing.T) {
 	}
 }
 
+// Both ports are private to the fresh sandbox network namespace.
+func liveForwardRoundTrip() error {
+	listener, err := net.Listen("tcp4", "127.0.0.1:18081")
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	go func() {
+		c, err := listener.Accept()
+		if err == nil {
+			defer c.Close()
+			io.WriteString(c, "both forwards")
+		}
+	}()
+	c, err := net.DialTimeout("tcp4", "127.0.0.1:18082", 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	reply, err := io.ReadAll(c)
+	if err != nil || string(reply) != "both forwards" {
+		return fmt.Errorf("round trip through -R and -L: got %q, error %v", reply, err)
+	}
+	return nil
+}
+
 func liveFilterCheck() error {
 	// Kernel-derived constants are independent of the hand-maintained table.
 	for _, nr := range []uintptr{syscall.SYS_UNSHARE, syscall.SYS_VMSPLICE} {
@@ -187,6 +223,9 @@ func livePayload(args []string) error {
 		return fmt.Errorf("payload must run as pid 1 with bind paths: pid=%d args=%q", os.Getpid(), args)
 	}
 	if err := liveFilterCheck(); err != nil {
+		return err
+	}
+	if err := liveForwardRoundTrip(); err != nil {
 		return err
 	}
 	binddir, socket := args[0], args[1]

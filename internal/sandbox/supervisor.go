@@ -131,6 +131,7 @@ func (s *Supervisor) Run() int {
 	var (
 		work     string
 		proxySrv *proxy.Server
+		forwards *forwardGroup
 		proxyLog *filteredProxyLog  // --filter-output proxy log
 		pump     *outputfilter.Pump // interactive / --filter-output pty pump
 		pinner   *bindpolicy.Pinner
@@ -174,6 +175,9 @@ func (s *Supervisor) Run() int {
 				_ = cmd.Process.Kill()
 				<-waitCh
 			}
+		}
+		if forwards != nil {
+			forwards.close()
 		}
 		if proxySrv != nil {
 			// Bounded: a handler mid-dial must not wedge the teardown
@@ -451,6 +455,33 @@ func (s *Supervisor) Run() int {
 		warn(err.Error())
 		return 1
 	}
+	var ready <-chan bool
+	var cancelReady func()
+	if len(s.Opts.Forwards) > 0 {
+		// The readiness FIFO: created and its read side owned BEFORE spawn
+		// (the launcher's O_RDWR end doubles as the standing writer, so
+		// the bridge's write can never block); the gate after spawn
+		// decides when the reserved listeners may serve.
+		if err := makeForwardReady(work); err != nil {
+			warn(fmt.Sprintf("cannot create the forward readiness FIFO: %v", err))
+			return 1
+		}
+		ready, cancelReady = watchForwardReady(work)
+		// Direct ownership: whichever way the gate resolves, closing the
+		// descriptor unblocks a parked reader — a path-based wakeup could
+		// miss a reader that has yet to enter its blocking open.
+		defer cancelReady()
+	}
+	if len(spec.forwards) > 0 {
+		// Reserve every listener up front (a later rule whose port is
+		// occupied dies HERE, before the sandbox spawns); serving starts
+		// only after a successful spawn — see the start call below.
+		forwards, err = reserveForwards(spec.forwards)
+		if err != nil {
+			warn(err.Error())
+			return 1
+		}
+	}
 	// Terminal sessions (the automatic interactive PTY and
 	// --filter-output with a host tty on stdin) run the payload as the
 	// bridge shell's foreground CHILD instead of exec'ing it in place:
@@ -601,16 +632,87 @@ func (s *Supervisor) Run() int {
 		return rc
 	}
 
+	// finish is the ONE shared exit path. The relays close FIRST: serving
+	// ends with the child, before the terminal drain — a client queued on
+	// a --net forward could otherwise reach the configured host
+	// destination while output is still draining (the group's context
+	// closes live relay connections, so this cannot block on streams).
+	// The drain that follows matters too: pending PTY output often holds
+	// the diagnostic explaining why a run failed, up to half a second for
+	// a daemonized child that keeps the slave open.
+	finish := func(rc int) int {
+		if forwards != nil {
+			forwards.close()
+			forwards = nil // teardown must not close it twice
+		}
+		if pump != nil {
+			pump.Stop(500 * time.Millisecond)
+		}
+		hub.done()
+		return rc
+	}
+
+	if forwards != nil {
+		// Serving starts only on the sandbox's OWN readiness signal: after
+		// cmd.Start() bwrap may still be setting up mounts and namespaces —
+		// or fail there — and with --net an early rule could reach a live
+		// host service in that window. The bridge writes one byte into the
+		// FIFO once its startup (every socat listener included) finished.
+		select {
+		case ok := <-ready:
+			if !ok {
+				warn("internal: the forward readiness FIFO could not be read")
+				return finish(1)
+			}
+			// The signal and the exit can BOTH be queued — Go's select
+			// picks randomly among ready cases. Never start relays for a
+			// child that already exited: a client queued on a --net
+			// forward could reach the configured host destination during
+			// the cleanup that follows. The signal did arrive, so an exit
+			// observed here is a genuine result, reported as-is.
+			select {
+			case r := <-waitCh:
+				reaped = true
+				return finish(r)
+			default:
+			}
+			forwards.start()
+		case r := <-waitCh:
+			// The exit status is consumed RIGHT HERE: teardown must never
+			// wait for a second one that can never arrive.
+			reaped = true
+			// The exit races the reader: the bridge's byte may sit in the
+			// FIFO while its report is still in flight, and a successful
+			// run must not be misreported as a failed launch. The child is
+			// dead — no byte can arrive anymore — so cancel the reader and
+			// take its final report before deciding (cancel closes only
+			// the standing writer: a read with a byte waiting still
+			// delivers it before EOF).
+			cancelReady()
+			ok := false
+			select {
+			case ok = <-ready:
+			case <-time.After(forwardReportWait):
+			}
+			if !ok {
+				warn("the sandbox exited before its forwards were ready; nothing was forwarded")
+				if r == 0 {
+					r = 1
+				}
+			}
+			// Never start serving after the child died. finish closes the
+			// reserved listeners before draining.
+			return finish(r)
+		case <-time.After(forwardReadyWait):
+			warn("the sandbox never reported forward readiness — killing it; " +
+				"the reserved listeners stay silent")
+			return finish(1)
+		}
+	}
+
 	rc := <-waitCh
 	reaped = true
-	// PTY drain: final output may still be in flight while the
-	// payload dies a beat later, but a daemonized child holding the
-	// slave open forever bounds the wait to half a second.
-	if pump != nil {
-		pump.Stop(500 * time.Millisecond)
-	}
-	hub.done()
-	return rc
+	return finish(rc)
 }
 
 // Proxy handlers can finish while the supervisor is tearing down. The

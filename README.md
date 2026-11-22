@@ -64,6 +64,8 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | --- | --- |
 | `-a, --allow HOST` | Allow `HOST` and its subdomains (suffix match on a dot boundary). Also accepts IPs, CIDRs and an optional `:port` (`example.com:443`, `203.0.113.0/24`, `[2001:db8::]/32`). A trailing `!private` (`mirror.corp!private`) lets that one **name** resolve into private ranges — internal mirrors on the `$no_proxy` direct route. Repeatable. |
 | `-A, --allow-file FILE` | File with allow entries, one per line, `#` comments. Repeatable. |
+| `-L, --local-forward SPEC` | Listen on the host and forward TCP to a sandbox service. Repeatable. |
+| `-R, --remote-forward SPEC` | Listen in the sandbox and forward TCP to a host-side destination. Repeatable. |
 | `-b, --bind PATH` | Bind `PATH` read-write into the sandbox. Repeatable. |
 | `-r, --ro-bind PATH` | Bind `PATH` read-only. Repeatable. |
 | `--bind-socket PATH` | Explicit opt-in to bind a socket, a runtime-dir path, or a socket-bearing directory that `-b`/`-r` refuse by default. **Read-only** for socket files and `/run`/`$XDG_RUNTIME_DIR` paths (connect-only — *never* read-write: `-b PATH --bind-socket PATH` is refused too); **read-write** for a plain directory (socket-bearing project dirs — `puma.sock`, `.s.PGSQL.5432`, `.git/fsmonitor--daemon.ipc`; combine with `-r PATH` for read-only; rw does let the sandbox replace the sockets inside it — the intended trade-off, since such dirs need writes). Repeatable; known control sockets, protected paths and anything inside `/proc`, `/sys` or `/dev` stay refused. |
@@ -83,6 +85,57 @@ Everything after the first positional (or `--`) is the sandboxed command.
 | `--no-seccomp` | Do not install the seccomp deny-list. Without it the launcher FAILS CLOSED: if the filter cannot be installed (bwrap < 0.4.1, unsupported architecture) it refuses to run rather than run unfiltered. |
 | `-v, --verbose` | Log every allow/deny decision to stderr. |
 | `--shell` | Run an interactive shell (`$SHELL` if usable, else bash). |
+
+### TCP port forwarding
+
+Publish a sandbox HTTP server on host loopback port 8080:
+
+```sh
+sbox -L 8080:8000 -- python3 -m http.server 8000 --bind 127.0.0.1
+# From the host
+curl http://127.0.0.1:8080
+```
+
+Reach a host service on port 3000 from sandbox loopback port 8080:
+
+```sh
+sbox -R 8080:3000 -- curl http://127.0.0.1:8080
+```
+
+Both flags take `[BIND_IP:]LISTEN_PORT:DEST_IP:DEST_PORT`, or `LISTEN_PORT:DEST_PORT`
+for loopback on both ends. IPs are literals, with brackets for IPv6. Omitted addresses and
+`localhost` mean `127.0.0.1`. For example, `-L '[::1]:8080:[::1]:8000'` uses IPv6 loopback.
+Binding to `0.0.0.0` on the host exposes the port on all host IPv4 interfaces.
+Forwards can be repeated or combined. The destination service can start after the listener.
+Rule sets are checked for loops before anything listens: a forward whose destination any
+rule's listener can capture — its own or another's, in the namespace that owns the listener,
+wildcard binds (`0.0.0.0`, `[::]`) counting for their whole port — is refused at startup.
+Each hop of such a loop would open another connection until the launcher runs out of
+file descriptors.
+
+Each rule grants direct access to its fixed TCP destination. A remote forward connects from
+the host independently of `--allow`, `no_proxy`, and `--upstream`. Other sandbox traffic
+continues to use the existing network policy. The launcher owns the host listeners and
+connections: every listener is reserved before the sandbox launches and only begins serving
+once the sandbox itself reports readiness through a private FIFO — after bubblewrap has
+finished its mount and namespace setup and every in-sandbox listener is up — so a failed
+launch never forwards a byte. Concurrent streams are capped PER FORWARD by counting accepted
+connections (idle listeners cost nothing; a forward at its limit holds at most one accepted
+client while it waits for a slot) — per-rule budgets keep a multi-hop chain from deadlocking:
+with one shared pool the first hops could hold every slot while waiting for downstream hops
+that then never get admitted. Transient accept failures — descriptor shortages, routing
+errors — pause accepting with backoff and resume once the condition clears instead of killing
+the forward for the rest of the run. The bridge's readiness write is mandatory — a sandbox that
+cannot signal never runs its payload. A run whose sandbox exits before reporting readiness
+fails, even when the payload itself exited zero; a byte that merely raced the exit still
+counts, and forwards never start on a sandbox that already exited — relays close the moment
+an exit is observed, before the final output drain. In isolated mode, a
+filtered
+`socat` inside the sandbox relays each stream over a private filesystem Unix socket and
+allows up to an hour for a response after a TCP half-close. Its startup readiness check
+runs in a subshell, so it can never overwrite `--env` values with fields read from the
+kernel socket tables.
+With `--net`, both endpoints are in the host network namespace.
 
 ### Environment variables
 
@@ -176,7 +229,8 @@ or silently falls back to a different workspace mode.
   unless `--filter-output` is enabled; that filter is intentionally unsuitable for full-screen
   tools. Pipes and redirected streams retain direct I/O unless filtering is requested.
 - **No network stack in the sandbox.** `bwrap --unshare-all` removes it; the
-  only egress is a Unix socket passed in at `/run/proxy.sock`.
+  default egress is the proxy Unix socket at `/run/proxy.sock`. Explicit TCP forwards use
+  separate private sockets.
 - **The launcher hosts the proxy.** A goroutine serves SOCKS5 and HTTP CONNECT
   on the Unix socket. Upstream credentials stay in memory; no proxy config
   containing credentials is written to disk. Killing the launcher also stops
@@ -185,7 +239,7 @@ or silently falls back to a different workspace mode.
   `127.0.0.1:1080`, auto-detecting SOCKS5 vs HTTP per connection — so
   `http_proxy=http://127.0.0.1:1080` works for tools that do not understand
   `socks5h://` (npm, apt, ...). Proxy env vars are preset; apps that ignore
-  them simply get no network (fail-closed).
+  them can still connect to explicitly forwarded sandbox ports.
 - **ssh** ignores proxy env vars, so proxied mode injects `/etc/ssh/ssh_config`
   with a `ProxyCommand` through the bridge: `ssh`/`scp`/`sftp` and
   git-over-ssh ride the same allowlist-checked proxy. `~/.ssh/config` still

@@ -111,7 +111,7 @@ func run(argv []string) int {
 		return die(err.Error())
 	}
 	if !opts.Net && len(allows) == 0 {
-		errf("warning: no --allow entries — ALL outbound connections will be denied")
+		errf("warning: no --allow entries — the network proxy will deny every destination")
 	}
 
 	raw := ""

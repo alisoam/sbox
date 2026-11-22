@@ -451,11 +451,13 @@ func (p *Provider) Build(spec *sandbox.Spec) (*sandbox.Launch, error) {
 			l.PassFDs = append(l.PassFDs, f)
 			return strconv.Itoa(extraFDBase + len(l.PassFDs) - 1), nil
 		}
-		nfd, err := syscall.Dup(int(f.Fd()))
-		if err != nil {
-			return "", fmt.Errorf("cannot dup pinned bind fd: %v", err)
+		// ExtraFiles installs the child slot. The parent-numbered copy must
+		// close on exec even when its number falls outside all those slots.
+		nfd, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_DUPFD_CLOEXEC, 0)
+		if errno != 0 {
+			return "", fmt.Errorf("cannot dup pinned bind fd: %w", errno)
 		}
-		dup := os.NewFile(uintptr(nfd), f.Name()+" dup")
+		dup := os.NewFile(nfd, f.Name()+" dup")
 		owned = append(owned, dup)
 		l.PassFDs = append(l.PassFDs, dup)
 		l.CloseAfterSpawn = append(l.CloseAfterSpawn, dup)

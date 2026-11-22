@@ -77,7 +77,7 @@ func TestSplitArgv(t *testing.T) {
 // TestShortWithValueDerived ensures the short-with-value table stays
 // derived from OptsWithValue (the trap-list invariant).
 func TestShortWithValueDerived(t *testing.T) {
-	want := map[byte]bool{'a': true, 'A': true, 'b': true, 'r': true}
+	want := map[byte]bool{'a': true, 'A': true, 'b': true, 'r': true, 'L': true, 'R': true}
 	if !reflect.DeepEqual(ShortWithValue, want) {
 		t.Errorf("ShortWithValue = %v, want %v", ShortWithValue, want)
 	}

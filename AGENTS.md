@@ -80,6 +80,51 @@ short flags; attached short values such as `-bPATH` remain supported.
   never send a raw TCP half-close underneath a TLS connection.
 - Quote attacker-controlled names, redact upstream credentials, and sanitize
   X-Sbox-Error to a single line. Never emit untrusted terminal controls raw.
+- -L/-R forwards are fixed TCP endpoints; validate the FULL rule set for loops
+  before anything listens. A dial is captured by a listener in the same
+  namespace (with --net there is only one; isolated -L listens on the host and
+  dials in the sandbox, -R the reverse) when ports match and the listener bind
+  is the exact address or a wildcard — wildcards claim their whole port for
+  every destination and both families, and connects to an unspecified address
+  land on loopback. Any cycle multiplies one client connection until the
+  launcher exhausts its file descriptors. ParseCLI rejects cycles; BuildSpec
+  re-asserts for programmatic Options.
+- Forward listeners are RESERVED before the backend starts and serve only
+  when the sandbox signals readiness through the $WORK FIFO mounted at
+  /run/sbox-ready (the bridge writes one byte after every socat listener is
+  up; an exit or silence before that fails closed) — a failed launch (a
+  later rule's port occupied, a bwrap mount/namespace failure) must never
+  have forwarded a byte.
+- Bound concurrent streams PER FORWARD by counting ACCEPTED connections:
+  idle listeners take no slot, a forward at its cap holds at most ONE
+  accepted client while it waits for a slot, further clients park in the
+  kernel backlog. Never share one pool across rules: a legal chain's first
+  hops would occupy every slot while their downstream hops wait for
+  admission that can never come (admission deadlock); loop validation is
+  what makes per-forward pools deadlock-free. RETRY every accept error
+  except a closed listener or shutdown, with capped exponential backoff —
+  EMFILE/ENFILE/ENOBUFS/ENOMEM/ECONNABORTED, but also ENETUNREACH, EPERM,
+  EPROTO and anything unenumerated: a still-bound port must resume serving
+  once the condition clears, not die silently for the rest of the run.
+  The readiness FIFO's ends are OWNED by the supervisor as two separate
+  descriptors opened before spawn: a non-blocking read end and a standing
+  writer (the bridge's write never blocks, and a reader goroutine that has
+  not entered its read yet is still covered). cancel closes ONLY the
+  writer: a parked read then delivers a byte the bridge already wrote
+  before it sees EOF — closing the read end could abort that read and
+  fail a launch that had signaled. The bridge's write is MANDATORY
+  (`|| exit 1`): the payload must never run with inactive forwards.
+  Before starting relays on the readiness signal, check for an
+  ALREADY-REPORTED exit (both cases can be queued; select picks randomly);
+  never serve a dead child. Relays close the moment an exit is observed,
+  BEFORE the PTY drain — a queued --net client must not reach the host
+  destination while output drains; the group's context closes live
+  streams, so that cannot block. A byte that never arrived fails the run,
+  a zero exit coerced to 1, the status marked reaped the moment it is
+  consumed; the PTY then drains — that output is the diagnostic.
+- The in-sandbox readiness check runs in a subshell with `(...) || exit 1`:
+  its read scratch variables (state, uid, timeout, ...) must never overwrite
+  same-named --env values, and startup failure must reach the bridge shell.
 
 ## Binds and capabilities
 
